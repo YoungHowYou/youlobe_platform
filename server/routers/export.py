@@ -1,0 +1,386 @@
+# -*- coding: utf-8 -*-
+"""
+模型转换/导出 API
+"""
+
+import sys
+import threading
+from pathlib import Path
+from typing import Literal
+
+from fastapi import APIRouter, Depends, HTTPException
+from pydantic import BaseModel, Field
+from sqlalchemy import func
+from sqlalchemy.orm import Session
+
+from ..database import get_db, SessionLocal
+from ..config import settings
+from ..models.train_task import TrainTask, TrainEpochLog
+from ..models.exported_model import ExportedModel
+from ..models.project import Project
+from ..models.defect_class import DefectClass
+from ..services.dataset_service import resolve_classification_display_names
+
+_root = str(Path(__file__).parent.parent.parent)
+if _root not in sys.path:
+    sys.path.insert(0, _root)
+
+router = APIRouter(prefix="/api/export", tags=["模型导出"])
+
+
+class ExportRequest(BaseModel):
+    task_id: int
+    source_type: str = Field(default="best")           # best / last
+    export_format: str = Field(default="onnx")          # onnx / openvino / tensorrt
+    imgsz: int = Field(default=640, ge=64, le=1280)   # 分类项目用 224，下限放宽到 64
+    half: bool = Field(default=False)                    # FP16
+    int8: bool = Field(default=False)                    # INT8 量化（仅 OpenVINO）
+    nms: bool = Field(default=False)                     # 内嵌 NMS 节点（仅 onnx/openvino + det/seg/obb）
+    head_mode: Literal["legacy", "native", "compat"] = Field(default="legacy")
+
+
+@router.get("/list")
+def list_exports(task_id: int = 0, project_id: int = 0, db: Session = Depends(get_db)):
+    """列出已导出的模型（按项目或任务过滤）"""
+    q = db.query(ExportedModel)
+    if task_id > 0:
+        q = q.filter(ExportedModel.task_id == task_id)
+    elif project_id > 0:
+        task_ids = [t.id for t in db.query(TrainTask.id).filter(TrainTask.project_id == project_id).all()]
+        q = q.filter(ExportedModel.task_id.in_(task_ids))
+    items = q.order_by(ExportedModel.created_at.desc()).all()
+    return [
+        {
+            "id": e.id,
+            "task_id": e.task_id,
+            "source_type": e.source_type,
+            "export_format": e.export_format,
+            "export_path": e.export_path,
+            "file_size_mb": round(e.file_size_mb or 0, 2),
+            "imgsz": e.imgsz,
+            "half": e.half == 1,
+            "int8": e.half == 2,
+            "precision": {0: "FP32", 1: "FP16", 2: "INT8"}.get(e.half, "FP32"),
+            "nms": bool(e.nms),
+            "head_mode": e.head_mode or "legacy",
+            "status": e.status,
+            "error_message": e.error_message,
+            "created_at": e.created_at.isoformat() if e.created_at else None,
+        }
+        for e in items
+    ]
+
+
+@router.get("/tasks")
+def list_exportable_tasks(project_id: int = 0, db: Session = Depends(get_db)):
+    """列出可导出的训练任务（按项目过滤）
+
+    放宽过滤：completed / cancelled / failed 都可能产出有效的 best.pt / last.pt
+    （Ultralytics 每个 epoch 都会保存），只要文件物理存在就允许导出。
+    """
+    q = db.query(TrainTask).filter(
+        TrainTask.status.in_(("completed", "cancelled", "failed", "training", "exporting"))
+    )
+    if project_id > 0:
+        q = q.filter(TrainTask.project_id == project_id)
+    tasks = q.order_by(TrainTask.id.desc()).all()
+
+    # 解析项目 task_type（用于前端 imgsz 默认值与字段显隐）
+    proj_task_type = None
+    if project_id > 0:
+        proj = db.query(Project).filter(Project.id == project_id).first()
+        if proj:
+            proj_task_type = proj.task_type
+
+    result = []
+    for t in tasks:
+        models = []
+        if t.best_model_path and Path(t.best_model_path).exists():
+            models.append({"type": "best", "path": t.best_model_path})
+        if t.last_model_path and Path(t.last_model_path).exists():
+            models.append({"type": "last", "path": t.last_model_path})
+        if not models:
+            continue
+
+        cfg = t.config or {}
+        # cls 项目固定 224；其它项目优先用 config.imgsz，没有则 640
+        if proj_task_type == "cls":
+            cfg_imgsz = 224
+        else:
+            cfg_imgsz = cfg.get("imgsz") if isinstance(cfg, dict) else None
+            if not cfg_imgsz:
+                cfg_imgsz = 640
+
+        # 分类没有 mAP50；导出选择器显示的是 Top-1 Accuracy。历史任务的
+        # best_map50 可能仍为 0，因此直接从每轮日志取真实最高值。
+        best_metric = t.best_map50
+        if proj_task_type == "cls":
+            best_top1 = (
+                db.query(func.max(TrainEpochLog.top1_acc))
+                .filter(TrainEpochLog.task_id == t.id)
+                .scalar()
+            )
+            if best_top1 is not None:
+                best_metric = float(best_top1)
+
+        result.append({
+            "task_id": t.id,
+            "task_name": t.task_name,
+            "task_type": proj_task_type,
+            "status": t.status,
+            "best_map50": best_metric,
+            "current_epoch": t.current_epoch,
+            "epochs": t.epochs,
+            "imgsz": cfg_imgsz,
+            "model_name": cfg.get("model_name") if isinstance(cfg, dict) else None,
+            "models": models,
+            "finished_at": t.finished_at.isoformat() if t.finished_at else None,
+            "created_at": t.created_at.isoformat() if t.created_at else None,
+        })
+    return result
+
+
+@router.post("/run")
+def run_export(req: ExportRequest, db: Session = Depends(get_db)):
+    """提交模型导出任务（后台线程执行）"""
+    task = db.query(TrainTask).filter(TrainTask.id == req.task_id).first()
+    if not task:
+        raise HTTPException(status_code=404, detail="训练任务不存在")
+
+    src_path = task.best_model_path if req.source_type == "best" else task.last_model_path
+    if not src_path or not Path(src_path).exists():
+        raise HTTPException(status_code=404, detail="模型文件不存在")
+
+    # 分类模型固定 imgsz=224（YOLO11-cls 标准），与训练保持一致，避免导出形状错配
+    proj = db.query(Project).filter(Project.id == task.project_id).first()
+    if proj and proj.task_type == "cls" and req.imgsz != 224:
+        req.imgsz = 224
+
+    # 即便历史权重内部仍记录 Crack/EdgeChip/Notch，导出包也始终使用
+    # 项目标准中文显示名。模型 index 顺序由该任务的 class_names 决定。
+    display_class_names = None
+    if proj and proj.task_type == "cls":
+        classes = (
+            db.query(DefectClass)
+            .filter(DefectClass.project_id == proj.id)
+            .order_by(DefectClass.class_index)
+            .all()
+        )
+        try:
+            source_names = (task.config or {}).get("class_names")
+            ordered = resolve_classification_display_names(classes, source_names)
+            display_class_names = [dc.name for dc in ordered]
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=f"分类类别映射校验失败：{exc}")
+
+    # half 字段是 3 态精度码：0=FP32 / 1=FP16 / 2=INT8
+    precision_code = 2 if req.int8 else (1 if req.half else 0)
+
+    # YOLO26 compat 使用运行时 NMS，不改变 YOLO11 的既有内嵌 NMS 开关。
+    requested_nms = req.nms if req.head_mode == "legacy" else False
+
+    # 检查是否已有相同导出（含精度、NMS、head 模式）
+    existing = db.query(ExportedModel).filter(
+        ExportedModel.task_id == req.task_id,
+        ExportedModel.source_type == req.source_type,
+        ExportedModel.export_format == req.export_format,
+        ExportedModel.imgsz == req.imgsz,
+        ExportedModel.half == precision_code,
+        ExportedModel.nms == (1 if requested_nms else 0),
+        ExportedModel.head_mode == req.head_mode,
+        ExportedModel.status == "completed",
+    ).first()
+    if existing:
+        raise HTTPException(status_code=409, detail="该组合（格式/精度/NMS/head模式）已导出，无需重复导出")
+
+    # 创建记录（half: 0=FP32, 1=FP16, 2=INT8）
+    record = ExportedModel(
+        task_id=req.task_id,
+        source_path=src_path,
+        source_type=req.source_type,
+        export_format=req.export_format,
+        imgsz=req.imgsz,
+        half=precision_code,
+        nms=1 if requested_nms else 0,
+        head_mode=req.head_mode,
+        status="exporting",
+    )
+    db.add(record)
+    db.commit()
+    db.refresh(record)
+
+    # 后台线程执行导出
+    export_id = record.id
+    # INT8 量化需要数据集路径
+    dataset_path = None
+    if req.int8:
+        task = db.query(TrainTask).filter(TrainTask.id == req.task_id).first()
+        if task and task.output_dir:
+            dataset_path = str(Path(task.output_dir) / "dataset")
+    threading.Thread(
+        target=_do_export,
+        args=(export_id, src_path, req.export_format, req.imgsz, req.half, req.int8, req.nms, req.head_mode, dataset_path, display_class_names),
+        daemon=True,
+    ).start()
+
+    return {"id": export_id, "status": "exporting", "message": "导出任务已启动"}
+
+
+def _do_export(
+    export_id: int,
+    src_path: str,
+    fmt: str,
+    imgsz: int,
+    half: bool,
+    int8: bool = False,
+    nms: bool = False,
+    head_mode: str = "legacy",
+    dataset_path: str = None,
+    display_class_names: list[str] | None = None,
+):
+    """后台执行导出"""
+    db = SessionLocal()
+    try:
+        record = db.query(ExportedModel).filter(ExportedModel.id == export_id).first()
+        if not record:
+            return
+
+        from core.export import run_export
+        output_dir = str(Path(src_path).parent / "exports")
+        result = run_export(
+            model_path=src_path,
+            output_dir=output_dir,
+            export_format=fmt,
+            imgsz=imgsz,
+            half=half,
+            int8=int8,
+            nms=nms,
+            head_mode=head_mode,
+            dataset_path=dataset_path,
+            display_class_names=display_class_names,
+        )
+
+        if result.get("error"):
+            record.status = "failed"
+            record.error_message = result["error"]
+        else:
+            record.status = "completed"
+            # 核心层按真实模型 head 归一化后的最终模式，覆盖请求占位值。
+            record.head_mode = result.get("head_mode", head_mode)
+            record.nms = 1 if result.get("nms", nms) else 0
+            record.export_path = result.get("export_path")
+            record.onnx_path = result.get("onnx_path")
+            # 计算文件大小
+            ep = result.get("export_path")
+            if ep:
+                p = Path(ep)
+                if p.is_file():
+                    record.file_size_mb = p.stat().st_size / 1024 / 1024
+                elif p.is_dir():
+                    total = sum(f.stat().st_size for f in p.rglob("*") if f.is_file())
+                    record.file_size_mb = total / 1024 / 1024
+        db.commit()
+    except Exception as e:
+        record = db.query(ExportedModel).filter(ExportedModel.id == export_id).first()
+        if record:
+            record.status = "failed"
+            record.error_message = str(e)
+            db.commit()
+    finally:
+        db.close()
+
+
+@router.delete("/{export_id}")
+def delete_export(export_id: int, db: Session = Depends(get_db)):
+    """删除导出记录 + 落盘的导出文件/目录。"""
+    record = db.query(ExportedModel).filter(ExportedModel.id == export_id).first()
+    if not record:
+        raise HTTPException(status_code=404, detail="记录不存在")
+
+    # 抓盘上路径再删 DB
+    ep_str = record.export_path
+    db.delete(record)
+    db.commit()
+
+    # 限制只删除 STORAGE_ROOT 内的路径，防止 DB 被改后误删任意文件
+    if ep_str:
+        try:
+            ep = Path(ep_str).resolve()
+            storage_root = Path(settings.STORAGE_ROOT).resolve()
+            if ep.exists() and ep.is_relative_to(storage_root):
+                if ep.is_file():
+                    ep.unlink(missing_ok=True)
+                elif ep.is_dir():
+                    import shutil
+                    shutil.rmtree(str(ep), ignore_errors=True)
+        except Exception:
+            # 删 DB 已成功，盘上残留不致命
+            pass
+    return {"ok": True}
+
+
+# ============================================================
+# 模型下载
+# ============================================================
+from fastapi.responses import FileResponse
+import shutil
+import tempfile
+
+
+@router.get("/download/pt/{task_id}/{model_type}")
+def download_pt_model(task_id: int, model_type: str, db: Session = Depends(get_db)):
+    """下载原始 .pt 模型"""
+    task = db.query(TrainTask).filter(TrainTask.id == task_id).first()
+    if not task:
+        raise HTTPException(status_code=404, detail="任务不存在")
+
+    model_path = task.best_model_path if model_type == "best" else task.last_model_path
+    if not model_path or not Path(model_path).exists():
+        raise HTTPException(status_code=404, detail="模型文件不存在")
+
+    filename = f"task{task_id}_{model_type}.pt"
+    return FileResponse(model_path, media_type="application/octet-stream", filename=filename)
+
+
+@router.get("/download/exported/{export_id}")
+def download_exported_model(export_id: int, db: Session = Depends(get_db)):
+    """下载导出的模型（单文件直接下载，目录打 zip 下载）"""
+    record = db.query(ExportedModel).filter(ExportedModel.id == export_id).first()
+    if not record or not record.export_path:
+        raise HTTPException(status_code=404, detail="记录不存在")
+
+    ep = Path(record.export_path)
+    if not ep.exists():
+        raise HTTPException(status_code=404, detail="导出文件不存在")
+
+    task = db.query(TrainTask).filter(TrainTask.id == record.task_id).first()
+    tname = f"task{record.task_id}"
+
+    if ep.is_file():
+        # 单文件：ONNX / TensorRT
+        filename = f"{tname}_{record.source_type}.{record.export_format}{ep.suffix}"
+        return FileResponse(str(ep), media_type="application/octet-stream", filename=filename)
+    elif ep.is_dir():
+        # 目录：OpenVINO → 打 zip
+        # zip 命名带 record.id，避免同 task + 同格式但不同 nms/精度的多条记录共享缓存
+        mode_tag = f"_{record.head_mode}" if record.head_mode in ("native", "compat") else ""
+        nms_tag = "_nms" if record.nms else ""
+        zip_name = f"{tname}_{record.source_type}_{record.export_format}{mode_tag}{nms_tag}"
+        zip_cache_name = f"{zip_name}_id{record.id}"
+        tmp_dir = Path(tempfile.gettempdir()) / "model_downloads"
+        tmp_dir.mkdir(exist_ok=True)
+        zip_path = tmp_dir / f"{zip_cache_name}.zip"
+
+        # Windows 目录 mtime 在 ultralytics 覆盖式导出后不会更新，必须递归找最大文件 mtime
+        if ep.is_dir():
+            ep_mtime = max((f.stat().st_mtime for f in ep.rglob("*") if f.is_file()), default=0)
+        else:
+            ep_mtime = ep.stat().st_mtime
+
+        if not zip_path.exists() or zip_path.stat().st_mtime < ep_mtime:
+            shutil.make_archive(str(zip_path.with_suffix("")), "zip", str(ep.parent), ep.name)
+
+        # 用户看到的下载文件名仍按 zip_name（不带 id 后缀，对用户透明）
+        return FileResponse(str(zip_path), media_type="application/zip", filename=f"{zip_name}.zip")
+    else:
+        raise HTTPException(status_code=404, detail="导出路径无效")

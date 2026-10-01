@@ -1,0 +1,1231 @@
+# -*- coding: utf-8 -*-
+"""推断服务 API（支持 .pt / ONNX / OpenVINO / TensorRT）"""
+
+import sys
+import uuid
+import base64
+
+from datetime import datetime
+from pathlib import Path
+
+import cv2
+import numpy as np
+from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form, Query, Body
+from fastapi.responses import FileResponse, StreamingResponse
+from sqlalchemy import func
+from sqlalchemy.orm import Session
+
+from ..database import get_db
+from ..config import settings
+from ..models.train_task import TrainTask
+from ..models.inference_result import InferenceResult
+from ..models.exported_model import ExportedModel
+from ..models.defect_class import DefectClass
+from ..models.project import Project
+
+_root = str(Path(__file__).parent.parent.parent)
+if _root not in sys.path:
+    sys.path.insert(0, _root)
+
+router = APIRouter(prefix="/api/inference", tags=["推断服务"])
+_model_cache: dict = {}
+
+
+# task_type → ultralytics task 名映射
+_TASK_MAP = {"seg": "segment", "det": "detect", "cls": "classify", "obb": "obb"}
+
+
+def _get_model(model_path: str, task_type: str | None = None, device: str | None = None):
+    """加载模型（LRU 缓存，容量 4）。
+
+    task_type: 我们项目的 task_type（seg/det/cls/obb），用于在加载非 .pt 模型
+    （ONNX / OpenVINO / TensorRT）时显式告诉 ultralytics 是哪种任务，否则
+    它默认按 detect 处理 cls 模型会跑 NMS，报 IndexError。
+
+    device: cache key 的一部分。OpenVINO backend 在首次 predict 时把模型编译
+    到指定硬件（CPU/GPU.0），切换 device 等于重新编译，所以缓存必须按 device
+    区分；否则用户从 GPU.0 切回 CPU 时会拿到上次的 GPU.0 编译版本。
+    """
+    cache_key = f"{model_path}|{task_type or ''}|{device or ''}"
+    if cache_key in _model_cache:
+        _model_cache[cache_key] = _model_cache.pop(cache_key)
+        return _model_cache[cache_key]
+    # OpenVINO 2026+ 兼容修复
+    if "openvino" in model_path.lower():
+        try:
+            import sys as _sys, openvino as _ov
+            if 'openvino.runtime' not in _sys.modules:
+                _sys.modules['openvino.runtime'] = _ov
+        except ImportError:
+            pass
+
+    # 推断任务类型：调用方传入 > OpenVINO metadata.yaml > 不传（ultralytics 自己猜）
+    explicit_task = _TASK_MAP.get(task_type) if task_type else None
+    if explicit_task is None:
+        try:
+            mp = Path(model_path)
+            meta_path = mp / "metadata.yaml" if mp.is_dir() else None
+            if meta_path and meta_path.exists():
+                import yaml as _yaml
+                meta = _yaml.safe_load(meta_path.read_text(encoding="utf-8")) or {}
+                t = meta.get("task")
+                if t in ("classify", "detect", "segment", "obb", "pose"):
+                    explicit_task = t
+        except Exception:
+            pass
+
+    from ultralytics import YOLO
+    model = YOLO(model_path, task=explicit_task) if explicit_task else YOLO(model_path)
+    _model_cache[cache_key] = model
+    if len(_model_cache) > 4:
+        _model_cache.pop(next(iter(_model_cache)))
+    return model
+
+
+@router.get("/models")
+def list_models(project_id: int = Query(default=0), db: Session = Depends(get_db)):
+    """
+    列出项目下可用模型（.pt + 导出格式）。
+
+    包括 completed 和 cancelled 两种状态的任务 —— 取消的任务硬盘上仍有
+    best.pt/last.pt（ultralytics 实时写盘），文件存在就算可用。
+    """
+    models = []
+    q = db.query(TrainTask).filter(TrainTask.status.in_(["completed", "cancelled"]))
+    if project_id > 0:
+        q = q.filter(TrainTask.project_id == project_id)
+    # finished_at 取消时可能为 None，用 coalesce 回退到 created_at（兼容 MySQL）
+    tasks = q.order_by(func.coalesce(TrainTask.finished_at, TrainTask.created_at).desc()).all()
+    task_ids = [t.id for t in tasks]
+    for t in tasks:
+        # cancelled 任务在 label 上加标记，避免用户误用低质量模型
+        suffix = ""
+        if t.status == "cancelled":
+            ep = f"{t.current_epoch}/{t.epochs}" if t.epochs else f"{t.current_epoch}"
+            suffix = f" [取消@epoch {ep}]"
+        if t.best_model_path and Path(t.best_model_path).exists():
+            models.append({"task_id": t.id, "model_format": "pytorch",
+                "label": f"{t.task_name} — best.pt{suffix}", "model_path": t.best_model_path})
+        if t.last_model_path and Path(t.last_model_path).exists():
+            models.append({"task_id": t.id, "model_format": "pytorch",
+                "label": f"{t.task_name} — last.pt{suffix}", "model_path": t.last_model_path})
+    # 导出的模型（只显示当前项目的）
+    eq = db.query(ExportedModel).filter(ExportedModel.status == "completed", ExportedModel.export_path.isnot(None))
+    if task_ids:
+        eq = eq.filter(ExportedModel.task_id.in_(task_ids))
+    elif project_id > 0:
+        eq = eq.filter(False)  # 项目下没有训练任务，不显示导出模型
+    exports = eq.order_by(ExportedModel.created_at.desc()).all()
+    fmt_map = {"onnx": "ONNX", "openvino": "OpenVINO", "tensorrt": "TensorRT"}
+    # 一次性把所有 export 关联的 task 取出，避免 N+1
+    task_by_id = {t.id: t for t in tasks}
+    missing_ids = {e.task_id for e in exports if e.task_id not in task_by_id}
+    if missing_ids:
+        for t in db.query(TrainTask).filter(TrainTask.id.in_(missing_ids)).all():
+            task_by_id[t.id] = t
+    for e in exports:
+        t = task_by_id.get(e.task_id)
+        tname = t.task_name if t else f"Task#{e.task_id}"
+        fp = "FP16" if e.half else "FP32"
+        models.append({"task_id": e.task_id, "model_format": e.export_format,
+            "label": f"{tname} — {e.source_type}.{fmt_map.get(e.export_format, e.export_format)} ({fp})",
+            "model_path": e.export_path})
+    return models
+
+
+@router.get("/devices")
+def list_devices():
+    """检测可用推断设备。
+    .pt 模型走 PyTorch CUDA / CPU；OV 模型走 OpenVINO 的 CPU / GPU.0 (核显) / GPU.1 (独显)。
+    返回所有可见设备，前端按模型类型自行过滤。
+    """
+    devices = [{"id": "cpu", "name": "CPU (PyTorch)", "available": True, "backend": "pytorch"}]
+
+    # PyTorch CUDA
+    try:
+        import torch
+        if torch.cuda.is_available():
+            for i in range(torch.cuda.device_count()):
+                devices.append({
+                    "id": str(i),
+                    "name": f"CUDA - {torch.cuda.get_device_name(i)}",
+                    "available": True,
+                    "backend": "pytorch",
+                })
+        else:
+            print("[devices] torch.cuda.is_available()=False")
+    except Exception as e:
+        print(f"[devices] torch CUDA probe failed: {e}")
+
+    # OpenVINO 设备（CPU / GPU.0 / GPU.1 / NPU）
+    try:
+        import openvino as ov
+        core = ov.Core()
+        for d in core.available_devices:
+            try:
+                name = core.get_property(d, "FULL_DEVICE_NAME")
+            except Exception:
+                name = d
+            devices.append({
+                "id": d,                          # 推理时用 _format_device_for_backend 加 intel: 前缀
+                "name": f"OV {d} - {name}",
+                "available": True,
+                "backend": "openvino",
+            })
+    except Exception as e:
+        print(f"[devices] OpenVINO probe failed: {e}")
+
+    return devices
+
+
+def _resolve_class_names(model, project_id: int, db) -> dict:
+    """
+    类别名映射 (class_index → name)，model.names 优先。
+
+    cls 训练走 ImageFolder，类别 index 是子目录字典序（如 Broken=0, Crack=1, OK=2），
+    与 DB class_index（创建顺序）可能不同；用 DB 映射会把 OK 显示成 Crack。
+    seg/det/obb 的 dataset.yaml 按 DB class_index 写，两边一致。
+    """
+    cn = {}
+    mn = getattr(model, "names", None)
+    if mn:
+        try:
+            cn = {int(k): str(v) for k, v in (mn.items() if isinstance(mn, dict) else enumerate(mn))}
+        except Exception:
+            cn = {}
+    if not cn and project_id and project_id > 0:
+        try:
+            dcs = db.query(DefectClass).filter(DefectClass.project_id == project_id).all()
+            cn = {int(dc.class_index): dc.name for dc in dcs}
+        except Exception:
+            pass
+    return cn
+
+
+def _run_obb_inference(model, img_array, filename, project_id, task_id, conf, iou, device, db):
+    """
+    OBB 推断：返回每个目标的 4 角点 polygon（图像像素坐标）+ 类别 + 置信度。
+    在原图上画旋转四边形作为 overlay。
+    """
+    import time
+    t0 = time.time()
+    pred = model.predict(
+        img_array, verbose=False,
+        conf=conf or 0.25, iou=iou or 0.5,
+        device=device if device != "cpu" else "cpu",
+    )
+    elapsed = time.time() - t0
+
+    r0 = pred[0] if pred else None
+    obb = getattr(r0, "obb", None) if r0 is not None else None
+
+    detections = []
+    if obb is not None and obb.xyxyxyxy is not None and len(obb) > 0:
+        # xyxyxyxy: (N, 4, 2) 图像像素坐标
+        polys = obb.xyxyxyxy.cpu().numpy() if hasattr(obb.xyxyxyxy, "cpu") else obb.xyxyxyxy
+        cls_ids = obb.cls.cpu().numpy().astype(int) if hasattr(obb.cls, "cpu") else obb.cls
+        confs = obb.conf.cpu().numpy() if hasattr(obb.conf, "cpu") else obb.conf
+
+        cn = _resolve_class_names(model, project_id, db)
+        for poly, cid, cf in zip(polys, cls_ids, confs):
+            cid = int(cid)
+            pts = [{"x": float(p[0]), "y": float(p[1])} for p in poly]
+            xs = [p["x"] for p in pts]
+            ys = [p["y"] for p in pts]
+            detections.append({
+                "class_id": cid,
+                "class_name": cn.get(cid, f"C{cid}"),
+                "confidence": round(float(cf), 4),
+                # 4 点旋转矩形（前端连线即可）
+                "polygon": pts,
+                # 同时给一个轴对齐外接矩形做兼容（不影响 OBB 显示）
+                "bbox": {"x1": int(min(xs)), "y1": int(min(ys)),
+                         "x2": int(max(xs)), "y2": int(max(ys))},
+            })
+
+    # ---- 在原图上画旋转四边形作为 overlay ----
+    overlay = img_array.copy()
+    if overlay.ndim == 2:
+        overlay = cv2.cvtColor(overlay, cv2.COLOR_GRAY2BGR)
+    elif overlay.shape[2] == 4:
+        overlay = cv2.cvtColor(overlay, cv2.COLOR_BGRA2BGR)
+
+    # 用类别 id 决定颜色（BGR）
+    palette = [(76,76,255),(76,255,103),(45,165,230),(255,144,76),(204,128,189),
+               (193,166,12),(193,89,89),(0,128,255),(128,255,128)]
+
+    for det in detections:
+        color = palette[det["class_id"] % len(palette)]
+        pts = np.array([[p["x"], p["y"]] for p in det["polygon"]], dtype=np.int32)
+        cv2.polylines(overlay, [pts], isClosed=True, color=color, thickness=2)
+        # 标签框（用第一个点上方）
+        label = f"{det['class_name']} {det['confidence']:.2f}"
+        x0, y0 = int(pts[0][0]), int(pts[0][1])
+        (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)
+        cv2.rectangle(overlay, (x0, max(0, y0 - th - 4)), (x0 + tw + 4, y0), color, -1)
+        cv2.putText(overlay, label, (x0 + 2, max(th, y0 - 2)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1, cv2.LINE_AA)
+
+    # ---- 保存图片（original + overlay） ----
+    infer_dir = settings.runs_path / "inference"
+    infer_dir.mkdir(parents=True, exist_ok=True)
+    rid = uuid.uuid4().hex[:12]
+    cv2.imwrite(str(infer_dir / f"{rid}_original.png"), img_array)
+    cv2.imwrite(str(infer_dir / f"{rid}_overlay.png"), overlay)
+    url_pfx = "/static/storage/runs/inference"
+
+    record = InferenceResult(
+        project_id=project_id, task_id=task_id,
+        filename=filename or "unknown", device=device,
+        conf_thresh=conf, iou_thresh=iou, resize_size=0,
+        num_detections=len(detections),
+        inference_time=round(elapsed, 3),
+        detections=detections,
+        original_path=f"{url_pfx}/{rid}_original.png",
+        overlay_path=f"{url_pfx}/{rid}_overlay.png",
+    )
+    db.add(record); db.commit(); db.refresh(record)
+
+    return {
+        "id": record.id,
+        "task_type": "obb",
+        "filename": record.filename,
+        "device": record.device,
+        "num_detections": record.num_detections,
+        "inference_time": record.inference_time,
+        "detections": detections,
+        "original_url": record.original_path,
+        "overlay_url": record.overlay_path,
+        "overlay_morph_url": None,
+        "mask_url": "",
+        "created_at": record.created_at.isoformat() if record.created_at else None,
+    }
+
+
+def _run_cls_inference(model, img_array, content, filename, project_id, task_id, device, db):
+    """分类推断：返回 top-1 类别 + top-5 概率"""
+    import time
+    t0 = time.time()
+    # YOLO classify 直接接受图片数组，会自动 resize 到模型 imgsz
+    results = model.predict(img_array, verbose=False, device=device if device != "cpu" else "cpu")
+    elapsed = time.time() - t0
+
+    r0 = results[0] if results else None
+    top1_id = -1
+    top1_conf = 0.0
+    top5 = []  # [{class_id, class_name, confidence}]
+
+    if r0 is not None and getattr(r0, "probs", None) is not None:
+        probs = r0.probs
+        top1_id = int(probs.top1) if hasattr(probs, "top1") else -1
+        top1_conf = float(probs.top1conf) if hasattr(probs, "top1conf") else 0.0
+        # top-5
+        if hasattr(probs, "top5") and hasattr(probs, "top5conf"):
+            ids = probs.top5
+            confs = probs.top5conf.cpu().numpy().tolist() if hasattr(probs.top5conf, "cpu") else list(probs.top5conf)
+            for cid, conf in zip(ids, confs):
+                top5.append({"class_id": int(cid), "confidence": round(float(conf), 4)})
+
+    # 类别名映射（DB 找不到时用 model.names 兜底）
+    class_names = _resolve_class_names(model, project_id, db)
+    for d in top5:
+        d["class_name"] = class_names.get(d["class_id"], f"C{d['class_id']}")
+    top1_name = class_names.get(top1_id, f"C{top1_id}")
+
+    # 保存原图（cls 不需要 overlay/mask）
+    infer_dir = settings.runs_path / "inference"
+    infer_dir.mkdir(parents=True, exist_ok=True)
+    rid = uuid.uuid4().hex[:12]
+    cv2.imwrite(str(infer_dir / f"{rid}_original.png"), img_array)
+    url_pfx = "/static/storage/runs/inference"
+
+    # 复用 InferenceResult 表（detections 字段存 top5）
+    record = InferenceResult(
+        project_id=project_id, task_id=task_id,
+        filename=filename or "unknown", device=device,
+        conf_thresh=0.0, iou_thresh=0.0, resize_size=0,
+        num_detections=1 if top1_id >= 0 else 0,
+        inference_time=round(elapsed, 3),
+        detections=top5,
+        original_path=f"{url_pfx}/{rid}_original.png",
+    )
+    db.add(record); db.commit(); db.refresh(record)
+
+    return {
+        "id": record.id,
+        "task_type": "cls",
+        "filename": record.filename,
+        "device": record.device,
+        "inference_time": record.inference_time,
+        "num_detections": record.num_detections,
+        # 与 seg/det 保持兼容：detections 里就是 top5（无 bbox）
+        "detections": top5,
+        "top1": {"class_id": top1_id, "class_name": top1_name, "confidence": round(top1_conf, 4)},
+        "top5": top5,
+        "original_url": record.original_path,
+        # cls 没有这些图，保持字段存在以兼容前端类型
+        "overlay_url": "",
+        "overlay_morph_url": None,
+        "mask_url": "",
+        "created_at": record.created_at.isoformat() if record.created_at else None,
+    }
+
+
+def _resolve_model_path(model_path: str, task_id: int, db: Session) -> str:
+    mp = model_path
+    if not mp and task_id > 0:
+        task = db.query(TrainTask).filter(TrainTask.id == task_id).first()
+        if task and task.best_model_path:
+            mp = task.best_model_path
+    if not mp or not Path(mp).exists():
+        raise HTTPException(status_code=404, detail="模型文件不存在")
+    return mp
+
+
+def _run_inference_core(
+    img_array, content: bytes, filename: str,
+    project_id: int, task_id: int, mp: str,
+    conf: float, iou: float, resize_size: int, device: str,
+    db: Session,
+) -> dict:
+    """
+    共用推理核心：根据 TrainTask.config.task_type 路由到 cls / obb / seg-det。
+    /run 和 /run-by-image-id 共有的逻辑（任务配置 → 路由 → 持久化）抽出来。
+    """
+    # ---- 通道归一化 ----
+    # cv2.imdecode(IMREAD_UNCHANGED) 对灰度 BMP 返回 (H,W) 单通道，对 RGBA 返回 (H,W,4)。
+    # 训练时模型固定吃 3 通道 BGR；
+    #   .pt 模型走 ultralytics dataloader 会自动转，
+    #   但 OpenVINO / ONNX backend 不做这一步，会直接报
+    #   "got [1,1,H,W] expecting [1,3,H,W]"。
+    # cls / obb 这里直接 model.predict(img_array)，必须在入口先转 3 通道；
+    # seg / det 走 core/inference.py 自己也会转，重复一次无害。
+    if img_array is not None:
+        if img_array.ndim == 2:
+            img_array = cv2.cvtColor(img_array, cv2.COLOR_GRAY2BGR)
+        elif img_array.ndim == 3 and img_array.shape[2] == 4:
+            img_array = cv2.cvtColor(img_array, cv2.COLOR_BGRA2BGR)
+        elif img_array.ndim == 3 and img_array.shape[2] == 1:
+            img_array = cv2.cvtColor(img_array, cv2.COLOR_GRAY2BGR)
+
+    crop_size, overlap = 640, 0.2
+    use_morphology, dilate_kernel, erode_kernel = False, 3, 3
+    task_type = "seg"
+    if task_id > 0:
+        task = db.query(TrainTask).filter(TrainTask.id == task_id).first()
+        if task and task.config:
+            crop_size = task.config.get("crop_size", 640)
+            overlap = task.config.get("overlap", 0.2)
+            use_morphology = task.config.get("use_morphology", False)
+            dilate_kernel = task.config.get("dilate_kernel", 3)
+            erode_kernel = task.config.get("erode_kernel", 3)
+            task_type = task.config.get("task_type", "seg")
+        if not project_id and task:
+            project_id = task.project_id
+
+    # 没有 task_id 时（直接选模型推理），尝试从项目 task_type 推
+    if task_type == "seg" and task_id == 0 and project_id > 0:
+        proj = db.query(Project).filter(Project.id == project_id).first()
+        if proj and proj.task_type:
+            task_type = proj.task_type
+
+    model = _get_model(mp, task_type=task_type, device=device)
+
+    # 分类：整图 letterbox 到 imgsz；不滑窗
+    if task_type == "cls":
+        return _run_cls_inference(
+            model=model, img_array=img_array, content=content,
+            filename=filename, project_id=project_id, task_id=task_id,
+            device=device, db=db,
+        )
+    # OBB：整图，输出 4 角点 polygon
+    if task_type == "obb":
+        return _run_obb_inference(
+            model=model, img_array=img_array, filename=filename,
+            project_id=project_id, task_id=task_id,
+            conf=conf, iou=iou, device=device, db=db,
+        )
+
+    # seg / det 走滑窗
+    from core.inference import infer_single_image
+    result = infer_single_image(
+        model=model, image=img_array,
+        crop_size=crop_size, overlap=overlap,
+        conf_thresh=conf, iou_thresh=iou,
+        resize_size=resize_size if resize_size > 0 else None,
+        device=device,
+        use_morphology=use_morphology,
+        dilate_kernel=dilate_kernel,
+        erode_kernel=erode_kernel,
+    )
+
+    # 保存到磁盘
+    infer_dir = settings.runs_path / "inference"
+    infer_dir.mkdir(parents=True, exist_ok=True)
+    rid = uuid.uuid4().hex[:12]
+    save_list = [("original", img_array), ("overlay", result["overlay"]), ("mask", result["mask_image"])]
+    if result.get("overlay_morph") is not None:
+        save_list.append(("overlay_morph", result["overlay_morph"]))
+    for name, img in save_list:
+        cv2.imwrite(str(infer_dir / f"{rid}_{name}.png"), img)
+    url_pfx = "/static/storage/runs/inference"
+
+    # 加载类别名称映射（DB 找不到时用 model.names 兜底）
+    class_names = _resolve_class_names(model, project_id, db)
+
+    # 检测列表
+    detections = []
+    for i in range(result["num_detections"]):
+        box = result["boxes"][i]
+        cid = int(result["classes"][i])
+        detections.append({
+            "class_id": cid,
+            "class_name": class_names.get(cid, f"C{cid}"),
+            "confidence": round(float(result["scores"][i]), 4),
+            "bbox": {"x1": int(box[0]), "y1": int(box[1]), "x2": int(box[2]), "y2": int(box[3])},
+        })
+
+    # 持久化
+    record = InferenceResult(
+        project_id=project_id, task_id=task_id,
+        filename=filename, device=device,
+        conf_thresh=conf, iou_thresh=iou, resize_size=resize_size,
+        num_detections=result["num_detections"],
+        inference_time=round(result.get("inference_time", 0), 3),
+        detections=detections,
+        original_path=f"{url_pfx}/{rid}_original.png",
+        overlay_path=f"{url_pfx}/{rid}_overlay.png",
+        overlay_morph_path=f"{url_pfx}/{rid}_overlay_morph.png" if result.get("overlay_morph") is not None else None,
+        mask_path=f"{url_pfx}/{rid}_mask.png",
+    )
+    db.add(record); db.commit(); db.refresh(record)
+
+    return {
+        "id": record.id,
+        "task_type": task_type,
+        "num_detections": record.num_detections,
+        "inference_time": record.inference_time,
+        "detections": detections,
+        "filename": record.filename,
+        "device": record.device,
+        "original_url": record.original_path,
+        "overlay_url": record.overlay_path,
+        "overlay_morph_url": f"{url_pfx}/{rid}_overlay_morph.png" if result.get("overlay_morph") is not None else None,
+        "mask_url": record.mask_path,
+        "created_at": record.created_at.isoformat() if record.created_at else None,
+    }
+
+
+@router.post("/run")
+async def run_inference(
+    file: UploadFile = File(...),
+    project_id: int = Form(default=0),
+    task_id: int = Form(default=0),
+    model_path: str = Form(default=""),
+    conf: float = Form(default=0.15),
+    iou: float = Form(default=0.5),
+    resize_size: int = Form(default=0),
+    device: str = Form(default="cpu"),
+    db: Session = Depends(get_db),
+):
+    """单张推断 + 持久化（multipart 上传图片）"""
+    mp = _resolve_model_path(model_path, task_id, db)
+
+    # 与 images.upload 一致：先用 file.size 快速拒绝，再流式读以防 OOM
+    max_size = settings.MAX_UPLOAD_SIZE
+    if file.size is not None and file.size > max_size:
+        raise HTTPException(status_code=413, detail=f"图像超过上限 {max_size} 字节")
+    chunks: list[bytes] = []
+    total = 0
+    while True:
+        chunk = await file.read(1024 * 1024)
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > max_size:
+            raise HTTPException(status_code=413, detail=f"图像超过上限 {max_size} 字节")
+        chunks.append(chunk)
+    content = b"".join(chunks)
+    img_array = cv2.imdecode(np.frombuffer(content, np.uint8), cv2.IMREAD_UNCHANGED)
+    if img_array is None:
+        raise HTTPException(status_code=400, detail="无法读取图像")
+    return _run_inference_core(
+        img_array=img_array, content=content,
+        filename=file.filename or "unknown",
+        project_id=project_id, task_id=task_id, mp=mp,
+        conf=conf, iou=iou, resize_size=resize_size, device=device, db=db,
+    )
+
+def _annotation_default_device() -> str:
+    try:
+        import torch
+        return "0" if torch.cuda.is_available() else "cpu"
+    except Exception:
+        return "cpu"
+
+
+def _annotation_model_context(project_id: int, task_id: int, model_path: str, db: Session):
+    project = db.query(Project).filter(Project.id == project_id).first()
+    if not project:
+        raise HTTPException(404, "项目不存在")
+
+    task = None
+    if task_id:
+        task = (
+            db.query(TrainTask)
+            .filter(TrainTask.id == task_id, TrainTask.project_id == project_id)
+            .first()
+        )
+        if not task:
+            raise HTTPException(404, "训练任务不存在")
+
+    if not model_path:
+        if task and task.best_model_path and Path(task.best_model_path).exists():
+            model_path = task.best_model_path
+        else:
+            tasks = (
+                db.query(TrainTask)
+                .filter(
+                    TrainTask.project_id == project_id,
+                    TrainTask.status.in_(["completed", "cancelled"]),
+                    TrainTask.best_model_path.isnot(None),
+                )
+                .order_by(func.coalesce(TrainTask.finished_at, TrainTask.created_at).desc())
+                .all()
+            )
+            for t in tasks:
+                if t.best_model_path and Path(t.best_model_path).exists():
+                    task = t
+                    task_id = t.id
+                    model_path = t.best_model_path
+                    break
+
+    model_path = _resolve_model_path(model_path, task_id, db)
+
+    task_type = project.task_type or "seg"
+    if task and task.config:
+        task_type = task.config.get("task_type", task_type)
+
+    return project, task, task_type, model_path
+
+
+def _read_project_image(image_id: int, db: Session):
+    from ..models.image import Image as ImageModel
+
+    image = db.query(ImageModel).filter(ImageModel.id == image_id).first()
+    if not image:
+        raise HTTPException(404, "图像不存在")
+
+    upload_root = settings.upload_path.resolve()
+    fp = Path(image.file_path)
+    fp = fp.resolve() if fp.is_absolute() else (settings.upload_path / image.file_path).resolve()
+    try:
+        fp.relative_to(upload_root)
+    except ValueError:
+        raise HTTPException(400, "非法路径")
+    if not fp.exists():
+        raise HTTPException(404, f"图像文件不存在: {fp}")
+
+    content = fp.read_bytes()
+    img_array = cv2.imdecode(np.frombuffer(content, np.uint8), cv2.IMREAD_UNCHANGED)
+    if img_array is None:
+        raise HTTPException(400, "无法读取图像")
+
+    if img_array.ndim == 2:
+        img_array = cv2.cvtColor(img_array, cv2.COLOR_GRAY2BGR)
+    elif img_array.ndim == 3 and img_array.shape[2] == 4:
+        img_array = cv2.cvtColor(img_array, cv2.COLOR_BGRA2BGR)
+
+    return image, img_array, content
+
+
+def _class_maps(project_id: int, db: Session):
+    classes = db.query(DefectClass).filter(DefectClass.project_id == project_id).all()
+    return {
+        "index_to_id": {int(c.class_index): int(c.id) for c in classes},
+        "name_to_id": {str(c.name): int(c.id) for c in classes},
+        "id_to_name": {int(c.id): str(c.name) for c in classes},
+    }
+
+
+def _box_polygon(x1, y1, x2, y2, w, h):
+    return [
+        {"x": max(0, min(1, float(x1) / w)), "y": max(0, min(1, float(y1) / h))},
+        {"x": max(0, min(1, float(x2) / w)), "y": max(0, min(1, float(y1) / h))},
+        {"x": max(0, min(1, float(x2) / w)), "y": max(0, min(1, float(y2) / h))},
+        {"x": max(0, min(1, float(x1) / w)), "y": max(0, min(1, float(y2) / h))},
+    ]
+
+
+def _mask_polygon(mask, w: int, h: int):
+    if mask is None:
+        return []
+    m = (mask > 0).astype(np.uint8)
+    contours, _ = cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return []
+    cnt = max(contours, key=cv2.contourArea)
+    if cv2.contourArea(cnt) < 3:
+        return []
+    eps = max(1.0, cv2.arcLength(cnt, True) * 0.002)
+    approx = cv2.approxPolyDP(cnt, eps, True).reshape(-1, 2)
+    if len(approx) > 120:
+        step = len(approx) / 120
+        approx = np.array([approx[int(i * step)] for i in range(120)])
+    return [
+        {"x": max(0, min(1, float(x) / w)), "y": max(0, min(1, float(y) / h))}
+        for x, y in approx
+    ]
+
+
+def _poly_meta(poly, w: int, h: int):
+    xs = [p["x"] * w for p in poly]
+    ys = [p["y"] * h for p in poly]
+    return {
+        "bbox": {
+            "x1": int(min(xs)),
+            "y1": int(min(ys)),
+            "x2": int(max(xs)),
+            "y2": int(max(ys)),
+        },
+        "area": float(cv2.contourArea(np.array([[p["x"] * w, p["y"] * h] for p in poly], dtype=np.float32))),
+    }
+
+
+@router.post("/annotation-current")
+def infer_annotation_current(body: dict = Body(...), db: Session = Depends(get_db)):
+    image_id = int(body.get("image_id") or 0)
+    task_id = int(body.get("task_id") or 0)
+    model_path = body.get("model_path") or ""
+    device = body.get("device") or _annotation_default_device()
+
+    image, img_array, content = _read_project_image(image_id, db)
+    project_id = int(body.get("project_id") or image.project_id)
+
+    project, task, task_type, mp = _annotation_model_context(project_id, task_id, model_path, db)
+    if task_type == "cls":
+        raise HTTPException(400, "分类项目请使用批量推理标注")
+
+    h, w = img_array.shape[:2]
+    maps = _class_maps(project_id, db)
+    model = _get_model(mp, task_type=task_type, device=device)
+
+    annotations = []
+    skipped = 0
+
+    if task_type == "obb":
+        pred = model.predict(img_array, verbose=False, conf=0.35, iou=0.5, device=device if device != "cpu" else "cpu")
+        r0 = pred[0] if pred else None
+        obb = getattr(r0, "obb", None) if r0 is not None else None
+        if obb is not None and obb.xyxyxyxy is not None and len(obb) > 0:
+            polys = obb.xyxyxyxy.cpu().numpy() if hasattr(obb.xyxyxyxy, "cpu") else obb.xyxyxyxy
+            cls_ids = obb.cls.cpu().numpy().astype(int) if hasattr(obb.cls, "cpu") else obb.cls
+            confs = obb.conf.cpu().numpy() if hasattr(obb.conf, "cpu") else obb.conf
+            for poly_px, cls_idx, conf in zip(polys, cls_ids, confs):
+                class_id = maps["index_to_id"].get(int(cls_idx))
+                if not class_id:
+                    skipped += 1
+                    continue
+                poly = [
+                    {"x": max(0, min(1, float(p[0]) / w)), "y": max(0, min(1, float(p[1]) / h))}
+                    for p in poly_px
+                ]
+                meta = _poly_meta(poly, w, h)
+                annotations.append({
+                    "class_id": class_id,
+                    "class_name": maps["id_to_name"].get(class_id),
+                    "confidence": round(float(conf), 4),
+                    "polygon": poly,
+                    **meta,
+                })
+    else:
+        crop_size, overlap = 640, 0.2
+        use_morphology, dilate_kernel, erode_kernel = False, 3, 3
+        if task and task.config:
+            crop_size = task.config.get("crop_size", crop_size)
+            overlap = task.config.get("overlap", overlap)
+            use_morphology = task.config.get("use_morphology", False)
+            dilate_kernel = task.config.get("dilate_kernel", 3)
+            erode_kernel = task.config.get("erode_kernel", 3)
+
+        from core.inference import infer_single_image
+        result = infer_single_image(
+            model=model,
+            image=img_array,
+            crop_size=crop_size,
+            overlap=overlap,
+            conf_thresh=0.35,
+            iou_thresh=0.5,
+            resize_size=None,
+            device=device,
+            use_morphology=use_morphology,
+            dilate_kernel=dilate_kernel,
+            erode_kernel=erode_kernel,
+        )
+
+        for i in range(result["num_detections"]):
+            cls_idx = int(result["classes"][i])
+            class_id = maps["index_to_id"].get(cls_idx)
+            if not class_id:
+                skipped += 1
+                continue
+
+            box = result["boxes"][i]
+            poly = []
+            if task_type == "seg" and i < len(result.get("masks", [])):
+                poly = _mask_polygon(result["masks"][i], w, h)
+            if len(poly) < 3:
+                poly = _box_polygon(box[0], box[1], box[2], box[3], w, h)
+
+            meta = _poly_meta(poly, w, h)
+            annotations.append({
+                "class_id": class_id,
+                "class_name": maps["id_to_name"].get(class_id),
+                "confidence": round(float(result["scores"][i]), 4),
+                "polygon": poly,
+                **meta,
+            })
+
+    return {
+        "image_id": image_id,
+        "task_type": task_type,
+        "model_path": mp,
+        "count": len(annotations),
+        "skipped": skipped,
+        "annotations": annotations,
+    }
+
+
+@router.post("/annotation-cls-batch")
+def infer_annotation_cls_batch(body: dict = Body(...), db: Session = Depends(get_db)):
+    from ..models.image import Image as ImageModel
+
+    project_id = int(body.get("project_id") or 0)
+    image_ids = body.get("image_ids") or []
+    task_id = int(body.get("task_id") or 0)
+    model_path = body.get("model_path") or ""
+    only_unlabeled = bool(body.get("only_unlabeled", True))
+    annotator = body.get("annotator")
+    device = body.get("device") or _annotation_default_device()
+
+    if not image_ids:
+        raise HTTPException(400, "image_ids 不能为空")
+
+    project, task, task_type, mp = _annotation_model_context(project_id, task_id, model_path, db)
+    if task_type != "cls":
+        raise HTTPException(400, "仅分类项目支持批量推理标注")
+
+    model = _get_model(mp, task_type="cls", device=device)
+    maps = _class_maps(project_id, db)
+    model_names = _resolve_class_names(model, project_id, db)
+
+    images = (
+        db.query(ImageModel)
+        .filter(ImageModel.project_id == project_id, ImageModel.id.in_(image_ids))
+        .all()
+    )
+
+    updated = 0
+    skipped_existing = 0
+    skipped_unmatched = 0
+    failed = 0
+    items = []
+
+    for img in images:
+        if only_unlabeled and img.class_id is not None:
+            skipped_existing += 1
+            continue
+
+        try:
+            _, img_array, _ = _read_project_image(img.id, db)
+            pred = model.predict(img_array, verbose=False, device=device if device != "cpu" else "cpu")
+            r0 = pred[0] if pred else None
+            probs = getattr(r0, "probs", None) if r0 is not None else None
+            if probs is None:
+                failed += 1
+                continue
+
+            top1 = int(probs.top1)
+            conf = float(probs.top1conf)
+            pred_name = model_names.get(top1, f"C{top1}")
+            class_id = maps["name_to_id"].get(pred_name) or maps["index_to_id"].get(top1)
+
+            if not class_id:
+                skipped_unmatched += 1
+                items.append({"image_id": img.id, "filename": img.filename, "matched": False, "pred_name": pred_name})
+                continue
+
+            img.class_id = class_id
+            if img.status != "reviewed":
+                img.status = "labeled"
+            if annotator:
+                img.annotator = annotator
+
+            updated += 1
+            items.append({
+                "image_id": img.id,
+                "filename": img.filename,
+                "class_id": class_id,
+                "class_name": maps["id_to_name"].get(class_id),
+                "confidence": round(conf, 4),
+                "matched": True,
+            })
+        except Exception:
+            failed += 1
+
+    db.commit()
+    return {
+        "updated": updated,
+        "skipped_existing": skipped_existing,
+        "skipped_unmatched": skipped_unmatched,
+        "failed": failed,
+        "items": items,
+    }
+
+@router.post("/run-by-image-id")
+def run_inference_by_image_id(
+    image_id: int = Form(...),
+    project_id: int = Form(default=0),
+    task_id: int = Form(default=0),
+    model_path: str = Form(default=""),
+    conf: float = Form(default=0.15),
+    iou: float = Form(default=0.5),
+    resize_size: int = Form(default=0),
+    device: str = Form(default="cpu"),
+    db: Session = Depends(get_db),
+):
+    """
+    按 image_id 推断（"推理训练图"批量场景）。
+    直接从本地读文件，跳过 multipart 上传，避免前端"下载→再上传"的浪费。
+    返回里多带 source_image_id / source_class_id 给前端核对 ground truth。
+    """
+    from ..models.image import Image as ImageModel
+
+    image = db.query(ImageModel).filter(ImageModel.id == image_id).first()
+    if not image:
+        raise HTTPException(404, "图像不存在")
+    if not project_id:
+        project_id = image.project_id
+
+    # 与 get_image_file 一致：DB-stored file_path 走 upload_path 拼接 + 边界校验，
+    # 防 DB 被改后通过该端点读取 STORAGE_ROOT 之外的任意文件
+    upload_root = settings.upload_path.resolve()
+    fp = Path(image.file_path)
+    if fp.is_absolute():
+        fp = fp.resolve()
+    else:
+        fp = (settings.upload_path / image.file_path).resolve()
+    try:
+        fp.relative_to(upload_root)
+    except ValueError:
+        raise HTTPException(400, "非法路径")
+    if not fp.exists():
+        raise HTTPException(404, f"图像文件不存在: {fp}")
+
+    mp = _resolve_model_path(model_path, task_id, db)
+    content = fp.read_bytes()
+    img_array = cv2.imdecode(np.frombuffer(content, np.uint8), cv2.IMREAD_UNCHANGED)
+    if img_array is None:
+        raise HTTPException(400, "无法读取图像")
+
+    result = _run_inference_core(
+        img_array=img_array, content=content,
+        filename=image.filename or fp.name,
+        project_id=project_id, task_id=task_id, mp=mp,
+        conf=conf, iou=iou, resize_size=resize_size, device=device, db=db,
+    )
+    result["source_image_id"] = image_id
+    result["source_class_id"] = image.class_id
+    return result
+
+
+@router.get("/project-images")
+def list_project_images_for_inference(
+    project_id: int = Query(...),
+    status: str = Query(default="labeled", description="labeled / reviewed / all"),
+    class_id: int | None = Query(default=None, description="按 class_id 过滤（cls 项目）"),
+    limit: int = Query(default=100, ge=1, le=2000),
+    sample: bool = Query(default=True, description="True=随机抽样, False=按创建时间倒序"),
+    db: Session = Depends(get_db),
+):
+    """
+    返回项目下用于"推理训练图"的图片列表（仅 id + filename + class_id）。
+    前端拿到列表后循环调 /run-by-image-id。
+    """
+    from ..models.image import Image as ImageModel
+
+    q = db.query(ImageModel).filter(ImageModel.project_id == project_id)
+    if status == "labeled":
+        q = q.filter(ImageModel.status.in_(["labeled", "reviewed"]))
+    elif status == "reviewed":
+        q = q.filter(ImageModel.status == "reviewed")
+    if class_id is not None:
+        q = q.filter(ImageModel.class_id == class_id)
+
+    total = q.count()
+    if sample:
+        # MySQL: ORDER BY RAND() — 单查询完成抽样，不再把所有 id 拉到 Python
+        items = q.order_by(func.rand()).limit(limit).all()
+    else:
+        items = q.order_by(ImageModel.created_at.desc()).limit(limit).all()
+
+    return {
+        "total": total,
+        "returned": len(items),
+        "items": [
+            {"id": img.id, "filename": img.filename, "class_id": img.class_id, "status": img.status}
+            for img in items
+        ],
+    }
+
+
+@router.get("/history")
+def list_history(project_id: int = Query(default=0), page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=50, ge=1, le=200), db: Session = Depends(get_db)):
+    q = db.query(InferenceResult)
+    if project_id > 0: q = q.filter(InferenceResult.project_id == project_id)
+    total = q.count()
+    items = q.order_by(InferenceResult.created_at.desc()).offset((page-1)*page_size).limit(page_size).all()
+
+    # 一次性把页面里涉及的 project_id / task_id 全捞出来，避免在循环里 N+1
+    project_ids = {r.project_id for r in items if r.project_id}
+    task_ids = {r.task_id for r in items if r.task_id}
+
+    cn_cache: dict[int, dict] = {pid: {} for pid in project_ids}
+    if project_ids:
+        for dc in db.query(DefectClass).filter(DefectClass.project_id.in_(project_ids)).all():
+            cn_cache.setdefault(dc.project_id, {})[dc.class_index] = dc.name
+
+    tt_cache: dict[int, str] = {}
+    if task_ids:
+        for t in db.query(TrainTask).filter(TrainTask.id.in_(task_ids)).all():
+            tt_cache[t.id] = (t.config or {}).get("task_type", "seg") if t.config else "seg"
+
+    def enrich(dets, pid):
+        if not dets: return []
+        names = cn_cache.get(pid, {}) if pid else {}
+        for d in dets:
+            if "class_name" not in d or not d.get("class_name"):
+                cid = d.get("class_id", 0)
+                d["class_name"] = names.get(cid, f"C{cid}")
+        return dets
+
+    def get_task_type(tid: int) -> str:
+        return tt_cache.get(tid, "seg")
+
+    def infer_task_type(r) -> str:
+        """优先从 TrainTask.config 取；取不到时根据 detections 字段兜底判断"""
+        tt = get_task_type(r.task_id) if r.task_id else None
+        if tt:
+            return tt
+        dets = r.detections or []
+        if dets:
+            d0 = dets[0]
+            if "polygon" in d0 and isinstance(d0.get("polygon"), list) and len(d0.get("polygon")) == 4:
+                return "obb"
+            if "bbox" not in d0:
+                return "cls"
+        return "seg"
+
+    return {"total": total, "page": page, "page_size": page_size, "items": [
+        {"id": r.id, "filename": r.filename, "num_detections": r.num_detections,
+         "inference_time": r.inference_time, "device": r.device,
+         "task_type": infer_task_type(r),
+         "detections": enrich(r.detections or [], r.project_id),
+         "original_url": r.original_path or "", "overlay_url": r.overlay_path or "",
+         "overlay_morph_url": r.overlay_morph_path,
+         "mask_url": r.mask_path or "", "created_at": r.created_at.isoformat() if r.created_at else None}
+        for r in items]}
+
+
+def _url_to_disk(url: str) -> Path | None:
+    """
+    把 /static/storage/... URL 反解成磁盘路径，并强制约束在 STORAGE_ROOT 内。
+    URL 通常来自 DB 中我们自己写入的值，但加一层 resolve + is_relative_to
+    防止 DB 被篡改时通过路径穿越触发任意文件删除。
+    """
+    root = Path(settings.STORAGE_ROOT).resolve()
+    rel = url.replace("/static/storage/", "", 1).lstrip("/\\")
+    if not rel:
+        return None
+    target = (root / rel).resolve()
+    try:
+        target.relative_to(root)
+    except ValueError:
+        return None
+    return target
+
+
+@router.delete("/history/{rid}")
+def del_history(rid: int, db: Session = Depends(get_db)):
+    r = db.query(InferenceResult).filter(InferenceResult.id == rid).first()
+    if not r: raise HTTPException(404, "不存在")
+    for p in [r.original_path, r.overlay_path, r.mask_path]:
+        if p:
+            fp = _url_to_disk(p)
+            if fp and fp.exists(): fp.unlink()
+    db.delete(r); db.commit()
+    return {"ok": True}
+
+
+@router.delete("/history")
+def clear_history(project_id: int = Query(default=0), db: Session = Depends(get_db)):
+    q = db.query(InferenceResult)
+    if project_id > 0: q = q.filter(InferenceResult.project_id == project_id)
+    recs = q.all()
+    for r in recs:
+        for p in [r.original_path, r.overlay_path, r.mask_path]:
+            if p:
+                fp = _url_to_disk(p)
+                if fp and fp.exists(): fp.unlink()
+        db.delete(r)
+    db.commit()
+    return {"ok": True, "deleted": len(recs)}
+
+
+# ============================================================
+# 缺陷小图切割（仅 seg 项目，给二级分类模型当训练集）
+# ============================================================
+
+def _crop_defect_for_classifier(img, bbox, target_min: int = 128, target_max: int = 512):
+    """
+    按规则切单个缺陷小图。
+
+    规则：
+    - 长边 > target_max:  以 bbox 中心切 long×long 正方形 → resize 到 target_max
+    - 长边 < target_min:  以 bbox 中心切 target_min×target_min（不缩放，向外膨胀）
+    - 中间:               以 bbox 中心切 long×long 正方形（不缩放，按长边补正方形）
+    边缘越界时窗口往内推保完整；fallback：side 不超过原图最小边。
+
+    Args:
+        img: 原图 ndarray
+        bbox: dict {x1, y1, x2, y2}（推理 detection 里的格式）
+
+    Returns:
+        (crop_ndarray, output_size)  — output_size 用于命名
+    """
+    H, W = img.shape[:2]
+    x1, y1 = int(bbox["x1"]), int(bbox["y1"])
+    x2, y2 = int(bbox["x2"]), int(bbox["y2"])
+    w = max(1, x2 - x1)
+    h = max(1, y2 - y1)
+    long_edge = max(w, h)
+    cx = (x1 + x2) // 2
+    cy = (y1 + y2) // 2
+
+    side = max(long_edge, target_min)
+    side = min(side, min(W, H))  # fallback：原图比目标还小
+
+    # 居中切窗口；超边时往内推
+    x0 = max(0, min(cx - side // 2, W - side))
+    y0 = max(0, min(cy - side // 2, H - side))
+    crop = img[y0:y0 + side, x0:x0 + side]
+
+    if long_edge > target_max:
+        crop = cv2.resize(crop, (target_max, target_max), interpolation=cv2.INTER_AREA)
+        return crop, target_max
+    return crop, side
+
+
+@router.post("/crop-defects")
+def crop_defects_for_classifier(
+    project_id: int = Query(...),
+    db: Session = Depends(get_db),
+):
+    """
+    遍历项目所有推理记录，按缺陷 bbox 切小图，按类别打包成 zip 下载。
+
+    仅适用于 seg 项目（其他 task_type 返回 400）。
+    用途：给二级分类模型当训练集 — 解压后每个类别一个文件夹，可直接喂 yolo-cls。
+
+    切图规则见 _crop_defect_for_classifier。
+    命名: <类别名>/<类别名>_<输出尺寸>_<序号>.<原图扩展名>
+    """
+    import io
+    import zipfile
+
+    project = db.query(Project).filter(Project.id == project_id).first()
+    if not project:
+        raise HTTPException(404, "项目不存在")
+    if project.task_type != "seg":
+        raise HTTPException(400, f"仅实例分割项目支持切割小图，当前 task_type={project.task_type}")
+
+    records = (
+        db.query(InferenceResult)
+        .filter(InferenceResult.project_id == project_id)
+        .order_by(InferenceResult.created_at)
+        .all()
+    )
+    if not records:
+        raise HTTPException(400, "项目下没有推理记录，先做推理")
+
+    counters: dict = {}      # (cls_name, out_size) -> 序号
+    crops: list = []         # [(zip_path, file_bytes)]
+
+    for rec in records:
+        if rec.num_detections == 0 or not rec.detections or not rec.original_path:
+            continue
+        fp = _url_to_disk(rec.original_path)
+        if not fp.exists():
+            continue
+        img = cv2.imread(str(fp), cv2.IMREAD_UNCHANGED)
+        if img is None:
+            continue
+        # 输出格式跟随原图扩展名
+        ext = fp.suffix.lower()
+        if ext not in (".bmp", ".png", ".jpg", ".jpeg"):
+            ext = ".png"
+
+        # DB 里 bbox 是【推理时缩放后】的坐标系（长边 = rec.resize_size）。
+        # 把图按当时的缩放参数也缩到推理尺寸，让 img 和 bbox 落在同一坐标系里再切。
+        # 想要高清小图就推理时不缩放（resize_size=0），分割本身在缩放图上做的，
+        # 小图反向放大到原图分辨率对下游分类没有信息增益。
+        if rec.resize_size and rec.resize_size > 0:
+            h, w = img.shape[:2]
+            long_side = max(h, w)
+            if long_side != rec.resize_size:
+                scale = rec.resize_size / long_side
+                img = cv2.resize(img, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_CUBIC)
+
+        for det in rec.detections:
+            bbox = det.get("bbox")
+            if not bbox:
+                continue
+            cls_name = det.get("class_name") or f"C{det.get('class_id', 0)}"
+            try:
+                crop, out_size = _crop_defect_for_classifier(img, bbox)
+            except Exception:
+                continue
+            if crop is None or crop.size == 0:
+                continue
+
+            ok, buf = cv2.imencode(ext, crop)
+            if not ok:
+                continue
+
+            key = (cls_name, out_size)
+            idx = counters.get(key, 0)
+            counters[key] = idx + 1
+            stem = Path((rec.filename or "image").replace("\\", "/")).stem or "image"
+            ts = datetime.now().strftime("%H%M%S%f")[:-3]
+            zip_name = f"{cls_name}/{stem}_{cls_name}_{out_size}_{idx}_{ts}{ext}"
+            crops.append((zip_name, buf.tobytes()))
+
+    if not crops:
+        raise HTTPException(400, "推理记录中没有可切割的缺陷")
+
+    mem = io.BytesIO()
+    with zipfile.ZipFile(mem, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
+        for name, data in crops:
+            zf.writestr(name, data)
+    mem.seek(0)
+
+    return StreamingResponse(
+        mem,
+        media_type="application/zip",
+        headers={
+            "Content-Disposition": f'attachment; filename="project_{project_id}_crops_{len(crops)}.zip"',
+            "X-Crop-Count": str(len(crops)),
+            # 不放类别名 header（HTTP header 限 latin-1，中文类名会炸）
+        },
+    )

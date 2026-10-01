@@ -1,0 +1,33 @@
+# ---- Web 框架 ----
+fastapi>=0.110.0
+uvicorn[standard]>=0.27.0
+python-multipart>=0.0.6        # 文件上传
+
+# ---- 数据库 ----
+# 本平台只使用 Python 内置 sqlite3（本地文件存储），无需安装任何数据库驱动
+sqlalchemy>=2.0.0
+
+# ---- 安全 ----
+cryptography>=42.0.0           # license 验签（ed25519）
+
+# ---- 图像处理 ----
+opencv-python>=4.8.0
+numpy>=1.24.0
+Pillow>=10.0.0
+
+# ---- 工具 ----
+pydantic>=2.0.0
+pydantic-settings>=2.0.0
+pyyaml>=6.0
+
+# ---- 训练相关 ----
+# 运行时为 Python 3.14 + torch 2.9.0+cpu（2026-09-21 从 3.10 迁移）。
+# 安装 CPU 版 torch/torchvision 必须走 pytorch 专用 index（PyPI 上是 CUDA 大包）：
+#   pip install torch==2.9.0 torchvision==0.24.0 --index-url https://download.pytorch.org/whl/cpu
+# 【系统级前置】torch ≥2.9 需要 VC++ 2015-2022 Redist ≥ 14.40（System32 的 MSVCP140.dll），
+# 缺失时 c10.dll 初始化报 WinError 1114。先装 https://aka.ms/vs/17/release/vc_redist.x64.exe
+ultralytics>=8.3.0
+matplotlib>=3.7.0
+pandas>=2.0.0           # core/train.py 直接用（2026-09 发现旧 venv 漏装）
+torch==2.9.0            # CPU 版，见上方专用 index 说明
+torchvision==0.24.0

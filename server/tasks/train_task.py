@@ -1,0 +1,533 @@
+# -*- coding: utf-8 -*-
+"""
+训练流水线（后台线程执行，无 Celery/Redis）
+==============================================
+在 uvicorn 进程内的守护线程中执行完整训练流水线：
+数据集构建 → 预处理 → 滑窗 → 划分 → 训练。
+通过 epoch_callback 将训练指标实时写入 SQLite，前端通过轮询获取。
+
+并发模型：同一时间只允许一个训练任务（training_dispatcher 单例把关）。
+取消机制：cancel_check 周期性查库，命中 cancelled 后 Ultralytics 在 epoch 边界
+优雅退出（与旧 Celery 版本一致，只是执行载体从 worker 进程换成了守护线程）。
+"""
+
+import sys
+import threading
+import traceback
+from datetime import datetime
+from pathlib import Path
+
+# 确保项目根目录在 sys.path 中，以便导入 core/ 模块
+_project_root = str(Path(__file__).parent.parent.parent)
+if _project_root not in sys.path:
+    sys.path.insert(0, _project_root)
+
+from ..database import SessionLocal
+from ..models.train_task import TrainTask, TrainEpochLog
+from ..models.project import Project
+from ..services.dataset_service import (
+    prepare_full_dataset, prepare_detection_dataset, prepare_classification_dataset,
+    prepare_obb_dataset,
+)
+from ..config import settings
+
+
+def _format_training_failure(exc: Exception, config: dict, trace_text: str) -> str:
+    """把常见的资源/参数错误转换为可操作的中文提示，并保留技术堆栈。"""
+    config = config or {}
+    detail = f"{exc}\n{trace_text}"
+    detail_lower = detail.lower()
+    model_name = config.get("model_name", "未记录")
+    imgsz = config.get("crop_size", "未记录")
+    batch_size = config.get("batch_size", "未记录")
+    workers = config.get("workers", "未记录")
+    params = (
+        f"当前参数：模型={model_name}，输入尺寸={imgsz}，"
+        f"Batch Size={batch_size}，DataLoader Workers={workers}。"
+    )
+
+    if "cuda out of memory" in detail_lower or "torch.outofmemoryerror" in detail_lower:
+        try:
+            next_batch = max(1, int(batch_size) // 2)
+            batch_tip = f"建议先把 Batch Size 降到 {next_batch} 或更低"
+        except (TypeError, ValueError):
+            batch_tip = "请减小 Batch Size"
+        guidance = (
+            "训练失败：GPU 显存不足。\n"
+            f"{params}\n"
+            f"{batch_tip}，关闭其他占用 GPU 的程序后重新训练。"
+        )
+    elif any(token in detail_lower for token in (
+        "insufficient memory",
+        "outofmemoryerror",
+        "failed to allocate",
+        "paging file is too small",
+        "not enough memory",
+    )):
+        guidance = (
+            "训练失败：系统内存或虚拟内存不足。\n"
+            f"{params}\n"
+            "请将 DataLoader Workers 调低到 0～2，关闭占用内存较大的程序，"
+            "必要时增大 Windows 虚拟内存，然后重新训练。"
+        )
+    elif any(token in detail_lower for token in (
+        "dataloader worker",
+        "worker exited unexpectedly",
+        "broken pipe",
+        "can't start new thread",
+        "cannot start new thread",
+    )):
+        guidance = (
+            "训练失败：数据加载子进程启动或运行异常。\n"
+            f"{params}\n"
+            "请把 DataLoader Workers 改为 0 后重新训练；高配机器稳定后可再逐步增加。"
+        )
+    else:
+        return detail
+
+    return f"{guidance}\n\n技术详情：\n{detail}"
+
+
+def _release_training_resources() -> None:
+    """训练宿主进程常驻，任务结束后显式回收内存缓存。"""
+    import gc
+
+    gc.collect()
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            # 回收 CUDA IPC 缓存；部分环境不支持，失败不影响任务状态。
+            try:
+                torch.cuda.ipc_collect()
+            except Exception:
+                pass
+    except Exception as cleanup_error:
+        print(f"[训练资源清理警告] {cleanup_error}")
+
+
+def run_training_pipeline(task_id: int) -> dict:
+    """
+    后台线程入口：执行完整训练流水线。
+    """
+    # 确保 core/ 可导入（守护线程环境下 sys.path 可能不含项目根目录）
+    import sys
+    _root = str(Path(__file__).parent.parent.parent)
+    if _root not in sys.path:
+        sys.path.insert(0, _root)
+
+    db = SessionLocal()
+    config = {}
+
+    try:
+        task = db.query(TrainTask).filter(TrainTask.id == task_id).first()
+        if not task:
+            return {"error": f"Task {task_id} not found"}
+
+        # 已落终态的任务在服务重启时可能残留非终态状态（旧线程随进程消亡），
+        # 不能让 "preparing" 把 cancelled 覆盖回去。
+        if task.status in ("cancelled", "completed", "failed"):
+            print(f"[task_{task_id}] status={task.status}, skip duplicate execution")
+            return {"skipped": True, "status": task.status}
+
+        config = task.config or {}
+        project_id = task.project_id
+
+        # 读取项目任务类型
+        project = db.query(Project).filter(Project.id == project_id).first()
+        task_type = (project.task_type if project else "seg") or "seg"
+        config["task_type"] = task_type
+
+        # 分类继承训练时，父模型的 output index 才是标签真相。先读取其类别
+        # 名称，数据集构建阶段会按语义把当前项目的中文类别排到同一顺序。
+        resume_class_names = None
+        if task_type == "cls" and config.get("train_mode") == "finetune":
+            resume_task_id = config.get("resume_from_task_id")
+            resume_model_type = config.get("resume_model_type", "best")
+            if resume_task_id:
+                previous_task = db.query(TrainTask).filter(TrainTask.id == resume_task_id).first()
+                if previous_task:
+                    previous_path = (
+                        previous_task.best_model_path
+                        if resume_model_type == "best"
+                        else previous_task.last_model_path
+                    )
+                    previous_names = (previous_task.config or {}).get("class_names")
+                    if previous_path and Path(previous_path).exists() and isinstance(previous_names, list):
+                        resume_class_names = previous_names
+                    elif previous_path and Path(previous_path).exists():
+                        raise ValueError(
+                            f"继承分类任务 {resume_task_id} 缺少类别映射记录，"
+                            "为避免标签错位，已拒绝开始训练。"
+                        )
+
+        # 更新状态
+        task.status = "preparing"
+        task.started_at = datetime.now()
+        # 清掉上次跑剩的 finished_at（重启复跑场景），避免前端按
+        # finished_at-started_at 算出负耗时
+        task.finished_at = None
+        db.commit()
+
+        # ---- 任务目录 ----
+        task_dir = settings.runs_path / f"task_{task_id}"
+        task_dir.mkdir(parents=True, exist_ok=True)
+        task.output_dir = str(task_dir)
+        db.commit()
+
+        # ---- 阶段 1~3: 数据集准备（按任务类型分支）----
+        if task_type == "cls":
+            dataset_result = prepare_classification_dataset(
+                project_id=project_id,
+                task_output_dir=str(task_dir),
+                db=db,
+                train_ratio=config.get("train_ratio", 0.8),
+                model_class_names=resume_class_names,
+            )
+        elif task_type == "det":
+            dataset_result = prepare_detection_dataset(
+                project_id=project_id,
+                task_output_dir=str(task_dir),
+                db=db,
+                train_ratio=config.get("train_ratio", 0.85),
+            )
+        elif task_type == "obb":
+            dataset_result = prepare_obb_dataset(
+                project_id=project_id,
+                task_output_dir=str(task_dir),
+                db=db,
+                train_ratio=config.get("train_ratio", 0.85),
+            )
+        else:
+            dataset_result = prepare_full_dataset(
+                project_id=project_id,
+                task_output_dir=str(task_dir),
+                db=db,
+                target_h=config.get("resize_h", 2048),
+                target_w=config.get("resize_w", 2048),
+                crop_size=config.get("crop_size", 640),
+                overlap=config.get("overlap", 0.2),
+                train_ratio=config.get("train_ratio", 0.8),
+                oversample_factor=config.get("oversample_factor", 5),
+                bg_keep_ratio=0,
+                use_morphology=config.get("use_morphology", True),
+                dilate_kernel=config.get("dilate_kernel", 3),
+                erode_kernel=config.get("erode_kernel", 3),
+                mask_dilate_kernel=config.get("mask_dilate_kernel", 0),
+            )
+
+        dataset_dir = dataset_result["dataset_dir"]
+        class_names = dataset_result["class_names"]
+
+        # 保存类别信息到 config（供后续继承训练时校验）
+        config["class_names"] = class_names
+        if task_type == "cls":
+            config["classification_class_mapping"] = dataset_result.get("class_mapping", [])
+            config["classification_dataset_folders"] = dataset_result.get("class_folder_names", [])
+        task.config = config
+        db.commit()
+
+        # ---- 生成 dataset.yaml（cls 模式 Ultralytics 直接吃数据集目录）----
+        if task_type == "cls":
+            # 分类：data 参数直接传 dataset 目录（YOLO 自动按子目录扫描类别）
+            dataset_yaml = dataset_dir
+        else:
+            from core.train import generate_dataset_yaml
+            dataset_yaml = str(task_dir / "dataset.yaml")
+            generate_dataset_yaml(
+                dataset_dir=dataset_dir,
+                output_path=dataset_yaml,
+                class_names=class_names,
+            )
+
+        # ---- 阶段 4: 模型训练 ----
+        task.status = "training"
+        task.epochs = config.get("epochs", 150)
+        db.commit()
+
+        # 确定模型来源（从头训练 or 继承训练）
+        model_name = config.get("model_name", "yolo26s-seg")  # 用户选择的模型尺寸
+        train_mode = config.get("train_mode", "scratch")
+        if train_mode == "finetune":
+            resume_task_id = config.get("resume_from_task_id")
+            resume_model_type = config.get("resume_model_type", "best")
+            if resume_task_id:
+                prev_task = db.query(TrainTask).filter(TrainTask.id == resume_task_id).first()
+                if prev_task:
+                    prev_path = prev_task.best_model_path if resume_model_type == "best" else prev_task.last_model_path
+                    if prev_path and Path(prev_path).exists():
+                        model_name = prev_path
+                        print(f"[继承训练] 从 Task#{resume_task_id} {resume_model_type}.pt 继续: {prev_path}")
+                    else:
+                        print(f"[警告] 继承模型不存在，回退为从头训练")
+                else:
+                    print(f"[警告] 找不到 Task#{resume_task_id}，回退为从头训练")
+
+        def cancel_check() -> bool:
+            """
+            被 core/train.py 周期性调用，检查训练任务是否需要中止。
+            判定条件：
+              - 任务记录已被删除（用户在前端误删了正在跑的任务）
+              - 任务状态被改成 'cancelled'（用户在前端按了取消/暂停）
+            返回 True 时，Ultralytics 会在最近的 epoch 边界停止训练。
+            用独立 session 查询，避免与外层 db 的事务隔离冲突。
+            """
+            check_db = SessionLocal()
+            try:
+                t = check_db.query(TrainTask).filter(TrainTask.id == task_id).first()
+                if t is None:
+                    return True  # 任务被删除
+                if t.status == "cancelled":
+                    return True
+                return False
+            except Exception as e:
+                print(f"[cancel_check db error] {e}")
+                return False
+            finally:
+                check_db.close()
+
+        def epoch_callback(data: dict):
+            """
+            每个 epoch 结束后的回调。
+            写入/更新 train_epoch_logs 表，更新 train_tasks 进度。
+
+            关键点：
+            1. **upsert**：Ultralytics 训练结束后会用 best.pt 再做一次 final val，
+               触发回调时 trainer.epoch 仍是最后一个 epoch 编号。
+               用 (task_id, epoch) 做 upsert，避免同一个 epoch 写两条记录。
+            2. **best 跟 fitness 走**：Ultralytics 用 fitness 选 best.pt，
+               不是用单纯 mAP50。我们以 trainer.best_fitness 的增量为准
+               同步更新 best_map50，确保界面显示的 best_map50 与 best.pt 实际指标一致。
+            """
+            try:
+                ep = data.get("epoch", 0)
+
+                # ---- upsert epoch 日志 ----
+                existing = (
+                    db.query(TrainEpochLog)
+                    .filter(TrainEpochLog.task_id == task_id, TrainEpochLog.epoch == ep)
+                    .first()
+                )
+                # cls 任务只有 train/loss + val/loss（单一分类 loss），别名落到 *_cls_loss 列
+                # 这样前端无论 seg/det/obb/cls 都从 cls_loss 列读 loss 曲线即可
+                if data.get("train_loss") is not None and data.get("train_cls_loss") is None:
+                    data["train_cls_loss"] = data["train_loss"]
+                if data.get("val_loss") is not None and data.get("val_cls_loss") is None:
+                    data["val_cls_loss"] = data["val_loss"]
+
+                fields = dict(
+                    train_box_loss=data.get("train_box_loss"),
+                    train_seg_loss=data.get("train_seg_loss"),
+                    train_cls_loss=data.get("train_cls_loss"),
+                    train_dfl_loss=data.get("train_dfl_loss"),
+                    val_box_loss=data.get("val_box_loss"),
+                    val_seg_loss=data.get("val_seg_loss"),
+                    val_cls_loss=data.get("val_cls_loss"),
+                    val_dfl_loss=data.get("val_dfl_loss"),
+                    precision_b=data.get("precision_B"),
+                    recall_b=data.get("recall_B"),
+                    map50_b=data.get("mAP50_B"),
+                    map50_95_b=data.get("mAP50_95_B"),
+                    map50_m=data.get("mAP50_M"),
+                    map50_95_m=data.get("mAP50_95_M"),
+                    top1_acc=data.get("top1_acc"),
+                    top5_acc=data.get("top5_acc"),
+                    lr=data.get("lr"),
+                )
+                if existing is not None:
+                    # 已存在则覆盖（final val 会触发同 epoch 的二次回调，用最新值覆盖）
+                    for k, v in fields.items():
+                        setattr(existing, k, v)
+                else:
+                    db.add(TrainEpochLog(task_id=task_id, epoch=ep, **fields))
+
+                # ---- 更新任务进度 + best 指标 ----
+                task_obj = db.query(TrainTask).filter(TrainTask.id == task_id).first()
+                if task_obj:
+                    task_obj.current_epoch = ep + 1
+
+                    # 分类验收使用 Top-1 Accuracy；数据库历史字段 best_map50 在
+                    # cls 任务中兼容承载这个最佳值，前端会按 task_type 显示 Top-1。
+                    if task_type == "cls" and data.get("top1_acc") is not None:
+                        task_obj.best_map50 = max(
+                            task_obj.best_map50 or 0.0,
+                            float(data["top1_acc"]),
+                        )
+
+                    # trainer.best_fitness 由 core/train.py 透传过来，
+                    # 是 Ultralytics 内部维护的"包括当前 epoch 的"历史最佳。
+                    # 当它增加时，说明当前 epoch 是新最佳，对应的就是 best.pt 的权重。
+                    new_best_fit = data.get("best_fitness", 0) or 0
+                    prev_best_fit = task_obj.best_fitness or 0
+                    if new_best_fit > prev_best_fit:
+                        task_obj.best_fitness = new_best_fit
+                        if task_type != "cls":
+                            # 同步更新 best_map50（与 best.pt 对应的 epoch 一致）
+                            cur_map50 = data.get("mAP50_B", 0) or 0
+                            task_obj.best_map50 = cur_map50
+
+                db.commit()
+            except Exception as e:
+                db.rollback()
+                print(f"[epoch_callback error] {e}")
+
+        # 调用现有 core/train.py
+        from core.train import run_train
+        train_result = run_train(
+            dataset_yaml=dataset_yaml,
+            output_dir=str(task_dir / "runs"),
+            model_name=model_name,
+            imgsz=config.get("crop_size", 640),
+            epochs=config.get("epochs", 150),
+            batch_size=config.get("batch_size", 16),
+            patience=config.get("patience", 0),
+            device=config.get("device", "cpu"),
+            task_type=task_type,
+            augment_hsv_h=config.get("hsv_h", 0.015),
+            augment_hsv_s=config.get("hsv_s", 0.7),
+            augment_hsv_v=config.get("hsv_v", 0.4),
+            augment_degrees=config.get("degrees", 10.0),
+            augment_translate=config.get("translate", 0.1),
+            augment_scale=config.get("scale", 0.5),
+            augment_shear=config.get("shear", 5.0),
+            augment_flipud=config.get("flipud", 0.5),
+            augment_fliplr=config.get("fliplr", 0.5),
+            augment_mosaic=config.get("mosaic", 0.3),
+            augment_mixup=config.get("mixup", 0.1),
+            augment_copy_paste=config.get("copy_paste", 0.5),
+            augment_erasing=config.get("erasing", 0.0),
+            close_mosaic=config.get("close_mosaic", 30),
+            lr0=config.get("lr0", 0.01),
+            lrf=config.get("lrf", 0.01),
+            momentum=config.get("momentum", 0.937),
+            weight_decay=config.get("weight_decay", 0.0005),
+            warmup_epochs=config.get("warmup_epochs", 3.0),
+            warmup_momentum=config.get("warmup_momentum", 0.8),
+            workers=config.get("workers", 4),
+            epoch_callback=epoch_callback,
+            cancel_check=cancel_check,
+        )
+
+        # ImageFolder 使用的 0000/0001 目录仅用于锁定标签 index。权重落盘后
+        # 立即写回中文显示名，确保后续继承、在线推理和 OpenVINO 导出一致。
+        if task_type == "cls":
+            from ..services.classification_metadata import write_classification_checkpoint_names
+            write_classification_checkpoint_names(
+                [train_result.get("best_pt"), train_result.get("last_pt")],
+                class_names,
+            )
+
+        # ---- 训练完成或被取消 ----
+        # 重新查一次任务状态：
+        #   - 若任务已被前端取消，状态已是 'cancelled'，不要覆盖回 completed
+        #   - 若任务记录被删除，直接退出，不写任何东西
+        task = db.query(TrainTask).filter(TrainTask.id == task_id).first()
+        if task is None:
+            print(f"[训练任务] Task#{task_id} 已被删除，跳过完成态写入")
+            return {"status": "cancelled (deleted)"}
+
+        if task.status == "cancelled":
+            # 已被取消，记录最后产出的模型路径但保持 cancelled 状态
+            task.best_model_path = train_result.get("best_pt")
+            task.last_model_path = train_result.get("last_pt")
+            task.finished_at = datetime.now()
+            db.commit()
+            return {"status": "cancelled", "best_pt": train_result.get("best_pt")}
+
+        task.status = "completed"
+        task.best_model_path = train_result.get("best_pt")
+        task.last_model_path = train_result.get("last_pt")
+        task.finished_at = datetime.now()
+        db.commit()
+
+        return {
+            "status": "completed",
+            "best_pt": train_result.get("best_pt"),
+            "last_pt": train_result.get("last_pt"),
+        }
+
+    except Exception as e:
+        trace_text = traceback.format_exc()
+        task = db.query(TrainTask).filter(TrainTask.id == task_id).first()
+        if task:
+            # 用户已经 cancel 了：trainer 退出时偶发会在收尾（plot_metrics、保存
+            # 元数据等）抛异常（如某些机器 matplotlib FreeType 加载字体失败），
+            # 这种 case 模型权重通常已落盘，应保留 cancelled 状态，从磁盘扫回
+            # best.pt / last.pt，不要把状态硬改成 failed。
+            if task.status == "cancelled":
+                try:
+                    run_root = Path(settings.runs_path) / f"task_{task_id}"
+                    for p in run_root.rglob("best.pt"):
+                        task.best_model_path = str(p)
+                        break
+                    for p in run_root.rglob("last.pt"):
+                        task.last_model_path = str(p)
+                        break
+                except Exception:
+                    pass
+                task.error_message = f"[已取消，trainer 收尾告警] {str(e)}"
+                task.finished_at = datetime.now()
+                db.commit()
+                return {"status": "cancelled", "warning": str(e)}
+
+            # 真正训练失败
+            task.status = "failed"
+            failure_config = config or task.config or {}
+            task.error_message = _format_training_failure(e, failure_config, trace_text)
+            task.finished_at = datetime.now()
+            db.commit()
+        return {"status": "failed", "error": str(e)}
+
+    finally:
+        try:
+            db.close()
+        finally:
+            _release_training_resources()
+
+
+class TrainingDispatcher:
+    """后台训练调度器（单例）：替代 Celery，单并发地在守护线程中跑训练流水线。"""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._thread: threading.Thread | None = None
+        self._current_task_id: int | None = None
+
+    @property
+    def is_running(self) -> bool:
+        return self._thread is not None and self._thread.is_alive()
+
+    @property
+    def current_task_id(self) -> int | None:
+        return self._current_task_id if self.is_running else None
+
+    def start(self, task_id: int) -> None:
+        """启动训练任务；已有任务在跑时抛 RuntimeError（路由层负责回滚任务记录）。"""
+        with self._lock:
+            if self.is_running:
+                raise RuntimeError(
+                    f"已有训练任务 #{self._current_task_id} 正在运行，请等待完成或先取消后再提交"
+                )
+            self._current_task_id = task_id
+            self._thread = threading.Thread(
+                target=self._run,
+                args=(task_id,),
+                daemon=True,
+                name=f"train-task-{task_id}",
+            )
+            self._thread.start()
+
+    def _run(self, task_id: int) -> None:
+        try:
+            run_training_pipeline(task_id)
+        except Exception:
+            # run_training_pipeline 内部已兜底任务状态；这里再兜一层防线程静默死亡
+            print(f"[training_dispatcher] task_{task_id} 未捕获异常:\n{traceback.format_exc()}")
+        finally:
+            with self._lock:
+                self._current_task_id = None
+
+
+# 全局单例（uvicorn 进程内单并发训练）
+training_dispatcher = TrainingDispatcher()
