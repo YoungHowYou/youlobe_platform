@@ -27,9 +27,9 @@ echo   4. git pull origin main
 echo   5. Tell you to restart backend (db auto-migration)
 echo.
 echo Will NOT do (you do these):
-echo   - kill uvicorn / celery
+echo   - kill uvicorn
 echo   - start backend / frontend
-echo   - touch database (backend auto-migrates on startup)
+echo   - touch database (storage\app.db, no migration needed)
 echo   - install pip / npm deps (none added in this update)
 echo.
 pause
@@ -119,7 +119,6 @@ echo.
 echo In another cmd window:
 echo   tasklist ^| findstr python              (find PIDs)
 echo   taskkill /F /PID ^<uvicorn pid^>
-echo   taskkill /F /PID ^<celery pid^>
 echo.
 echo Or kill all python processes (be careful):
 echo   taskkill /F /IM python.exe
@@ -146,14 +145,10 @@ rem ---- 5. restart instructions ----
 echo.
 echo [5/5] Update done! Restart backend now (db auto-migration runs on startup)
 echo.
-echo Start backend (uvicorn):
+echo.
+echo Start backend (uvicorn, 训练线程在其进程内，无 Celery/Worker 需启动):
 echo   set YOLO_AUTOINSTALL=False
 echo   D:\yolo26s_platform\venv\Scripts\python.exe -m uvicorn server.main:app --host 0.0.0.0 --port 8000
-echo.
-echo Start celery worker:
-echo   set YOLO_AUTOINSTALL=False
-echo   D:\yolo26s_platform\venv\Scripts\python.exe -m celery -A server.tasks worker --loglevel=info --pool=solo
-echo.
 echo Start frontend:
 echo   cd D:\yolo26s_platform\web
 echo   npm run dev

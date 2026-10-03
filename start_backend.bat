@@ -1,6 +1,6 @@
 @echo off
 title YOLO Backend
-cd /d D:\yolo26s_platform
+cd /d "%~dp0"
 call venv\Scripts\activate
 REM Disable Ultralytics auto pip install (prevents hang on slow/offline networks)
 set YOLO_AUTOINSTALL=False

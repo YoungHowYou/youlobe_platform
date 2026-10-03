@@ -126,21 +126,26 @@
             </el-form-item>
             <el-form-item label="Batch Size">
               <el-input-number v-model="c.batch_size" :min="1" :max="512" />
-              <span class="hint">CPU 训练建议 4~16，内存充足可加大（cls 可翻倍）</span>
+              <span class="hint">显存 8GB 建议 8~16（seg/det/obb 640）；cls 224 可加倍；OOM 时减半</span>
             </el-form-item>
             <el-form-item label="早停 Patience">
               <el-input-number v-model="c.patience" :min="0" :max="500" />
               <span class="hint">0=禁用，建议 50</span>
             </el-form-item>
             <el-form-item label="训练设备">
-              <el-select v-model="c.device" style="width:200px">
+              <el-select v-model="c.device" style="width:220px">
+                <el-option label="自动（优先 GPU）" value="auto" />
+                <el-option
+                  v-for="d in torchDevices" :key="d.id"
+                  :label="`${d.name}${d.total_mem_mb ? ' · ' + (d.total_mem_mb/1024).toFixed(0) + 'GB' : ''}`"
+                  :value="d.id" />
                 <el-option label="CPU" value="cpu" />
               </el-select>
-              <span class="hint">本平台仅支持 CPU 训练</span>
+              <span class="hint">有可用 CUDA 用 GPU 训练，无显卡环境自动回落 CPU</span>
             </el-form-item>
             <el-form-item label="DataLoader Workers">
               <el-input-number v-model="c.workers" :min="0" :max="16" />
-              <span class="hint">CPU 机器建议 2~8；如训练启动异常可改回 0</span>
+              <span class="hint">GPU 训练建议 4~8；如训练启动异常可改回 0</span>
             </el-form-item>
           </el-card>
 
@@ -326,7 +331,7 @@ const taskType = ref<'seg'|'det'|'cls'|'obb'>('seg')
 function getBaseDefaults() {
   return {
     model_name: 'yolo11s-seg',
-    epochs: 200, batch_size: 8, patience: 50, device: 'cpu', workers: 4,
+    epochs: 200, batch_size: 8, patience: 50, device: 'auto', workers: 4,
     lr0: 0.01, lrf: 0.01, momentum: 0.937, weight_decay: 0.0005,
     warmup_epochs: 3, warmup_momentum: 0.8,
     train_ratio: 0.8, oversample_factor: 5,
@@ -357,6 +362,9 @@ function defaultsForTaskType(tt: string): Record<string, any> {
   }
   return d
 }
+
+interface TorchDevice { id: string; name: string; available: boolean; backend?: string; total_mem_mb?: number }
+const torchDevices = ref<TorchDevice[]>([])
 
 const c = ref<Record<string, any>>(getBaseDefaults())
 
@@ -427,6 +435,12 @@ watch(trainMode, (m) => {
 
 onMounted(async () => {
   try {
+    const { data: devs } = await api.get('/inference/devices')
+    torchDevices.value = (devs || []).filter(
+      (d: TorchDevice) => d.available && d.backend === 'pytorch' && d.id !== 'cpu'
+    )
+  } catch {}
+  try {
     const { data: proj } = await api.get(`/projects/${props.id}`)
     currentClassCount.value = proj.defect_classes?.length || 0
     taskType.value = (proj.task_type || 'seg') as 'seg' | 'det' | 'cls' | 'obb'
@@ -434,8 +448,11 @@ onMounted(async () => {
     if (proj.last_train_config && Object.keys(proj.last_train_config).length > 0) {
       // 用户点过"保存为默认"：缓存覆盖在默认之上
       Object.assign(c.value, defaults, proj.last_train_config)
-      // 旧缓存可能存了 GPU 设备；本平台仅支持 CPU，强制回落
-      if (c.value.device !== 'cpu') c.value.device = 'cpu'
+      // 旧缓存可能存了本机不存在的 GPU 编号（如 "1"）：回落 auto，避免训练启动即报错
+      if (c.value.device !== 'cpu' && c.value.device !== 'auto'
+          && !torchDevices.value.some(d => d.id === c.value.device)) {
+        c.value.device = 'auto'
+      }
       ElMessage.info('已加载上次保存的训练参数')
     } else {
       Object.assign(c.value, defaults)

@@ -546,7 +546,6 @@ def import_full_project_from_zip(zip_file: BinaryIO, db: Session) -> dict:
                 project_id=project.id,
                 task_name=task_info.get("task_name", "导入训练任务"),
                 status=status,
-                celery_task_id=None,
                 config=task_info.get("config"),
                 epochs=task_info.get("epochs", 0),
                 current_epoch=task_info.get("current_epoch", 0),

@@ -382,7 +382,7 @@ def run_training_pipeline(task_id: int) -> dict:
             epochs=config.get("epochs", 150),
             batch_size=config.get("batch_size", 16),
             patience=config.get("patience", 0),
-            device=config.get("device", "cpu"),
+            device=config.get("device") or "auto",   # 默认 auto：有 CUDA 用 GPU，否则回落 CPU
             task_type=task_type,
             augment_hsv_h=config.get("hsv_h", 0.015),
             augment_hsv_s=config.get("hsv_s", 0.7),

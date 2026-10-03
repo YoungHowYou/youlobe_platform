@@ -24,7 +24,7 @@ class TrainConfig(BaseModel):
     epochs: int = Field(default=200, ge=1, le=2000)
     batch_size: int = Field(default=16, ge=1, le=512)   # 大显存机器（≥32G）+ cls 224 可上 256~512
     patience: int = Field(default=50, ge=0)
-    device: str = Field(default="cpu", description="本平台仅支持 CPU 训练")
+    device: str = Field(default="auto", description='训练设备：auto=有 CUDA 用 GPU 否则 CPU，也可填 cpu / 0 / cuda:0')
     workers: int = Field(default=4, ge=0, le=16)
 
     # 学习率

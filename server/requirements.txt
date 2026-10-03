@@ -21,13 +21,12 @@ pydantic-settings>=2.0.0
 pyyaml>=6.0
 
 # ---- 训练相关 ----
-# 运行时为 Python 3.14 + torch 2.9.0+cpu（2026-09-21 从 3.10 迁移）。
-# 安装 CPU 版 torch/torchvision 必须走 pytorch 专用 index（PyPI 上是 CUDA 大包）：
-#   pip install torch==2.9.0 torchvision==0.24.0 --index-url https://download.pytorch.org/whl/cpu
+# torch / torchvision 故意不写在这里：CPU 版与 GPU(CUDA) 版来自不同的 wheel index，
+# 由 tools/setup_env.py 按机器是否有 NVIDIA 显卡自动选择，或手动执行：
+#   GPU:  venv\Scripts\python -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cu126
+#   CPU:  venv\Scripts\python -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
 # 【系统级前置】torch ≥2.9 需要 VC++ 2015-2022 Redist ≥ 14.40（System32 的 MSVCP140.dll），
-# 缺失时 c10.dll 初始化报 WinError 1114。先装 https://aka.ms/vs/17/release/vc_redist.x64.exe
+# 缺失时 c10.dll 初始化报 WinError 1114：https://aka.ms/vs/17/release/vc_redist.x64.exe
 ultralytics>=8.3.0
 matplotlib>=3.7.0
 pandas>=2.0.0           # core/train.py 直接用（2026-09 发现旧 venv 漏装）
-torch==2.9.0            # CPU 版，见上方专用 index 说明
-torchvision==0.24.0

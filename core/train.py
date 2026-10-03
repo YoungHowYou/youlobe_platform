@@ -167,6 +167,39 @@ def plot_training_curves(results_csv: str, save_dir: str):
         plt.close()
 
 
+def resolve_device(requested: str) -> str:
+    """
+    归一化训练设备：
+
+    - ``""`` / ``"auto"``          → 有可用 CUDA 用 ``"0"``，否则 ``"cpu"``
+    - ``"cpu"``                    → 强制 CPU
+    - ``"0"`` / ``"cuda"`` / ``"cuda:0"`` → 有 CUDA 原样透传给 Ultralytics，无 CUDA 回落 CPU
+
+    前端默认传 ``"auto"``，因此换到无显卡的机器上部署时不需要改参数。
+    """
+    import torch
+
+    req = str(requested or "").strip().lower()
+    cuda_ok = torch.cuda.is_available()
+
+    if req in ("", "auto"):
+        if cuda_ok:
+            name = torch.cuda.get_device_name(0)
+            print(f"[train device] 自动选择 GPU: cuda:0（{name}）")
+            return "0"
+        print("[train device] 未检测到可用 CUDA，自动使用 CPU 训练")
+        return "cpu"
+
+    if req == "cpu":
+        return "cpu"
+
+    if cuda_ok:
+        return req
+
+    print(f"[train device] 请求 device='{requested}'，但当前环境无可用 CUDA，已回落 cpu")
+    return "cpu"
+
+
 def run_train(
     dataset_yaml: str,
     output_dir: str,
@@ -216,7 +249,8 @@ def run_train(
         epochs: 训练轮数（默认 150）
         batch_size: 批大小（默认 16）
         patience: 早停耐心值（0 = 禁用早停）
-        device: 训练设备（本平台强制 CPU，传 GPU 编号会被忽略并告警）
+        device: 训练设备。支持 "auto"（默认，有 CUDA 用 GPU）/ "cpu" / "0" / "cuda:0"，
+            无可用 CUDA 时任何取值都会自动回落 CPU
         augment_*: 各项数据增广参数
         close_mosaic: 最后 N 个 epoch 关闭 Mosaic
         epoch_callback: 每个 epoch 结束后的回调函数，接收一个字典参数：
@@ -250,14 +284,12 @@ def run_train(
     output_dir = Path(output_dir).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # ---- 本平台仅支持 CPU 训练（目标硬件无独显）----
-    # 不管调用方/前端缓存里传什么设备，一律强制回落到 CPU，避免误用 GPU 参数
-    if str(device).lower() not in ("cpu", ""):
-        print(f"[train device] 收到 device='{device}'，本平台仅支持 CPU 训练，已强制切换为 cpu")
-    device = "cpu"
+    # ---- 设备选择：GPU 优先，无 CUDA 时自动回落 CPU ----
+    device = resolve_device(device)
+    if device != "cpu":
+        torch.backends.cudnn.benchmark = True   # 输入尺寸固定（imgsz），自动选最快卷积算法
 
-    # RTX 30/40-series Tensor Cores are much faster with TF32 for float32 ops.
-    # CPU 训练下设置无实际效果，保留仅为兼容未来重新启用 GPU 的场景。
+    # Ampere 及更新架构用 TF32 加速 fp32 卷积/矩阵乘；Turing 及更老架构会忽略该设置。
     try:
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True

@@ -2,13 +2,13 @@
 """
 数据集构建服务 (dataset_service.py)
 ====================================
-核心桥接模块：从 MySQL 读取 Web 标注数据，生成 YOLO 格式的训练数据集，
+核心桥接模块：从 SQLite 读取 Web 标注数据，生成 YOLO 格式的训练数据集，
 然后调用现有 core/ 模块执行完整的训练流水线。
 
 这是 Web 标注系统和现有训练代码之间最关键的连接层。
 
 数据流：
-    MySQL annotations 表
+    annotations 表（SQLite）
         → 按 image 分组
         → polygon JSON → YOLO polygon TXT
         → 生成 images/ + labels/ 目录
@@ -166,7 +166,7 @@ def build_dataset_from_db(
     only_reviewed: bool = False,
 ) -> dict:
     """
-    从 MySQL 读取标注数据，生成原始图像 + YOLO 标注文件。
+    从数据库读取标注数据，生成原始图像 + YOLO 标注文件。
 
     这一步产出的目录结构：
         output_dir/

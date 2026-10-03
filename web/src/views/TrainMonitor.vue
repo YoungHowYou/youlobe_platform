@@ -254,7 +254,7 @@ const paramGroups: ParamGroup[] = [
       { key: 'epochs',        label: 'Epochs',    tip: '训练总轮数' },
       { key: 'batch_size',    label: 'Batch Size',tip: '一次梯度更新的图片数' },
       { key: 'patience',      label: 'Patience',  tip: '早停容忍轮数（连续无提升）' },
-      { key: 'device',        label: '设备',      tip: '本平台仅支持 CPU 训练' },
+      { key: 'device',        label: '设备',      tip: 'GPU 优先；无可用 CUDA 时自动回落 CPU' },
       { key: 'workers',       label: 'DataLoader Workers', tip: '数据加载/增强子进程数；Windows 异常时可设为 0' },
       { key: 'train_mode',    label: '训练模式',  tip: 'scratch=从头 / finetune=继承' },
       { key: 'resume_from_task_id', label: '继承自', tip: '继承训练时来源任务 ID' },

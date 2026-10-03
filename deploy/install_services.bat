@@ -6,6 +6,10 @@ REM  Frontend is served by the backend (web\dist), so NO separate
 REM  frontend service is needed. After this, open the browser at
 REM  http://localhost:8000  (admin / admin123).
 REM
+REM  ⚠ 备选方案：需要额外下载 nssm.exe 放到 deploy\ 目录。
+REM    推荐直接用同目录下的 install_service.bat（基于 pywin32，
+REM    零外部依赖，也是官方推荐路径）。
+REM
 REM  本平台只依赖本地硬盘（SQLite 文件库），不再需要 MySQL/Redis/Celery，
 REM  后端单进程内即可完成训练任务调度。
 REM
@@ -24,20 +28,23 @@ if not exist "%NSSM%" set NSSM=nssm.exe
 
 if not exist "%APP_DIR%\logs" mkdir "%APP_DIR%\logs"
 
-echo === Registering VP_backend (uvicorn: API + web UI + 内置训练线程) ===
-"%NSSM%" install VP_backend "%PY%" "-m uvicorn server.main:app --host 0.0.0.0 --port 8000"
-"%NSSM%" set VP_backend AppDirectory "%APP_DIR%"
-"%NSSM%" set VP_backend AppEnvironmentExtra YOLO_AUTOINSTALL=False PYTHONPATH=%APP_DIR%
-"%NSSM%" set VP_backend AppStdout "%APP_DIR%\logs\backend.out.log"
-"%NSSM%" set VP_backend AppStderr "%APP_DIR%\logs\backend.err.log"
-"%NSSM%" set VP_backend Start SERVICE_AUTO_START
+echo === Registering LabelyouBackend (uvicorn: API + web UI + 内置训练线程) ===
+REM 注意：AppParameters 必须拆成独立参数传，整体加引号会被当成单个参数导致启动失败
+"%NSSM%" install LabelyouBackend "%PY%" -m uvicorn server.main:app --host 0.0.0.0 --port 8000
+"%NSSM%" set LabelyouBackend AppDirectory "%APP_DIR%"
+"%NSSM%" set LabelyouBackend AppEnvironmentExtra YOLO_AUTOINSTALL=False PYTHONPATH=%APP_DIR%
+"%NSSM%" set LabelyouBackend AppStdout "%APP_DIR%\logs\backend.out.log"
+"%NSSM%" set LabelyouBackend AppStderr "%APP_DIR%\logs\backend.err.log"
+"%NSSM%" set LabelyouBackend AppExit Default Restart
+"%NSSM%" set LabelyouBackend AppRestartDelay 5000
+"%NSSM%" set LabelyouBackend Start SERVICE_AUTO_START
 
 echo === Starting service ===
-net start VP_backend
-
+net start LabelyouBackend
+LabelyouBackend
 echo.
-echo Done. Open http://localhost:8000   (admin / admin123)
-echo Manage service: services.msc   or   "%NSSM%" edit VP_backend
+echo To remove later (as admin):
+echo   net stop LabelyouBackend ^& "%NSSM%" remove LabelyouBedit VP_backend
 echo.
 echo To remove later (as admin):
 echo   net stop VP_backend ^& "%NSSM%" remove VP_backend confirm

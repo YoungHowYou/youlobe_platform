@@ -41,5 +41,5 @@ echo.
 echo === Step 6: new HEAD ===
 git log --oneline -1
 echo.
-echo Done. Now restart uvicorn + celery + frontend.
+echo Done. Now restart uvicorn (and frontend dev server if running).
 pause

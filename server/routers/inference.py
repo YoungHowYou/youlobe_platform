@@ -94,7 +94,7 @@ def list_models(project_id: int = Query(default=0), db: Session = Depends(get_db
     q = db.query(TrainTask).filter(TrainTask.status.in_(["completed", "cancelled"]))
     if project_id > 0:
         q = q.filter(TrainTask.project_id == project_id)
-    # finished_at 取消时可能为 None，用 coalesce 回退到 created_at（兼容 MySQL）
+    # finished_at 取消时可能为 None，用 coalesce 回退到 created_at
     tasks = q.order_by(func.coalesce(TrainTask.finished_at, TrainTask.created_at).desc()).all()
     task_ids = [t.id for t in tasks]
     for t in tasks:
@@ -146,11 +146,18 @@ def list_devices():
         import torch
         if torch.cuda.is_available():
             for i in range(torch.cuda.device_count()):
+                props = torch.cuda.get_device_properties(i)
+                try:
+                    free_mem, total_mem = torch.cuda.mem_get_info(i)
+                except Exception:
+                    free_mem, total_mem = (0, props.total_memory)
                 devices.append({
                     "id": str(i),
                     "name": f"CUDA - {torch.cuda.get_device_name(i)}",
                     "available": True,
                     "backend": "pytorch",
+                    "total_mem_mb": round(total_mem / 1024 / 1024),
+                    "free_mem_mb": round(free_mem / 1024 / 1024),
                 })
         else:
             print("[devices] torch.cuda.is_available()=False")
@@ -964,7 +971,7 @@ def list_project_images_for_inference(
 
     total = q.count()
     if sample:
-        # MySQL: ORDER BY RAND() — 单查询完成抽样，不再把所有 id 拉到 Python
+        # func.rand()：SQLite 下编译为 random()，单查询完成随机抽样
         items = q.order_by(func.rand()).limit(limit).all()
     else:
         items = q.order_by(ImageModel.created_at.desc()).limit(limit).all()
