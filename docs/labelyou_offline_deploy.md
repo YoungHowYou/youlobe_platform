@@ -2,7 +2,7 @@
 
 适用目标：一台不能访问外网的 Windows 电脑，部署目录固定为 `D:\labelyou`，后端业务代码不以 `.py` 明文交付，普通平台账号除删除项目外可正常使用，模型权重按只读资产管理，并启用机器码绑定。
 
-本平台只依赖本地硬盘：数据库为 SQLite 文件（`storage\app.db`），训练任务在 API 进程内的后台线程执行。目标机**不需要**预装或运行 MySQL / Redis / MariaDB / Celery，训练仅支持 CPU。
+本平台只依赖本地硬盘：数据库为 SQLite 文件（`storage\app.db`），训练任务在 API 进程内的后台线程执行。目标机**不需要**预装或运行 MySQL / Redis / MariaDB / Celery，训练优先使用 GPU（无 CUDA 的机器自动回落 CPU）。
 
 ## 交付包内容
 
@@ -48,12 +48,13 @@ D:\labelyou\
 
 目标电脑不能联网，所以不要在目标机上执行 `pip install`、`npm install` 或 Ultralytics 自动下载模型。所有依赖均已内置。
 
-## CPU 训练注意事项
+## 训练设备注意事项
 
-- 本平台训练强制 CPU（`core/train.py` 会忽略任何 GPU 设备参数）
-- 建议 `batch=4~16` 起步，按内存余量调整；`workers=2~8`
+- 默认 `device=auto`：有可用 CUDA 用 GPU 训练，没有则自动回落 CPU（`core/train.py::resolve_device`）
+- 打包时按目标机选 torch wheel：有显卡用 cu126 index，无显卡用 cpu index（CPU 版体积小很多）
+- GPU（8GB 显存）建议 `batch=8~16`、`workers=4~8`；纯 CPU 建议 `batch=4~16`、`workers=2~8`
 - seg/obb 大图滑窗训练较慢，必要时降低 `epochs` 或 `crop_size`
-- 推理设备仍可按需选择（CPU / OpenVINO CPU 等，取决于打包的依赖）
+- 推理设备仍可按需选择（CPU / CUDA / OpenVINO CPU 等，取决于打包的依赖）
 
 ## 机器码绑定流程
 
@@ -200,6 +201,32 @@ D:\labelyou\tools\start_all.bat
 ```cmd
 D:\labelyou\tools\smoke_test.bat
 ```
+
+### 做成开机自启的 Windows 服务（推荐）
+
+上面的 `start_api.bat` 需要有人登录并保持窗口开着。生产环境建议注册成服务，
+开机即跑、崩溃自动重启、不需要登录：
+
+```cmd
+REM 以管理员身份运行
+deploy\install_service.bat          REM 注册服务 LabelyouBackend，设为自动启动
+deploy\uninstall_service.bat        REM 卸载
+```
+
+服务会以 `SYSTEM` 身份运行，工作目录/日志/端口如下：
+
+| 项 | 值 |
+|---|---|
+| 服务名 | `LabelyouBackend` |
+| 日志 | `logs\service.log`（8MB 轮转 ×5） |
+| 监听 | `0.0.0.0:8000`，可用环境变量 `LABELYOU_HOST` / `LABELYOU_PORT` 覆盖 |
+| 管理 | `services.msc` / `sc query LabelyouBackend` / `net stop\|start LabelyouBackend` |
+
+实现见 `tools/win_service.py`（pywin32，无需第三方 exe）。前台调试用
+`venv\Scripts\python.exe tools\win_service.py console`。
+
+> 服务以 SYSTEM 运行，`storage\` 的写权限不受普通用户 ACL 影响，可与
+> `deploy\lockdown_acl.bat` 的锁定方案叠加使用。
 
 ## 验证清单
 

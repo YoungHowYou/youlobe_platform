@@ -1,6 +1,9 @@
 # AGENTS.md — yolo26s_platform
 
-工业缺陷检测全栈平台（硅晶圆/方锭/光伏）。Vue 3 前端 + FastAPI 后端 + SQLite 本地文件库 + 进程内训练线程 + Ultralytics YOLO。**已去除 MySQL/Redis/Celery**，全部状态存本地硬盘；训练仅支持 CPU。
+工业缺陷检测全栈平台（硅晶圆/方锭/光伏）。Vue 3 前端 + FastAPI 后端 + SQLite 本地文件库 + 进程内训练线程 + Ultralytics YOLO。**已去除 MySQL/Redis/Celery**，全部状态存本地硬盘；训练优先用 GPU（有 CUDA 走 GPU，无显卡机器自动回落 CPU）。
+
+> 部署 / 换机器 / 排障请先看 **`.github/skills/yolo-platform-deploy/SKILL.md`**：
+> 五步部署流程、服务化、局域网放行、僵尸数据清理，以及踩过的坑（服务宿主、批处理编码等）都在里面。
 
 ---
 
@@ -8,8 +11,10 @@
 
 后端（单进程即可，训练任务在其内部的守护线程执行）：
 ```bash
-# 在 D:\yolo26s_platform 目录
-D:/yolo26s_platform/venv/Scripts/python.exe -m uvicorn server.main:app --host 0.0.0.0 --port 8000
+# 项目根目录
+python tools/setup_env.py      # 首次：建 venv + 装 torch（GPU/CPU 自适应）+ 后端依赖
+venv/Scripts/python.exe -m uvicorn server.main:app --host 0.0.0.0 --port 8000
+# 或直接双击 start_backend.bat（脚本已改为按 %~dp0 定位，不再硬编码路径）
 ```
 
 前端：
@@ -97,6 +102,9 @@ web/src/views/
   InferenceView.vue    — 在线推断（队列 + 推理训练图 + 网格 + 切割小图）
 
 tools/
+  setup_env.py         — 一键建环境（按 nvidia-smi 自动选 GPU/CPU torch wheel）
+  check_gpu_train.py   — GPU 训练链路自检（合成数据跑 1 epoch，不碰真实数据）
+  audit_storage.py     — 存储体检/清理（僵尸项目、丢失的图片记录、app.db VACUUM）
   cleanup_storage.py   — 存储瘦身（推理缓存 + epoch checkpoints + 预处理产物）
   verify_cls.py        — cls 模型全量验证 + 混淆矩阵
   test_cls_pipeline.py — cls 端到端回归测试
@@ -148,14 +156,26 @@ PUT  /api/projects/{id}/images/batch-class    cls 批量打分类标签
 
 ---
 
-## 训练内存 / Workers / 跨版本部署坑（2026-07-21，已按 CPU-only + 无 Celery 修订）
+## 训练内存 / Workers / 设备选择（已按 GPU/CPU 自适应 + 无 Celery 修订）
 
 1. **不要再强制 `cache="ram"`**：4050 张 640×640 三通道切片解码后约占 4.6 GiB，CUDA OOM 自动重建 DataLoader 时耗尽系统内存，最后只显示 OpenCV `Failed to allocate 1228800 bytes`。`core/train.py` 现固定 `cache=False`；只影响读盘速度，不影响精度。
 2. **看完整 traceback 的第一处 OOM**：最终的 OpenCV `Insufficient memory` 可能只是二次异常，真正原因常是更前面的内存耗尽。资源类失败由 `server/tasks/train_task.py` 转成中文参数建议，同时保留技术堆栈。
-3. **Workers 给数据加载提速**：2026-07-04 提交 `0f25d3f` 把固定 `workers=0` 改成可配置。CPU 训练建议 2～8，Windows 异常时回到 0。
+3. **Workers 给数据加载提速**：2026-07-04 提交 `0f25d3f` 把固定 `workers=0` 改成可配置。GPU 训练建议 4～8，纯 CPU 训练建议 2～8，Windows 异常时回到 0。
 4. **训练线程跑在 uvicorn 进程内**：训练成功、失败、取消后都必须 `gc.collect()` + `torch.cuda.empty_cache()` + `torch.cuda.ipc_collect()`（无 CUDA 时自动跳过）；已在任务 `finally` 统一执行。改了 `core/*` 或 `server/tasks/*` 后必须重启 uvicorn。
 5. **`unexpected keyword argument 'workers'` 是混版，不是模型缺失**：说明新版 `server/tasks/train_task.py` 配了旧版 `core/train.py`。完整同步 `server/` + `core/`，确认 `inspect.signature(core.train.run_train)` 含 `workers`，再重启 uvicorn。复制 `.pt` 不能解决参数签名错误。
-6. **训练强制 CPU**：`core/train.py` 入口会把任何非 cpu 的 device 参数强制改为 `cpu` 并打印告警（前端训练页也只提供 CPU 选项）；GPU 相关调优参数（TF32 等）保留但无实际效果。
+6. **设备选择走 `core/train.py::resolve_device()`**：`auto`（默认）→ 有 CUDA 用 `"0"`，没有就 `cpu`；显式传 `cpu` 才是强制 CPU。**不要再写死 `device="cpu"`**。
+
+---
+
+## GPU 训练（2026-10-01 实机部署，RTX 2080 8GB / 驱动 560.94 / CUDA 12.6）
+
+- 环境：Python 3.10.11 + venv + `torch`/`torchvision` **cu126** wheel（`python tools/setup_env.py` 自动挑 index）。
+  老驱动（<530）机器改用 `python tools/setup_env.py --torch-index cu121`。
+- 前端训练页「训练设备」下拉数据来自 `/api/inference/devices`（后端返回 `total_mem_mb`），
+  没有 CUDA 时只有「自动 / CPU」两项；缓存里失效的 GPU 编号（如换机器后的 `"1"`）自动回落 `auto`。
+- 8GB 显存经验值：seg/det/obb `imgsz=640` 用 `batch 8~16`；cls `imgsz=224` 可到 `32~64`。
+  报 CUDA OOM 时先把 batch 减半，其次是降模型尺寸（s→n）。
+- `cudnn.benchmark=True` 只在 GPU 分支打开（imgsz 固定，收益稳定）；TF32 开关在 Turing 上无效但无害。
 
 ---
 
@@ -186,7 +206,7 @@ PUT  /api/projects/{id}/images/batch-class    cls 批量打分类标签
 3. **mask2png.py 是用户的 GUI 工具**，git status untracked 不要碰。
 4. **`*.pt` 已加 .gitignore**，模型权重不入库。
 5. **改 db 字段**：直接改 `server/models/*.py` 并重启 uvicorn，`create_all` 只负责建新表；SQLite 不支持 ALTER 加列的自动迁移，新字段对**新库**生效，老库需重建或手动 ALTER。
-6. **cancel 任务后还想用其 best.pt**：直接去 `D:\yolo26s_platform\storage\runs\task_<N>\runs\train\weights\best.pt`，前端在线推断也能选到。
+6. **cancel 任务后还想用其 best.pt**：直接去 `<项目根目录>\storage\runs\task_<N>\runs\train\weights\best.pt`，前端在线推断也能选到。
 
 ---
 
@@ -203,10 +223,14 @@ SQLite 本地文件：<STORAGE_ROOT>/app.db（默认 storage/app.db，首次启�
 
 ## 用户硬件 / 环境
 
-- GPU: RTX 3060 6GB 移动版（同事相同）；训练仅 CPU
+- GPU: RTX 2080 8GB（驱动 560.94 / CUDA 12.6），训练默认走 GPU
 - OS: Windows 11 Pro for Workstations
-- shell: git-bash（Bash 工具默认）—— Linux 风格命令
-- 本机已部署运行实例：`D:\yolo26s_platform`（venv + SQLite `storage\app.db`），后端托管 `web\dist`，浏览器直接开 http://localhost:8000
-- Node.js 便携版在 `D:\soft\nodejs\node-v22.14.0-win-x64`（未进系统 PATH，构建前端时临时加 PATH 或用绝对路径调 npm.cmd；vite dev 端口 5174）
-- Python 3.14.7（per-user：`C:\Users\haoyu.yang\AppData\Local\Programs\Python\Python314`），venv 已迁移到 3.14 + torch 2.9.0+cpu（2026-09-21）。**系统级前置**：必须装 VC++ 2015-2022 Redist ≥14.40（`System32\MSVCP140.dll`），否则 torch ≥2.9 的 c10.dll 初始化失败（WinError 1114）——当年"锁死 2.8.0+3.10"的真凶就是它；离线部署目标机也要装 `vc_redist.x64.exe`。机器上仍保留 Python 3.10.11，旧环境在 `venv310-backup`（确认 3.14 稳定后可删）
-- 开机自启：计划任务 `LabelyouBackend`（SYSTEM、开机触发+10s 延迟、失败 1 分钟自动重启、隐藏无控制台窗口），跑 `tools\start_service.bat`（日志在 `logs\backend.*.log`）。`shell:startup` 快捷方式已删除；手动开发仍可用 `start_backend.bat`
+- shell: PowerShell（VS Code 集成终端）
+- 本机已部署运行实例：本仓库根目录（`venv` + SQLite `storage\app.db`），后端托管 `web\dist`，浏览器直接开 http://localhost:8000
+- Node.js v24.16.0（在系统 PATH 中，`node -v` / `npm -v` 直接可用；vite dev 端口 5174）
+- Python 3.10.11（`C:\Users\yanghowyou\AppData\Local\Programs\Python\Python310`），venv 为 3.10 + `torch` cu126（2026-10-01 部署）。**系统级前置**：必须装 VC++ 2015-2022 Redist ≥14.40（`System32\MSVCP140.dll`），否则 torch 的 c10.dll 初始化失败（WinError 1114）；离线部署目标机也要装 `vc_redist.x64.exe`
+- 开机自启：已注册 Windows 服务 `LabelyouBackend`（`deploy\install_service.bat` 安装，pywin32 实现，
+  `tools\win_service.py`，SYSTEM 身份 + 自动启动 + 崩溃 5s/10s/60s 三次重试；日志 `logs\service.log`）；
+  改完 `server/`/`core/` 后要 `net stop LabelyouBackend && net start LabelyouBackend`。
+  前台调试用 `venv\Scripts\python.exe tools\win_service.py console`；
+  手动开发也可用 `start_backend.bat`（仅后端）或 `start_all.bat`（后端 + vite dev）

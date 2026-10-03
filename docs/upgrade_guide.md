@@ -228,7 +228,7 @@ B 路径：用你升级前的备份 zip 重新解压（建议每次升级前用 
 ### Q8: 训练最终显示 OpenCV `Insufficient memory / Failed to allocate`
 先看完整 traceback。真正原因常是更早的系统内存耗尽，OpenCV 只是二次错误。
 
-- CPU 训练建议 `batch=4～16`、`workers=2～8`；启动异常时 workers 改回 0。
+- 有 GPU 时 `batch=8～16`、`workers=4～8`；纯 CPU 训练建议 `batch=4～16`、`workers=2～8`；启动异常时 workers 改回 0。
 - 平台使用 `cache=False`，并在任务成功、失败、取消后主动清理内存缓存。
 - 参数调整后新建任务重新训练；失败任务不会自动续跑。
 
