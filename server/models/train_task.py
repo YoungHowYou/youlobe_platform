@@ -22,7 +22,7 @@ class TrainTask(Base):
              "completed", "failed", "cancelled", name="task_status"),
         default="pending"
     )
-    celery_task_id: Mapped[str | None] = mapped_column(String(300), nullable=True)
+    # 训练在 uvicorn 进程内的守护线程执行（无 Celery/Redis），不再需要外部任务 ID
 
     # 训练配置快照（JSON）
     config: Mapped[dict | None] = mapped_column(JSON, nullable=True)
@@ -62,7 +62,17 @@ class TrainEpochLog(Base):
         Index("idx_task_epoch", "task_id", "epoch"),
     )
 
-    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    id: Mapped[int] = mapped_column(
+        # ⚠ SQLite 下只有精确的 INTEGER PRIMARY KEY 才是 rowid 别名（才能自增）。
+        # 直接写 BigInteger 会生成 `id BIGINT NOT NULL, PRIMARY KEY (id)`，
+        # 插入时 SQLAlchemy 不带 id → SQLite 不会自动生成 → 报
+        # `NOT NULL constraint failed: train_epoch_logs.id`，epoch 日志一条都写不进去
+        # （表现为前端训练监控曲线全空、current_epoch 一直 0）。
+        # with_variant 让 SQLite 用 INTEGER、其它数据库仍用 BIGINT。
+        BigInteger().with_variant(Integer, "sqlite"),
+        primary_key=True,
+        autoincrement=True,
+    )
     task_id: Mapped[int] = mapped_column(Integer, ForeignKey("train_tasks.id", ondelete="CASCADE"), nullable=False)
     epoch: Mapped[int] = mapped_column(Integer, nullable=False)
 
