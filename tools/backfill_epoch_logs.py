@@ -152,8 +152,11 @@ def backfill_task(db, task: TrainTask, dry_run: bool = False) -> dict:
 
     last_ep = max(r["epoch"] for r in rows)
     if not dry_run:
-        if task.current_epoch < last_ep + 1:
-            task.current_epoch = last_ep + 1
+        # results.csv 的 epoch 列是 1-based，直接就是"已完成轮数"，不能再 +1；
+        # 同时不要超过任务的 epochs 配置（收尾那次 final val 会让回调多推一格）。
+        target_epoch = min(last_ep, task.epochs) if task.epochs else last_ep
+        if task.current_epoch < target_epoch:
+            task.current_epoch = target_epoch
         if best_ep is not None and best_fit > (task.best_fitness or 0):
             task.best_fitness = best_fit
             if best_map50 is not None:
