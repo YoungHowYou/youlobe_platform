@@ -28,6 +28,13 @@
         <el-divider direction="vertical" />
         <el-button size="small" :disabled="!canUndo" @click="undo">撤销</el-button>
         <el-button size="small" :disabled="!canRedo" @click="redo">重做</el-button>
+        <template v-if="selectedAnnIdx>=0">
+          <el-divider direction="vertical" />
+          <span class="ctrl-label">选中区域</span>
+          <el-button size="small" title="逆时针旋转 15°（快捷键 [ ，加 Shift 为 1°）" @click="rotateSelectedBy(-15)">-15°</el-button>
+          <el-button size="small" title="顺时针旋转 15°（快捷键 ] ，加 Shift 为 1°）" @click="rotateSelectedBy(15)">+15°</el-button>
+          <el-button size="small" title="顺时针旋转 90°" @click="rotateSelectedBy(90)">+90°</el-button>
+        </template>
         <el-button size="small" @click="zoomFit">适应窗口</el-button>
         <el-button size="small" title="向左旋转90°（仅旋转视图，保存坐标自动换算回原图）" @click="rotateView(-90)"><el-icon><RefreshLeft /></el-icon></el-button>
         <el-button size="small" title="向右旋转90°（快捷键 R）" @click="rotateView(90)"><el-icon><RefreshRight /></el-icon></el-button>
@@ -111,7 +118,7 @@
       <span>缩放:{{ Math.round(zoomLevel*100) }}%</span>
       <span v-if="viewRot!==0" style="color:#E6A23C">视图旋转:{{ viewRot }}°</span>
       <span v-if="currentImageIdx>=0">{{ currentImageIdx+1 }}/{{ imageList.length }}</span>
-      <span class="status-shortcuts">空格+拖拽移动 · 滚轮缩放</span>
+      <span class="status-shortcuts">空格+拖拽移动 · Alt+拖拽区域平移 · 选中后 Shift+方向键微调 · 滚轮缩放</span>
       <div v-if="isSegTask" class="seg-view-controls">
         <el-switch
           v-model="showAnnotationLayer"
@@ -152,6 +159,8 @@ const annotations = ref<AnnotationData[]>([])
 const projectTaskType = ref<'seg'|'det'|'cls'|'obb'>('seg')
 const selectedClassId = ref<number>(0)
 const selectedAnnIdx = ref(-1)
+// 拖动/旋转过程中的实时提示（角度、位移），显示在画布底部
+const dragHint = ref('')
 const currentTool = ref('select')
 const brushSize = ref(2)
 const showAnnotationLayer = ref(true)
@@ -199,13 +208,16 @@ const statusTagType = computed(()=>({unlabeled:'info',labeling:'warning',labeled
 const isSegTask = computed(()=>projectTaskType.value==='seg')
 const showBrushSize = computed(()=>['brush','circle','polyline','eraser'].includes(currentTool.value))
 const toolHint = computed(()=>{
+  if(dragHint.value) return dragHint.value
   if(spaceDown.value) return '按住空格拖拽移动画布'
   return({
-    polygon:isDrawing.value?'点击加顶点·双击/回车完成·Esc取消':'点击开始画多边形',
-    rect:'点击拖拽画矩形',
-    brush:'按住涂抹·松开生成标注·按住 Shift 涂抹追加到上一段（大缺陷分多笔涂）',circle:'点击拖拽画圆',
-    polyline:isDrawing.value?'点击加折点·双击/回车完成':'点击开始画折线',
-    eraser:'按住涂抹擦除标注区域',boxEraser:'拖拽框选删除',select:'点击标注后可拖动顶点编辑·拖动绿色圆点旋转·Ctrl+C复制·Ctrl+V粘贴',
+    polygon:isDrawing.value?'点击加顶点·双击/回车完成·Esc取消':'点击开始画多边形（Alt+拖拽可平移已有区域）',
+    rect:'点击拖拽画矩形（Alt+拖拽可平移已有区域）',
+    brush:'按住涂抹·松开生成标注·按住 Shift 涂抹追加到上一段（大缺陷分多笔涂）',
+    circle:'点击拖拽画圆（Alt+拖拽可平移已有区域）',
+    polyline:isDrawing.value?'点击加折点·双击/回车完成':'点击开始画折线（Alt+拖拽可平移已有区域）',
+    eraser:'按住涂抹擦除标注区域',boxEraser:'拖拽框选删除',
+    select:'拖动区域平移·拖绿色圆点旋转(Shift 吸附15°)·拖白点改顶点·Shift+方向键微调·[ ] 旋转15°',
   })[currentTool.value]||''
 })
 const canvasAreaRef = ref<HTMLElement>()
@@ -229,6 +241,9 @@ let autoSaveTimer:any=null
 let isPanning=false,lastPanX=0,lastPanY=0
 let bgLoadSeq=0
 let suppressViewControlWatch=false
+let hintTimer:any=null
+// Alt+拖拽平移：任意工具下都能直接平移区域（不必先切「选择」工具）
+let manualDrag:{idx:number;startX:number;startY:number;origPoly:Point[];moved:boolean}|null=null
 
 // ================================================================
 // 视图旋转：只旋转显示与编辑坐标系，图片文件和 DB 里的标注始终是原图坐标。
@@ -635,6 +650,12 @@ function initCanvas(){
       else if(!tgt){selectedAnnIdx.value=-1;removeVertexHandles();highlightSelected()}
       return
     }
+    // Alt+拖拽：任意绘图工具下直接平移鼠标所在区域（不必先切到「选择」工具）。
+    // 必须在各绘图分支之前拦截，否则会在区域内部落下新顶点 / 新笔迹。
+    if(opt.e.altKey){
+      const t=opt.target as any
+      if(t&&t._ann){opt.e.preventDefault?.();startManualDrag(t._idx,p);return}
+    }
     if(tool==='polygon')onPolyClick(p)
     else if(tool==='polyline')onPolylineClick(p)
     else if(tool==='brush'){isBrushing=true;brushPts=[{x:p.x,y:p.y}]}
@@ -648,9 +669,13 @@ function initCanvas(){
     if(isPanning){
       const vpt=canvas!.viewportTransform!
       vpt[4]+=opt.e.clientX-lastPanX;vpt[5]+=opt.e.clientY-lastPanY
+      // 必须走 setViewportTransform：它会刷新所有对象的 lineCoords（命中判定用的
+      // 视口坐标），直接改 vpt[4]/vpt[5] 会让标注区域平移后彻底点不中、拖不动
+      canvas!.setViewportTransform(vpt)
       canvas!.requestRenderAll();lastPanX=opt.e.clientX;lastPanY=opt.e.clientY;return
     }
     const p=canvas!.getPointer(opt.e)
+    if(manualDrag){applyManualDrag(p);return}
     if(currentTool.value==='polygon'&&isDrawing.value)drawTmpLine(p)
     else if(currentTool.value==='polyline'&&isDrawing.value)drawTmpLine(p)
     else if(currentTool.value==='brush'&&isBrushing){brushPts.push({x:p.x,y:p.y});drawDotAt(p,clsColor(selectedClassId.value)+'66')}
@@ -662,6 +687,7 @@ function initCanvas(){
 
   canvas.on('mouse:up',(opt)=>{
     if(isPanning){isPanning=false;canvas!.setCursor('default');return}
+    if(manualDrag){finishManualDrag();return}
     const p=canvas!.getPointer(opt.e)
     if(currentTool.value==='brush'&&isBrushing)finishBrush(!!(opt.e as any).shiftKey)
     else if(currentTool.value==='eraser'&&isErasing)finishEraser()
@@ -746,8 +772,9 @@ function renderAnnotations(){
     })
     ;(poly as any)._ann=true
     ;(poly as any)._idx=idx
-    // 整体拖动：mousedown 记录原点，moving 同步 handles，modified 应用偏移到数据
+    // 整体拖动：mousedown 记录原点，moving 让所有 handle 跟随，modified 应用偏移到数据
     let dragOrigin:{left:number,top:number}|null=null
+    let handleOrigin:{h:fabric.Circle|fabric.Line;left:number;top:number}[]=[]
     poly.on('mousedown',()=>{
       if(currentTool.value!=='select')return
       dragOrigin={left:poly.left||0,top:poly.top||0}
@@ -756,23 +783,23 @@ function renderAnnotations(){
       if(!dragOrigin||!currentImage.value)return
       const dx=(poly.left||0)-dragOrigin.left
       const dy=(poly.top||0)-dragOrigin.top
-      // 实时同步顶点 handles 跟随
-      const W2=dispW(),H2=dispH()
-      const ann_=annotations.value[idx]
-      if(!ann_)return
-      editHandles.forEach((h,i)=>{
-        const pt=ann_.polygon[i]
-        if(!pt)return
-        h.set({left:pt.x*W2+dx-6,top:pt.y*H2+dy-6})
-        h.setCoords()
-      })
+      // 让所有 handle（顶点/旋转点/连线）整体跟随。
+      // 注意：必须在首个 moving 事件才记录初始位置（此时 selectAnn 触发的
+      // handles 重建已完成），且不能按 editHandles 下标去取 polygon 顶点——
+      // editHandles 前两个是虚线连线与旋转点，按下标取会整体错位。
+      if(handleOrigin.length===0){
+        handleOrigin=editHandles.map(h=>({h,left:h.left||0,top:h.top||0}))
+      }
+      handleOrigin.forEach(o=>{o.h.set({left:o.left+dx,top:o.top+dy});o.h.setCoords()})
+      liveHint(`平移 Δx=${Math.round(dx)}px Δy=${Math.round(dy)}px`)
       canvas!.requestRenderAll()
     })
     poly.on('modified',()=>{
-      if(!dragOrigin||!currentImage.value)return
+      dragHint.value=''
+      if(!dragOrigin||!currentImage.value){handleOrigin=[];return}
       const dx=(poly.left||0)-dragOrigin.left
       const dy=(poly.top||0)-dragOrigin.top
-      dragOrigin=null
+      dragOrigin=null;handleOrigin=[]
       // 阈值过滤：< 0.5px 视为没动（避免单击也触发 dirty）
       if(Math.abs(dx)<0.5&&Math.abs(dy)<0.5)return
       pushUndo()
@@ -1023,7 +1050,7 @@ function drawTmpLine(p:{x:number;y:number}){
   const ln=new fabric.Line([last.x,last.y,p.x,p.y],{stroke:c,strokeWidth:0.75,strokeDashArray:[5,3],selectable:false,evented:false})
   ;(ln as any)._tmp=true;(ln as any)._tl=true;canvas.add(ln);canvas.requestRenderAll()
 }
-function cancelDrawing(){isDrawing.value=false;drawingPoints=[];isBrushing=false;brushPts=[];isErasing=false;eraserPts=[];circleStart=null;rectStart=null;boxEraserStart=null;lastBrushAnnIdx=-1;lastBrushPts=[];cleanTmp()}
+function cancelDrawing(){finishManualDrag();isDrawing.value=false;drawingPoints=[];isBrushing=false;brushPts=[];isErasing=false;eraserPts=[];circleStart=null;rectStart=null;boxEraserStart=null;lastBrushAnnIdx=-1;lastBrushPts=[];cleanTmp()}
 function cleanTmp(){if(!canvas)return;canvas.getObjects().filter(o=>(o as any)._tmp).forEach(o=>canvas!.remove(o));canvas.requestRenderAll()}
 function selectAnn(idx:number){
   selectedAnnIdx.value=idx
@@ -1060,8 +1087,8 @@ function showVertexHandles(idx:number){
   const rotCx=xsAll.reduce((a,b)=>a+b,0)/xsAll.length
   const rotCy=ysAll.reduce((a,b)=>a+b,0)/ysAll.length
   const rotMinY=Math.min(...ysAll)
-  const rotHandleY=Math.max(8,rotMinY-22)   // 上方 22 px，至少留 8px
-  const rotR=5
+  const rotHandleY=Math.max(10,rotMinY-26)   // 上方 26 px，至少留 10px
+  const rotR=7
   // 中心 → 手柄的虚线连接
   const stem=new fabric.Line([rotCx,rotCy,rotCx,rotHandleY],{
     stroke:'#52C41A',strokeWidth:1,strokeDashArray:[3,3],
@@ -1094,13 +1121,18 @@ function showVertexHandles(idx:number){
     origAngle=Math.atan2(sy,sx)
     rotMoved=false
   })
-  rotHandle.on('moving',()=>{
+  rotHandle.on('moving',(opt:any)=>{
     if(!origPoly||!currentImage.value)return
     rotMoved=true
     const W2=dispW(),H2=dispH()
     const hx=(rotHandle.left||0)+rotR
     const hy=(rotHandle.top||0)+rotR
-    const angleNow=Math.atan2(hy-rotCy,hx-rotCx)
+    let angleNow=Math.atan2(hy-rotCy,hx-rotCx)
+    // 按住 Shift 吸附到 15° 整数倍（相对本次拖动的起始角），便于精确摆正
+    if(opt?.e?.shiftKey){
+      const step=Math.PI/12
+      angleNow=origAngle+Math.round((angleNow-origAngle)/step)*step
+    }
     const delta=angleNow-origAngle
     const cosD=Math.cos(delta),sinD=Math.sin(delta)
     for(let i=0;i<origPoly.length;i++){
@@ -1114,20 +1146,19 @@ function showVertexHandles(idx:number){
       }
     }
     // 实时更新 polygon 显示
-    const polyObj=canvas!.getObjects().find(o=>(o as any)._ann&&(o as any)._idx===idx) as fabric.Polygon|undefined
-    if(polyObj){
-      const pts=annotations.value[idx].polygon.map(pt=>({x:pt.x*W2,y:pt.y*H2}))
-      polyObj.set({points:pts as any})
-      ;(polyObj as any)._calcDimensions?.()
-      polyObj.setCoords()
-      polyObj.dirty=true
-    }
-    // 同步更新虚线连接
-    stem.set({x1:rotCx,y1:rotCy,x2:hx,y2:hy})
+    syncAnnShape(idx)
+    // 手柄与虚线连线跟随（吸附后按吸附方向重算，视觉与数据一致）
+    const hx2=rotCx+Math.cos(angleNow)*(rotCy-rotHandleY)
+    const hy2=rotCy+Math.sin(angleNow)*(rotCy-rotHandleY)
+    rotHandle.set({left:hx2-rotR,top:hy2-rotR})
+    rotHandle.setCoords()
+    stem.set({x1:rotCx,y1:rotCy,x2:hx2,y2:hy2})
     ;(stem as any).setCoords?.()
+    liveHint(`旋转 ${(((delta*180/Math.PI)%360+360)%360).toFixed(1)}°`)
     canvas!.requestRenderAll()
   })
   rotHandle.on('modified',()=>{
+    dragHint.value=''
     if(!rotMoved){origPoly=null;return}   // 没真的拖动，不入栈不触发保存
     pushUndo()  // 旋转完成入 undo（拖一次只入栈一次）
     origPoly=null
@@ -1167,17 +1198,14 @@ function showVertexHandles(idx:number){
       const ny=Math.max(0,Math.min(1,cy/H2))
       annotations.value[idx].polygon[i]={x:nx,y:ny}
       // 实时更新对应 polygon 形状（不全量重绘，性能更好）
-      const polyObj=canvas!.getObjects().find(o=>(o as any)._ann&&(o as any)._idx===idx) as fabric.Polygon|undefined
-      if(polyObj){
-        const pts=annotations.value[idx].polygon.map(pt=>({x:pt.x*W2,y:pt.y*H2}))
-        polyObj.set({points:pts as any})
-        ;(polyObj as any)._calcDimensions?.()
-        polyObj.setCoords()
-        polyObj.dirty=true
-      }
+      syncAnnShape(idx)
+      // 提示顶点在原图上的像素坐标（换算回原图坐标系，视图旋转时也正确）
+      const op=dispToOrig({x:nx,y:ny}),cimg=currentImage.value
+      liveHint(`顶点 #${i+1} → 原图 (${Math.round(op.x*(cimg?.width||0))}, ${Math.round(op.y*(cimg?.height||0))})`)
       canvas!.requestRenderAll()
     })
     handle.on('modified',()=>{
+      dragHint.value=''
       if(firstMove)return // 没真的拖动
       dirty.value=true;scheduleAutoSave()
       // 拖动结束后完整重建 polygon 形状 + handles，
@@ -1196,6 +1224,132 @@ function removeVertexHandles(){
   if(!canvas)return
   canvas.getObjects().filter(o=>(o as any)._handle).forEach(o=>canvas!.remove(o))
   editHandles=[]
+}
+
+// ====== 区域整体变换：精确旋转 / 微调平移 / Alt+拖拽平移 ======
+
+/** 找到某个标注对应的 fabric 对象 */
+function annObj(idx:number):fabric.Polygon|undefined{
+  return canvas?.getObjects().find(o=>(o as any)._ann&&(o as any)._idx===idx) as fabric.Polygon|undefined
+}
+
+/**
+ * 把 annotations[idx].polygon 的新坐标同步到画布上的 polygon 对象，
+ * 避免全量 renderAnnotations（拖动过程中更高频、更省）。
+ * fabric 的 Polygon 改 points 后必须重算包围盒，否则选中区域/手柄会显示错位。
+ */
+function syncAnnShape(idx:number){
+  if(!canvas)return
+  const polyObj=annObj(idx),ann=annotations.value[idx]
+  if(!polyObj||!ann)return
+  const W=dispW(),H=dispH()
+  polyObj.set({points:ann.polygon.map(pt=>({x:pt.x*W,y:pt.y*H})) as any})
+  ;(polyObj as any)._calcDimensions?.()
+  polyObj.setCoords()
+  polyObj.dirty=true
+}
+
+/** 画布底部的短提示（旋转角度 / 位移），到时自动消失 */
+function flashHint(text:string,ms=1500){
+  dragHint.value=text
+  if(hintTimer)clearTimeout(hintTimer)
+  hintTimer=setTimeout(()=>{dragHint.value=''},ms)
+}
+/** 拖动过程中的实时提示：带兜底超时，万一没收到 mouseup 也不会一直挂在画布上 */
+function liveHint(text:string){flashHint(text,2500)}
+
+/** 选中区域绕自身质心旋转指定角度（显示坐标系 → 写回归一化坐标） */
+function rotateSelectedBy(deg:number){
+  const idx=selectedAnnIdx.value
+  const ann=idx>=0?annotations.value[idx]:null
+  if(!ann){ElMessage.warning('请先用「选择」工具点击一个标注区域');return}
+  if(ann.polygon.length<3)return
+  const W=dispW(),H=dispH()
+  const n=ann.polygon.length
+  const cx=ann.polygon.reduce((s,p)=>s+p.x*W,0)/n
+  const cy=ann.polygon.reduce((s,p)=>s+p.y*H,0)/n
+  pushUndo()
+  const rad=deg*Math.PI/180,cosD=Math.cos(rad),sinD=Math.sin(rad)
+  ann.polygon=ann.polygon.map(p=>{
+    const px=p.x*W-cx,py=p.y*H-cy
+    return{
+      x:Math.max(0,Math.min(1,(cx+px*cosD-py*sinD)/W)),
+      y:Math.max(0,Math.min(1,(cy+px*sinD+py*cosD)/H)),
+    }
+  })
+  dirty.value=true
+  renderAnnotations()
+  if(currentTool.value==='select')showVertexHandles(idx)
+  highlightSelected()
+  flashHint(`已旋转 ${deg>0?'+':''}${deg}°`)
+  scheduleAutoSave()
+}
+
+let lastNudgeAt=0
+/** 方向键微调平移选中区域；连续按键合并为一次 undo */
+function nudgeSelected(dx:number,dy:number){
+  const idx=selectedAnnIdx.value
+  const ann=idx>=0?annotations.value[idx]:null
+  if(!ann)return
+  const W=dispW(),H=dispH()
+  const now=Date.now()
+  if(now-lastNudgeAt>700)pushUndo()   // 连续微调只在第一次入栈
+  lastNudgeAt=now
+  ann.polygon=ann.polygon.map(p=>({
+    x:Math.max(0,Math.min(1,p.x+dx/W)),
+    y:Math.max(0,Math.min(1,p.y+dy/H)),
+  }))
+  dirty.value=true
+  syncAnnShape(idx)
+  if(currentTool.value==='select')showVertexHandles(idx)   // 手柄跟随
+  canvas?.requestRenderAll()
+  liveHint(`平移 Δx=${dx}px Δy=${dy}px`)
+  scheduleAutoSave()
+}
+
+/**
+ * Alt+拖拽平移（任意工具下生效）。
+ * 用独立状态手动实现拖动，因为非「选择」工具下 polygon 是 selectable:false，
+ * fabric 不会为该对象启动拖拽变换。
+ */
+function startManualDrag(idx:number,p:{x:number;y:number}){
+  const ann=annotations.value[idx]
+  if(!ann)return
+  selectedAnnIdx.value=idx
+  highlightSelected()
+  manualDrag={idx,startX:p.x,startY:p.y,origPoly:ann.polygon.map(q=>({x:q.x,y:q.y})),moved:false}
+}
+
+function applyManualDrag(p:{x:number;y:number}){
+  const md=manualDrag
+  if(!md)return
+  const ann=annotations.value[md.idx]
+  if(!ann){manualDrag=null;return}
+  const W=dispW(),H=dispH()
+  const dx=p.x-md.startX,dy=p.y-md.startY
+  if(!md.moved){
+    if(Math.abs(dx)<1&&Math.abs(dy)<1)return   // 阈值：避免只是点击就入栈
+    pushUndo();md.moved=true
+  }
+  ann.polygon=md.origPoly.map(q=>({
+    x:Math.max(0,Math.min(1,q.x+dx/W)),
+    y:Math.max(0,Math.min(1,q.y+dy/H)),
+  }))
+  syncAnnShape(md.idx)
+  canvas?.requestRenderAll()
+  dragHint.value=`平移 Δx=${Math.round(dx)}px Δy=${Math.round(dy)}px`
+}
+
+function finishManualDrag(){
+  const md=manualDrag
+  manualDrag=null
+  dragHint.value=''
+  if(!md||!md.moved)return
+  dirty.value=true
+  renderAnnotations()
+  if(currentTool.value==='select')showVertexHandles(md.idx)
+  highlightSelected()
+  scheduleAutoSave()
 }
 
 // ====== 复制粘贴 ======
@@ -1304,10 +1458,24 @@ function zoomFit(){
   const cw=canvasAreaRef.value.clientWidth,ch=canvasAreaRef.value.clientHeight
   const iw=dispW(),ih=dispH()
   const z=Math.min(cw/iw,ch/ih)*0.95
-  canvas.setViewportTransform([1,0,0,1,0,0])
-  canvas.zoomToPoint(new fabric.Point(cw/2,ch/2),z)
-  const vpt=canvas.viewportTransform!;vpt[4]=(cw-iw*z)/2;vpt[5]=(ch-ih*z)/2
+  // 一次性落地最终变换，并且必须用 setViewportTransform：
+  // fabric 的 findTarget 用视口坐标（lineCoords）做命中判定，
+  // 直接改 canvas.viewportTransform 而不刷新对象坐标，会导致
+  // 「适应窗口」之后所有标注区域都点不中、拖不动（平移旋转失效的真因）。
+  canvas.setViewportTransform([z,0,0,z,(cw-iw*z)/2,(ch-ih*z)/2])
   canvas.requestRenderAll();zoomLevel.value=z
+}
+function isTypingTarget(e:KeyboardEvent){
+  // 只有真正的文本输入才算「正在输入」：工具栏的单选/复选/滑块(radio/checkbox/range)
+  // 点完会保留焦点，若一并拦截会导致方向键微调、[ ] 旋转全部失效
+  const t=e.target as HTMLElement|null
+  if(!t)return false
+  if(t.isContentEditable)return true
+  const tag=t.tagName
+  if(tag==='TEXTAREA'||tag==='SELECT')return true
+  if(tag!=='INPUT')return false
+  const type=((t as HTMLInputElement).type||'text').toLowerCase()
+  return ['text','search','url','tel','email','password','number'].includes(type)
 }
 function onKD(e:KeyboardEvent){
   if(e.code==='Space'){e.preventDefault();spaceDown.value=true}
@@ -1318,6 +1486,18 @@ function onKD(e:KeyboardEvent){
   else if(e.ctrlKey&&e.key==='s'){e.preventDefault();handleSave({immediate:true})}
   else if(e.ctrlKey&&(e.key==='c'||e.key==='C')){e.preventDefault();copyAnn()}
   else if(e.ctrlKey&&(e.key==='v'||e.key==='V')){e.preventDefault();pasteAnn()}
+  // 选中区域的精确微调 / 旋转（放在方向键切图之前判断，Shift+方向键才微调）
+  else if(selectedAnnIdx.value>=0&&e.shiftKey&&(e.key==='ArrowLeft'||e.key==='ArrowRight'||e.key==='ArrowUp'||e.key==='ArrowDown')){
+    if(isTypingTarget(e))return
+    e.preventDefault()
+    const step=e.ctrlKey?10:1
+    nudgeSelected(e.key==='ArrowLeft'?-step:(e.key==='ArrowRight'?step:0),e.key==='ArrowUp'?-step:(e.key==='ArrowDown'?step:0))
+  }
+  else if(selectedAnnIdx.value>=0&&(e.key==='['||e.key===']')){
+    if(isTypingTarget(e))return
+    e.preventDefault()
+    rotateSelectedBy((e.key===']'?1:-1)*(e.shiftKey?1:15))
+  }
   else if(!e.ctrlKey&&(e.key==='a'||e.key==='ArrowLeft'))prevImage()
   else if(!e.ctrlKey&&(e.key==='d'||e.key==='ArrowRight'))nextImage()
   else if(!e.ctrlKey&&(e.key==='r'||e.key==='R'))rotateView(90)

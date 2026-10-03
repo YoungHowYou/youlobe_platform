@@ -69,6 +69,18 @@ cls 标签存 `images.class_id`（图级），其他 task 标签存 `annotations
 
 ---
 
+## 标注器区域变换（Annotator.vue）
+
+- 「选择」工具：**拖区域本体=平移**、**拖绿色圆点=旋转**（按住 Shift 吸附 15°）、拖白点=改顶点。
+- 任意工具下 **`Alt+拖拽` 区域本体也能平移**（不必先切「选择」工具），且不会误落新顶点/新笔迹。
+- `Shift+方向键` 平移 1px（再按住 Ctrl 为 10px）；`[` / `]` 旋转 ∓15°（加 Shift 为 1°）；选中后工具栏出现 `-15°/+15°/+90°`。
+- **改视口必须走 `canvas.setViewportTransform()`**：fabric 的 `findTarget` 用视口坐标（对象 `lineCoords`）做命中判定，
+  旧版 `zoomFit()` 和「空格+拖拽」平移是直接改 `canvas.viewportTransform[4]/[5]` 的，
+  结果「适应窗口 / 平移画布」之后所有标注区域都点不中、拖不动（表现为“标注完的 region 不能平移”）。
+  以后任何改变视口的代码都必须经 `setViewportTransform()`（它会顺带刷新每个对象的 `setCoords`）。
+
+---
+
 ## 关键文件位置
 
 ```
