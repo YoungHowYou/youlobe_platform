@@ -65,10 +65,10 @@
         <el-table-column label="类别数" width="80">
           <template #default="{row}">{{ row.defect_classes?.length || 0 }}</template>
         </el-table-column>
-        <el-table-column label="尺寸" width="160">
+        <el-table-column label="切片" width="160">
           <template #default="{row}">
             <span style="font-size:12px;color:#606266">
-              {{ row.resize_h }}×{{ row.resize_w }} → {{ row.crop_size }}
+              原图 → {{ row.crop_size }} 滑窗
             </span>
           </template>
         </el-table-column>

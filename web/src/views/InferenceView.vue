@@ -281,7 +281,7 @@
             <span>长边缩放</span>
             <el-input-number v-model="resizeSize" :min="0" :max="8192" :step="256" size="small" controls-position="right" />
           </div>
-          <div class="param-help">0 表示不缩放，按原图尺寸推理。</div>
+          <div class="param-help">0 表示不缩放，按原图尺寸推理（与训练一致，建议保持 0）。</div>
           <div class="param-actions">
             <div class="action-cell action-cell--pick">
               <el-upload :auto-upload="false" :show-file-list="false" :on-change="onSelectFile" accept=".bmp,.png,.jpg,.jpeg,.tif,.tiff" multiple>

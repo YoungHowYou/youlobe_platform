@@ -11,6 +11,7 @@ API 文档:
 """
 
 from contextlib import asynccontextmanager
+import os
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -33,6 +34,44 @@ from .database import init_db
 from .services.license_service import enforce_license_if_required
 
 
+_PID_FILE_NAME = ".backend.pid"
+
+
+def _pid_alive(pid: int) -> bool:
+    """判断 PID 是否仍存活（Windows 上不能用 os.kill(pid, 0)，会真的杀进程）。"""
+    try:
+        import psutil
+
+        return psutil.Process(pid).is_running()
+    except Exception:
+        return False
+
+
+def _running_instance_pid() -> int | None:
+    """返回仍在运行的另一个后端实例 PID；没有则 None。"""
+    from pathlib import Path
+
+    try:
+        pid = int((Path(settings.STORAGE_ROOT) / _PID_FILE_NAME).read_text().strip())
+    except Exception:
+        return None
+    if pid <= 0 or pid == os.getpid():
+        return None
+    return pid if _pid_alive(pid) else None
+
+
+def _port_in_use(port: int) -> bool:
+    """本机同端口是否已有进程在监听（兼容老实例没写 PID 文件的情况）。"""
+    import socket
+
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.settimeout(0.5)
+            return s.connect_ex(("127.0.0.1", port)) == 0
+    except Exception:
+        return False
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """应用生命周期：启动时建表 + 创建默认管理员 + 重置上次遗留的非终态训练任务"""
@@ -47,20 +86,41 @@ async def lifespan(app: FastAPI):
         # 训练在 uvicorn 进程内的守护线程中执行，进程退出即中断且无法续跑；
         # 上次运行残留的非终态任务（pending/preparing/training/exporting）直接标记失败，
         # 避免前端永远看到"排队中/训练中"。
-        from .models.train_task import TrainTask
-        stale = (
-            db.query(TrainTask)
-            .filter(TrainTask.status.in_(["pending", "preparing", "training", "exporting"]))
-            .all()
-        )
-        for t in stale:
-            t.status = "failed"
-            t.error_message = "服务重启，训练中断；请重新创建训练任务"
-            from datetime import datetime as _dt
-            t.finished_at = _dt.now()
-        if stale:
-            db.commit()
-            print(f"[启动] 已将 {len(stale)} 个中断的训练任务标记为 failed")
+        #
+        # 但若另一个后端实例仍在运行（重复启动/误开第二个窗口，同一份 storage），
+        # 训练线程还活着，这里绝不能重置，否则会把正在跑的训练误标成失败。
+        other_pid = _running_instance_pid()
+        port_busy = other_pid is None and _port_in_use(settings.PORT)
+        if other_pid is not None or port_busy:
+            who = f"PID {other_pid}" if other_pid is not None else f"端口 {settings.PORT}"
+            print(
+                f"[启动] 检测到另一个后端实例仍在运行（{who}），"
+                "跳过中断任务重置；同一份 storage 只能由一个后端实例管理"
+            )
+        else:
+            from pathlib import Path as _P
+
+            try:
+                (_P(settings.STORAGE_ROOT) / _PID_FILE_NAME).write_text(str(os.getpid()))
+            except Exception as _e:
+                print(f"[WARN] 写入实例锁文件失败: {_e}")
+
+            from .models.train_task import TrainTask
+
+            stale = (
+                db.query(TrainTask)
+                .filter(TrainTask.status.in_(["pending", "preparing", "training", "exporting"]))
+                .all()
+            )
+            for t in stale:
+                t.status = "failed"
+                t.error_message = "服务重启，训练中断；请重新创建训练任务"
+                from datetime import datetime as _dt
+
+                t.finished_at = _dt.now()
+            if stale:
+                db.commit()
+                print(f"[启动] 已将 {len(stale)} 个中断的训练任务标记为 failed")
     finally:
         db.close()
     print("=" * 60)

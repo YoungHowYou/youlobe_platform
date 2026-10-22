@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Optional, Callable
 
 
-_HEAD_MODES = {"legacy", "native", "compat"}
+_HEAD_MODES = {"legacy", "native", "compat", "nms"}
 
 
 def _resolve_head_export_args(
@@ -26,21 +26,34 @@ def _resolve_head_export_args(
     head_mode: str = "legacy",
     nms: bool = False,
 ) -> tuple[str, dict]:
-    """构造导出 head 参数，确保 YOLO26 兼容模式与 YOLO11 旧链路隔离。
+    """构造导出 head 参数，确保 YOLO26 各模式与 YOLO11 旧链路隔离。
 
     ``legacy`` 保留旧调用方语义：end2end 模型走原生 one-to-one，普通模型
-    完全遵循原有 ``nms`` 开关。只有真实 end2end head 且显式请求 ``compat``
-    时，才切换到 one-to-many head；传统 NMS 继续由运行时统一执行，保证
-    PT/OpenVINO 使用相同的 conf/iou 参数和后处理实现。
+    完全遵循原有 ``nms`` 开关。
+
+    真实 end2end head（YOLO26/10）下有三种显式模式：
+      - ``native``：显式 ``nms=False``，导出 one-to-one NMS-free 输出 (1,max_det,6+nm)
+      - ``nms``   ：``nms=True``，导出 one-to-many 原始候选并在**图内**追加传统
+                    NMS 节点，产物已过滤，部署端无需任何后处理
+      - ``compat``：``end2end=False``，只导出 one-to-many 原始候选，NMS 交给运行时
+
+    注意（ultralytics 8.4+）：``nms`` 缺省值是 ``None``，此时既不是原生也不是
+    NMS 内嵌，而是退回 one-to-many 原始候选；因此 native 必须显式传 ``nms=False``。
     """
     if head_mode not in _HEAD_MODES:
-        raise ValueError(f"不支持的 head_mode: {head_mode}，可选: legacy / native / compat")
+        raise ValueError(
+            f"不支持的 head_mode: {head_mode}，可选: legacy / native / compat / nms"
+        )
 
     if is_end2end:
+        if head_mode == "nms":
+            # nms=True 会让 ultralytics 关闭 end2end 分支（one-to-many + NMSModel 包装），
+            # 把 NMS 作为算子写进导出图；conf 在导出时固化进节点。
+            return "nms", {"nms": True, "conf": 0.001}
         if head_mode == "compat":
             return "compat", {"end2end": False}
-        # native/legacy 都保持模型默认的 one-to-one NMS-free head。
-        return "native", {}
+        # native/legacy 都保持 one-to-one NMS-free head（显式 nms=False）。
+        return "native", {"nms": False}
 
     # YOLO11 等非 end2end 模型不得注入 end2end 参数，保持既有导出行为。
     if nms:
@@ -115,6 +128,10 @@ def run_export(
     is_end2end = False
     try:
         is_end2end = bool(getattr(model.model.model[-1], 'end2end', False))
+        if not is_end2end:
+            # 融合后的 YOLO26 权重只剩一个分支，head.end2end 会变成 False；
+            # 用模型 yaml 的架构标记兜底（YOLO11 的 yaml 没有该字段）。
+            is_end2end = bool((getattr(model.model, 'yaml', None) or {}).get('end2end', False))
     except Exception:
         pass
     effective_head_mode, head_export_args = _resolve_head_export_args(
@@ -122,7 +139,9 @@ def run_export(
         head_mode=head_mode,
         nms=nms,
     )
-    if effective_head_mode == "compat":
+    if effective_head_mode == "nms":
+        print("[export] end2end 模型使用内嵌 NMS 模式：one-to-many + 图内 NMS 节点")
+    elif effective_head_mode == "compat":
         print("[export] end2end 模型使用兼容/高召回模式：one-to-many + 运行时 NMS")
     elif is_end2end:
         print("[export] end2end 模型使用原生模式：one-to-one NMS-free")

@@ -190,21 +190,23 @@ def run_preprocess(
     erode_kernel: int = 3,
     use_morphology: bool = True,
     mask_dilate_kernel: int = 0,
+    resize: bool = True,
     progress_callback: Optional[Callable] = None
 ) -> dict:
-    """
-    执行数据预处理：将所有图像和 Mask 统一 Resize 到目标尺寸。
+    """执行数据预处理：可选择是否统一 Resize，并应用形态学三通道处理。
 
     Args:
         image_dir: 原始图像文件夹路径
         mask_dir: 原始 Mask 文件夹路径
         output_dir: 输出根目录（会在其下创建 images/ 和 masks/ 子文件夹）
-        target_h: 目标高度（最小 640）
-        target_w: 目标宽度（最小 640）
+        target_h: 目标高度（resize=True 时生效，最小 640）
+        target_w: 目标宽度（resize=True 时生效，最小 640）
         dilate_kernel: 图像膨胀核大小（矩形，奇数，默认3）
         erode_kernel: 图像腐蚀核大小（矩形，奇数，默认3）
-        use_morphology: 是否使用形态学三通道处理
-        mask_dilate_kernel: 标注 Mask 膨胀核大小（矩形，奇数，0表示不膨胀，在Resize前进行）
+        use_morphology: 是否使用形态学三通道处理（只对单通道灰度图有意义）
+        mask_dilate_kernel: 标注 Mask 膨胀核大小（矩形，奇数，0表示不膨胀）
+        resize: False 时保持原图分辨率，只做形态学/转码；
+                训练默认关掉统一缩放，直接按原图尺寸滑窗。
         progress_callback: 进度回调函数 callback(current, total, message)
 
     Returns:
@@ -214,12 +216,13 @@ def run_preprocess(
             "with_mask": int,           # 有对应 Mask 的图像数
             "without_mask": int,        # 无 Mask 的图像数（纯背景）
             "original_size": (H, W),    # 原始图像尺寸
-            "target_size": (H, W),      # 目标尺寸
+            "target_size": (H, W),      # 实际输出尺寸（未缩放时等于原图）
         }
     """
     # ---- 参数校验 ----
-    assert target_h >= 640, f"目标高度不能小于640，当前值: {target_h}"
-    assert target_w >= 640, f"目标宽度不能小于640，当前值: {target_w}"
+    if resize:
+        assert target_h >= 640, f"目标高度不能小于640，当前值: {target_h}"
+        assert target_w >= 640, f"目标宽度不能小于640，当前值: {target_w}"
 
     image_dir = Path(image_dir)
     mask_dir = Path(mask_dir)
@@ -239,7 +242,7 @@ def run_preprocess(
         "with_mask": 0,
         "without_mask": 0,
         "original_size": None,
-        "target_size": (target_h, target_w),
+        "target_size": (target_h, target_w) if resize else None,
     }
 
     # ---- 逐张处理 ----
@@ -253,9 +256,11 @@ def run_preprocess(
         # 记录原始尺寸（取第一张）
         if stats["original_size"] is None:
             stats["original_size"] = (img.shape[0], img.shape[1])
+            if stats["target_size"] is None:
+                stats["target_size"] = (img.shape[0], img.shape[1])
 
-        # 判断是否需要 Resize（如果原图已经是目标尺寸则跳过）
-        need_resize = (img.shape[0] != target_h) or (img.shape[1] != target_w)
+        # 判断是否需要 Resize（如果原图已经是目标尺寸则跳过；resize=False 永不缩放）
+        need_resize = resize and ((img.shape[0] != target_h) or (img.shape[1] != target_w))
         
         # 形态学处理：生成三通道图（在Resize前进行，保持原始图像细节）
         if use_morphology:

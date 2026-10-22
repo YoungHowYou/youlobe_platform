@@ -57,6 +57,29 @@ class ExportHeadModeTests(unittest.TestCase):
         )
 
         self.assertEqual(mode, "native")
+        # ultralytics 8.4+ 中 nms 缺省为 None（one-to-many 原始候选），native 必须显式 nms=False
+        self.assertEqual(kwargs, {"nms": False})
+        self.assertNotIn("conf", kwargs)
+
+    def test_yolo26_nms_embeds_nms_node(self):
+        mode, kwargs = _resolve_head_export_args(
+            is_end2end=True,
+            head_mode="nms",
+            nms=False,
+        )
+
+        self.assertEqual(mode, "nms")
+        self.assertEqual(kwargs, {"nms": True, "conf": 0.001})
+        self.assertNotIn("end2end", kwargs)
+
+    def test_non_end2end_ignores_yolo26_nms_mode(self):
+        mode, kwargs = _resolve_head_export_args(
+            is_end2end=False,
+            head_mode="nms",
+            nms=False,
+        )
+
+        self.assertEqual(mode, "legacy")
         self.assertEqual(kwargs, {})
 
     def test_invalid_mode_is_rejected(self):

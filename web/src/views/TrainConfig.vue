@@ -111,14 +111,18 @@
                   <el-option label="yolo11m-seg · Medium — 更精准，~22M 参数（OpenVINO 兼容好）" value="yolo11m-seg" />
                   <el-option label="yolo11l-seg · Large — 高精度，~28M 参数" value="yolo11l-seg" />
                   <el-option label="yolo11x-seg · XLarge — 最精准，~62M 参数" value="yolo11x-seg" />
-                  <el-option label="yolo26n-seg · Nano — ~3M 参数（end2end，NMS-free）" value="yolo26n-seg" />
-                  <el-option label="yolo26s-seg · Small — ~24M 参数（end2end，NMS-free）" value="yolo26s-seg" />
-                  <el-option label="yolo26m-seg · Medium — ~40M 参数（end2end，NMS-free）" value="yolo26m-seg" />
-                  <el-option label="yolo26l-seg · Large — ~63M 参数（end2end，NMS-free）" value="yolo26l-seg" />
-                  <el-option label="yolo26x-seg · XLarge — ~97M 参数（end2end，NMS-free）" value="yolo26x-seg" />
+                  <el-option label="yolo26n-seg · Nano — ~3M 参数（end2end，导出可选内嵌 NMS）" value="yolo26n-seg" />
+                  <el-option label="yolo26s-seg · Small — ~24M 参数（end2end，导出可选内嵌 NMS）" value="yolo26s-seg" />
+                  <el-option label="yolo26m-seg · Medium — ~40M 参数（end2end，导出可选内嵌 NMS）" value="yolo26m-seg" />
+                  <el-option label="yolo26l-seg · Large — ~63M 参数（end2end，导出可选内嵌 NMS）" value="yolo26l-seg" />
+                  <el-option label="yolo26x-seg · XLarge — ~97M 参数（end2end，导出可选内嵌 NMS）" value="yolo26x-seg" />
                 </template>
               </el-select>
               <span class="hint">模型越大精度越高，但速度越慢、内存占用越大</span>
+              <div v-if="taskType === 'det' || taskType === 'seg'" style="font-size:12px;color:#909399;margin-top:4px;line-height:1.6">
+                YOLO26 是 end2end 架构（训练阶段 NMS-free）；是否把 NMS 写进模型在训练完成后的
+                「模型转换」页选：兼容/高召回 / 内嵌 NMS / 原生端到端。
+              </div>
             </el-form-item>
             <el-form-item label="Epochs">
               <el-input-number v-model="c.epochs" :min="1" :max="2000" />

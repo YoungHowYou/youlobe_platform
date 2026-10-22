@@ -50,12 +50,20 @@ uvicorn 没开 `--reload`，必须手动 kill PID + 重启。重启会把未跑�
 
 | type | 含义 | 训练数据集 | 模型默认 | 切片 |
 |---|---|---|---|---|
-| `seg` | 实例分割 | YOLO polygon txt | yolo26s-seg.pt | 大图 → resize → 滑窗 crop_size² |
-| `det` | 目标检测 | YOLO bbox txt | yolo26s.pt | 同 seg |
+| `seg` | 实例分割 | YOLO polygon txt | yolo26s-seg.pt | **原图 → 按 crop_size/overlap 滑窗（不缩放）** |
+| `det` | 目标检测 | YOLO bbox txt | yolo26s.pt | **不切片**（原图 letterbox 到 imgsz） |
 | `cls` | 图像分类 | ImageFolder `dataset/<class>/` | yolo11s-cls.pt | **不切片**，整图 letterbox 到 imgsz |
-| `obb` | 旋转目标检测 | YOLO 4 角点 txt（8 归一化坐标） | yolo11s-obb.pt | 同 seg |
+| `obb` | 旋转目标检测 | YOLO 4 角点 txt（8 归一化坐标） | yolo11s-obb.pt | **不切片**（同 det） |
 
 cls 标签存 `images.class_id`（图级），其他 task 标签存 `annotations.polygon`（实例级）。
+
+> **seg 从 2026-10-22 起不再统一缩放**：数据集准备直接读原图（需要形态学时在整图做三通道），
+> 再按 `crop_size` / `overlap` 滑窗。`projects.resize_h/w` 仅保留字段兼容，**不再参与训练**；
+> 小于 `crop_size` 的图用 0 填充到窗口尺寸。推理页「长边缩放」建议保持 0 与训练一致。
+>
+> **切片口径决策（2026-10-22）**：保持 overlap 滑窗 + 类内 NMS，**不引入 halo**。
+> 当前 640×640 图、缺陷最长边 38px、模型输入 640 → 不切片，halo 无收益；
+> 只有上大图且可重训时再评估（优先级：overlap+WBF > halo > ignore-region 训练）。
 
 ---
 
@@ -87,7 +95,7 @@ cls 标签存 `images.class_id`（图级），其他 task 标签存 `annotations
 core/
   train.py             — Ultralytics 训练入口，task_type 分支 + cancel_check 回调
   inference.py         — 滑窗推理（seg/det）
-  preprocess.py        — Resize + 形态学（B=原图 G=膨胀 R=腐蚀 三通道）
+  preprocess.py        — 形态学（B=原图 G=膨胀 R=腐蚀 三通道）；训练链已改 resize=False
   sliding_window.py    — 滑窗切割
 
 server/

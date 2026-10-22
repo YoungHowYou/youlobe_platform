@@ -36,7 +36,8 @@ class ExportRequest(BaseModel):
     half: bool = Field(default=False)                    # FP16
     int8: bool = Field(default=False)                    # INT8 量化（仅 OpenVINO）
     nms: bool = Field(default=False)                     # 内嵌 NMS 节点（仅 onnx/openvino + det/seg/obb）
-    head_mode: Literal["legacy", "native", "compat"] = Field(default="legacy")
+    # legacy=YOLO11 旧链路；native=YOLO26 NMS-free；compat=one-to-many+运行时 NMS；nms=one-to-many+图内 NMS
+    head_mode: Literal["legacy", "native", "compat", "nms"] = Field(default="legacy")
 
 
 @router.get("/list")
@@ -176,8 +177,13 @@ def run_export(req: ExportRequest, db: Session = Depends(get_db)):
     # half 字段是 3 态精度码：0=FP32 / 1=FP16 / 2=INT8
     precision_code = 2 if req.int8 else (1 if req.half else 0)
 
-    # YOLO26 compat 使用运行时 NMS，不改变 YOLO11 的既有内嵌 NMS 开关。
-    requested_nms = req.nms if req.head_mode == "legacy" else False
+    # YOLO26 的 nms 模式固定内嵌 NMS；compat/native 不带 NMS 节点，YOLO11 仍由 nms 开关决定。
+    if req.head_mode == "nms":
+        requested_nms = True
+    elif req.head_mode == "legacy":
+        requested_nms = req.nms
+    else:
+        requested_nms = False
 
     # 检查是否已有相同导出（含精度、NMS、head 模式）
     existing = db.query(ExportedModel).filter(
@@ -363,7 +369,7 @@ def download_exported_model(export_id: int, db: Session = Depends(get_db)):
     elif ep.is_dir():
         # 目录：OpenVINO → 打 zip
         # zip 命名带 record.id，避免同 task + 同格式但不同 nms/精度的多条记录共享缓存
-        mode_tag = f"_{record.head_mode}" if record.head_mode in ("native", "compat") else ""
+        mode_tag = f"_{record.head_mode}" if record.head_mode in ("native", "compat", "nms") else ""
         nms_tag = "_nms" if record.nms else ""
         zip_name = f"{tname}_{record.source_type}_{record.export_format}{mode_tag}{nms_tag}"
         zip_cache_name = f"{zip_name}_id{record.id}"

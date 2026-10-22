@@ -295,18 +295,16 @@
         </el-form-item>
         <!-- cls 项目隐藏 Resize/切割尺寸/重叠率（cls 训练统一走 imgsz=224，不切大图） -->
         <template v-if="project?.task_type !== 'cls'">
-          <el-row :gutter="16">
-            <el-col :span="12">
-              <el-form-item label="Resize 高">
-                <el-input-number v-model="editForm.resize_h" :min="640" :step="256" style="width:100%" />
-              </el-form-item>
-            </el-col>
-            <el-col :span="12">
-              <el-form-item label="Resize 宽">
-                <el-input-number v-model="editForm.resize_w" :min="640" :step="256" style="width:100%" />
-              </el-form-item>
-            </el-col>
-          </el-row>
+          <el-alert
+            v-if="project?.task_type === 'seg'"
+            type="info" :closable="false" show-icon
+            style="margin-bottom:12px"
+            title="训练不再统一缩放：原图直接按重叠滑窗切片"
+          >
+            <div style="font-size:12px;line-height:1.7">
+              Resize 高/宽已停用，保留字段仅为兼容历史任务；训练只使用下方的切割尺寸与重叠率。
+            </div>
+          </el-alert>
           <el-row :gutter="16">
             <el-col :span="12">
               <el-form-item label="切割尺寸">

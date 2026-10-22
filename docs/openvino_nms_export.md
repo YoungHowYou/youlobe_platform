@@ -26,6 +26,12 @@ end2end: false     # ← 但这个字段是 false
 
 YOLO11-seg 系列在 ultralytics 里 **不支持** end2end 训练（只有 YOLO10/26 才有这套架构），所以 yaml 里 `end2end: false` 是永远不可能改成 true 的。`nms=True` 是给非 end2end 模型的**等价替代方案**——同样能让模型直接输出过滤后的 box，只是实现层面是在导出 graph 末尾追加节点，而不是改 head 训练拓扑。
 
+> **YOLO26 / YOLO10（end2end 架构）同样可以内嵌 NMS**：平台「模型转换 → YOLO26 模式」多了一个
+> **内嵌 NMS** 选项（`head_mode="nms"`），实际导出参数为 `nms=True, conf=0.001`。
+> ultralytics 8.4+ 在 `nms=True` 时会自动把 end2end 分支关掉、换成 one-to-many head + 图内 NMS 节点，
+> 产物同样是 `(1, 300, 6+nm)`（seg 另带 mask 原型输出），部署端无需任何后处理。
+> 三种模式的区别见 `docs/yolo26_vs_yolo11_deployment.md` 的「坑 1」。
+
 ---
 
 ## 2. 直接验证：xml 里确实有 NMS 节点

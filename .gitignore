@@ -56,3 +56,7 @@ kernel.errors.txt
 
 # Local admin-private files: private keys, licenses, machine codes
 admin_private/
+
+# 本地虚拟环境 / 后端实例锁
+.venv/
+.backend.pid

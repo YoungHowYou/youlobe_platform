@@ -51,7 +51,7 @@
               </el-tag>
               <span>
                 <el-icon><Picture /></el-icon>
-                {{ p.resize_h }}×{{ p.resize_w }} → {{ p.crop_size }}
+                原图 → {{ p.crop_size }} 滑窗 · 重叠 {{ Math.round((p.overlap ?? 0) * 100) }}%
               </span>
               <span>
                 <el-icon><Collection /></el-icon>
@@ -133,18 +133,16 @@
         </el-form-item>
 
         <el-divider content-position="left">预处理参数</el-divider>
-        <el-row :gutter="16" v-if="form.task_type === 'seg'">
-          <el-col :span="12">
-            <el-form-item label="Resize 高度">
-              <el-input-number v-model="form.resize_h" :min="640" :max="8192" :step="64" style="width:100%" />
-            </el-form-item>
-          </el-col>
-          <el-col :span="12">
-            <el-form-item label="Resize 宽度">
-              <el-input-number v-model="form.resize_w" :min="640" :max="8192" :step="64" style="width:100%" />
-            </el-form-item>
-          </el-col>
-        </el-row>
+        <el-alert
+          v-if="form.task_type === 'seg'"
+          type="info" :closable="false" show-icon
+          style="margin-bottom:12px"
+          title="不再统一缩放：原图直接按滑窗切片"
+        >
+          <div style="font-size:12px;line-height:1.7">
+            训练时不再把图缩放到固定尺寸，而是按原图分辨率 → 以「切割尺寸」为窗口、按「重叠率」滑窗后送入模型。
+          </div>
+        </el-alert>
         <el-row :gutter="16" v-if="form.task_type !== 'cls'">
           <el-col :span="12">
             <el-form-item :label="cropSizeLabel">

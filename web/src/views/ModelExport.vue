@@ -10,6 +10,19 @@
     <!-- 新建导出 -->
     <el-card shadow="never" style="margin-bottom:24px">
       <template #header><span style="font-weight:600">转换模型</span></template>
+      <el-alert
+        v-if="tasks.length === 0"
+        type="info"
+        :closable="false"
+        show-icon
+        title="还没有可导出的训练任务"
+        style="margin-bottom:16px"
+      >
+        <div style="font-size:12px;line-height:1.7">
+          先到「训练配置」跑完一个任务；训练完成后这里会出现「YOLO26 模式」选择：
+          兼容/高召回、内嵌 NMS、原生端到端（仅 YOLO26 / YOLO10 模型）。
+        </div>
+      </el-alert>
       <el-form label-width="120px" label-position="left" style="max-width:600px">
         <el-form-item label="训练任务">
           <el-select v-model="selTaskId" placeholder="选择训练任务" style="width:100%" @change="onTaskChange">
@@ -86,11 +99,16 @@
         <el-form-item v-if="isEnd2endModel && exportFormat !== 'tensorrt'" label="YOLO26 模式">
           <el-radio-group v-model="headMode">
             <el-radio label="compat">兼容/高召回（推荐）</el-radio>
+            <el-radio label="nms">内嵌 NMS（部署最简）</el-radio>
             <el-radio label="native">原生端到端（速度优先）</el-radio>
           </el-radio-group>
           <div style="font-size:12px;color:#909399;line-height:1.6;margin-top:4px">
             <template v-if="headMode === 'compat'">
               使用 one-to-many head + 运行时标准 NMS，PT/OpenVINO 共用相同 conf/iou 参数。
+            </template>
+            <template v-else-if="headMode === 'nms'">
+              使用 one-to-many head，导出时把 NMS 节点写进模型：输出 <code>(1,300,6+nm)</code> 已过滤结果，
+              部署端无需任何后处理。IoU 阈值在导出时固化（默认 0.45），conf 可事后筛选。
             </template>
             <template v-else>
               使用 one-to-one NMS-free 输出，部署简单，但小目标召回率可能略低。
@@ -155,6 +173,7 @@
         <el-table-column label="Head 模式" width="105">
           <template #default="{row}">
             <el-tag v-if="row.head_mode === 'compat'" type="success" size="small">兼容</el-tag>
+            <el-tag v-else-if="row.head_mode === 'nms'" type="danger" size="small">内嵌 NMS</el-tag>
             <el-tag v-else-if="row.head_mode === 'native'" type="warning" size="small">原生</el-tag>
             <span v-else style="color:#aaa;font-size:12px">原有</span>
           </template>
@@ -242,7 +261,7 @@ interface TaskInfo {
   finished_at:string|null
   created_at:string|null
 }
-interface ExportInfo { id:number; task_id:number; source_type:string; export_format:string; export_path:string|null; file_size_mb:number; imgsz:number; half:boolean; precision:string; nms:boolean; head_mode:'legacy'|'native'|'compat'; status:string; error_message:string|null; created_at:string|null }
+interface ExportInfo { id:number; task_id:number; source_type:string; export_format:string; export_path:string|null; file_size_mb:number; imgsz:number; half:boolean; precision:string; nms:boolean; head_mode:'legacy'|'native'|'compat'|'nms'; status:string; error_message:string|null; created_at:string|null }
 
 const tasks = ref<TaskInfo[]>([])
 const exports = ref<ExportInfo[]>([])
@@ -252,7 +271,7 @@ const exportFormat = ref('onnx')
 const imgsz = ref(640)
 const precision = ref('fp32')
 const nms = ref(false)
-const headMode = ref<'native'|'compat'>('compat')
+const headMode = ref<'native'|'compat'|'nms'>('compat')
 const exporting = ref(false)
 let pollTimer: any = null
 
@@ -324,7 +343,7 @@ const isClsTask = computed(() => {
   return t?.task_type === 'cls'
 })
 
-// 当前选中任务是否 end2end 架构模型（YOLO26/10 head 自带 NMS，"内嵌 NMS" 开关无意义）
+// 当前选中任务是否 end2end 架构模型（YOLO26/10 head 支持 native/compat/nms 三种导出模式）
 const isEnd2endModel = computed(() => {
   const t = tasks.value.find(x => x.task_id === selTaskId.value)
   const name = (t?.model_name || '').toLowerCase()

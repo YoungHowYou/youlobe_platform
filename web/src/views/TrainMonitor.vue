@@ -94,6 +94,64 @@
         </div>
       </el-card>
 
+      <!-- GPU 实时状态（nvidia-smi 采样，只读传感器，不影响训练） -->
+      <el-card v-if="gpuStats.gpus.length" shadow="never" class="gpu-card">
+        <template #header>
+          <div style="display:flex;justify-content:space-between;align-items:center">
+            <span style="font-weight:600">GPU 状态</span>
+            <span style="font-size:12px;color:#909399">
+              <template v-if="gpuStats.sampled_at">采样于 {{ gpuStats.sampled_at.replace('T', ' ') }}</template>
+              <template v-else>每 3 秒刷新</template>
+            </span>
+          </div>
+        </template>
+        <div v-for="g in gpuStats.gpus" :key="g.index ?? 0" class="gpu-row">
+          <div class="gpu-name">
+            <el-tag size="small" type="info">GPU {{ g.index }}</el-tag>
+            <span>{{ g.name }}</span>
+          </div>
+          <div class="gpu-metrics">
+            <div class="gpu-metric">
+              <div class="gpu-metric-label">温度</div>
+              <div class="gpu-metric-value" :class="gpuTempClass(g.temperature_c)">
+                {{ fmtGpuNum(g.temperature_c, 0) }} <span class="unit">°C</span>
+              </div>
+            </div>
+            <div class="gpu-metric">
+              <div class="gpu-metric-label">GPU 占用</div>
+              <div class="gpu-metric-value">{{ fmtGpuNum(g.utilization_pct, 0) }} <span class="unit">%</span></div>
+              <el-progress :percentage="Math.round(g.utilization_pct ?? 0)" :show-text="false" :stroke-width="6" />
+            </div>
+            <div class="gpu-metric">
+              <div class="gpu-metric-label">显存</div>
+              <div class="gpu-metric-value">
+                {{ fmtGpuMb(g.memory_used_mb) }} <span class="unit">/ {{ fmtGpuMb(g.memory_total_mb) }} MB</span>
+              </div>
+              <el-progress
+                :percentage="Math.min(100, Math.round(g.memory_pct ?? 0))"
+                :show-text="false"
+                :stroke-width="6"
+                :status="(g.memory_pct ?? 0) >= 90 ? 'exception' : ''"
+              />
+            </div>
+            <div class="gpu-metric">
+              <div class="gpu-metric-label">核心频率</div>
+              <div class="gpu-metric-value">{{ fmtGpuNum(g.clock_sm_mhz, 0) }} <span class="unit">MHz</span></div>
+            </div>
+            <div class="gpu-metric">
+              <div class="gpu-metric-label">显存频率</div>
+              <div class="gpu-metric-value">{{ fmtGpuNum(g.clock_mem_mhz, 0) }} <span class="unit">MHz</span></div>
+            </div>
+            <div class="gpu-metric">
+              <div class="gpu-metric-label">功耗</div>
+              <div class="gpu-metric-value">
+                {{ fmtGpuNum(g.power_w, 0) }} <span class="unit">/ {{ fmtGpuNum(g.power_limit_w, 0) }} W</span>
+              </div>
+            </div>
+          </div>
+        </div>
+      </el-card>
+
       <!-- 训练参数（点击展开/收起） -->
       <el-card v-if="selectedTask?.config" shadow="never" style="margin-bottom:20px">
         <template #header>
@@ -212,7 +270,7 @@ import { ref, onMounted, onBeforeUnmount, watch, nextTick, computed } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import * as echarts from 'echarts'
-import { trainApi, type TrainTask, type EpochLog } from '../api/train'
+import { trainApi, type TrainTask, type EpochLog, type GpuStatsPayload } from '../api/train'
 
 const props = defineProps<{ id: string }>()
 const router = useRouter()
@@ -231,6 +289,32 @@ const epochs = ref<EpochLog[]>([])
 let pollTimer: any = null
 let clockTimer: any = null
 const nowTs = ref(Date.now())
+
+// ---- GPU 实时状态（温度/显存/占用/频率/功耗）----
+const gpuStats = ref<GpuStatsPayload>({ available: false, gpus: [] })
+let gpuTimer: any = null
+
+async function loadGpuStats() {
+  try {
+    const { data } = await trainApi.getGpuStats()
+    gpuStats.value = data
+  } catch {
+    // 后端尚未重启/接口不存在时静默失败，不影响监控页其他内容
+  }
+}
+
+function fmtGpuNum(v: number | null | undefined, digits = 0) {
+  return v == null ? '-' : v.toFixed(digits)
+}
+function fmtGpuMb(v: number | null | undefined) {
+  return v == null ? '-' : Math.round(v).toLocaleString()
+}
+function gpuTempClass(t: number | null | undefined) {
+  if (t == null) return ''
+  if (t >= 85) return 'hot'
+  if (t >= 75) return 'warm'
+  return ''
+}
 
 const selectedTask = computed(() => tasks.value.find(t => t.id === selectedTaskId.value))
 
@@ -386,6 +470,9 @@ onMounted(async () => {
   if (tasks.value.length > 0) {
     selectTask(tasks.value[0])
   }
+  // GPU 状态：与训练无关，始终刷新（3 秒）
+  await loadGpuStats()
+  gpuTimer = setInterval(loadGpuStats, 3000)
   // 轮询刷新（训练中时每 5 秒刷新）
   pollTimer = setInterval(async () => {
     const running = tasks.value.some(t => t.status === 'training' || t.status === 'preparing' || t.status === 'pending')
@@ -401,6 +488,7 @@ onBeforeUnmount(() => {
   window.removeEventListener('resize', onWindowResize)
   if (pollTimer) clearInterval(pollTimer)
   if (clockTimer) clearInterval(clockTimer)
+  if (gpuTimer) clearInterval(gpuTimer)
   charts.forEach(c => c.dispose())
   charts = []
 })
@@ -713,5 +801,59 @@ pre {
   color: #909399;
   font-weight: normal;
   margin-right: 4px;
+}
+
+/* ---- GPU 状态卡片 ---- */
+.gpu-card {
+  margin-bottom: 20px;
+}
+.gpu-row {
+  padding: 10px 0;
+  border-bottom: 1px dashed #ebeef5;
+}
+.gpu-row:last-child {
+  border-bottom: none;
+}
+.gpu-name {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  font-weight: 600;
+  color: #303133;
+  margin-bottom: 10px;
+}
+.gpu-metrics {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+  gap: 12px;
+}
+.gpu-metric {
+  background: #fafbfc;
+  border: 1px solid #ebeef5;
+  border-radius: 8px;
+  padding: 8px 10px;
+}
+.gpu-metric-label {
+  font-size: 12px;
+  color: #909399;
+  margin-bottom: 4px;
+}
+.gpu-metric-value {
+  font-size: 16px;
+  font-weight: 600;
+  color: #303133;
+  margin-bottom: 6px;
+}
+.gpu-metric-value .unit {
+  font-size: 12px;
+  font-weight: normal;
+  color: #909399;
+}
+.gpu-metric-value.warm {
+  color: #e6a23c;
+}
+.gpu-metric-value.hot {
+  color: #f56c6c;
 }
 </style>

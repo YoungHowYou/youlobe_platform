@@ -169,6 +169,22 @@ def delete_project(project_id: int, db: Session = Depends(get_db)):
     if not project:
         raise HTTPException(status_code=404, detail="项目不存在")
 
+    # 训练线程跑在 uvicorn 进程内：直接删项目会让线程继续往已删除的目录/记录写，
+    # 因此与「删除训练任务」保持一致，活跃状态直接拒绝。
+    active = (
+        db.query(TrainTask)
+        .filter(
+            TrainTask.project_id == project_id,
+            TrainTask.status.in_(["pending", "preparing", "training", "exporting"]),
+        )
+        .first()
+    )
+    if active is not None:
+        raise HTTPException(
+            status_code=409,
+            detail=f"项目下有正在运行的任务 #{active.id}（{active.status}），请先取消或等它结束再删除项目",
+        )
+
     # 先抓出磁盘上要清的路径（DB 删完后就查不到 task_id 了）
     upload_dir = settings.upload_path / str(project_id)
     train_dirs: list[Path] = []

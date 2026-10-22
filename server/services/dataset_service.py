@@ -981,54 +981,48 @@ def prepare_full_dataset(
     raw_img_dir = str(Path(raw_dir) / "images")
     raw_lbl_dir = str(Path(raw_dir) / "labels")
 
-    # ---- 阶段 2: 预处理 Resize ----
+    # ---- 阶段 2: 预处理（不做统一缩放，只做可选的形态学三通道）----
+    # 2026-10-22 起：图不缩放，训练按原图分辨率做重叠滑窗。
+    # resize_h / resize_w 仅保留字段兼容，不再参与训练。
     if progress_callback:
-        progress_callback(1, 4, "预处理 Resize + 形态学处理...")
+        progress_callback(1, 4, "预处理（原图分辨率；形态学可选）...")
 
     from core.preprocess import run_preprocess
-    resized_dir = str(task_dir / "resized")
-    run_preprocess(
-        image_dir=raw_img_dir,
-        mask_dir=raw_lbl_dir,
-        output_dir=resized_dir,
-        target_h=target_h,
-        target_w=target_w,
-        dilate_kernel=dilate_kernel,
-        erode_kernel=erode_kernel,
-        use_morphology=use_morphology,
-        mask_dilate_kernel=mask_dilate_kernel,
+
+    if use_morphology:
+        # 形态学需要在整图上做（与推理端一致），否则切片边界会出现核窗口差异
+        pre_dir = str(task_dir / "preprocessed")
+        run_preprocess(
+            image_dir=raw_img_dir,
+            mask_dir=raw_lbl_dir,
+            output_dir=pre_dir,
+            use_morphology=True,
+            dilate_kernel=dilate_kernel,
+            erode_kernel=erode_kernel,
+            mask_dilate_kernel=mask_dilate_kernel,
+            resize=False,
+        )
+        tile_img_dir = str(Path(pre_dir) / "images")
+    else:
+        # 不做形态学就不转码不复制，直接用数据库导出的原图
+        tile_img_dir = raw_img_dir
+
+    # ---- 阶段 3: 滑窗切割（原图尺寸 + 重叠度）----
+    if progress_callback:
+        progress_callback(2, 4, f"滑窗切割（crop={crop_size}, overlap={overlap}）...")
+
+    cropped_dir = str(task_dir / "cropped")
+    _sliding_window_with_yolo_labels(
+        image_dir=tile_img_dir,
+        label_dir=raw_lbl_dir,
+        output_dir=cropped_dir,
+        crop_size=crop_size,
+        overlap=overlap,
+        img_h=0,
+        img_w=0,
     )
 
-    # 注意：preprocess 是为 mask 格式设计的，但我们的标注是 YOLO TXT 格式。
-    # 对于 YOLO polygon 标注（归一化坐标），Resize 不影响标注坐标。
-    # 所以我们只 Resize 图像，标注文件直接复制过去。
-    resized_img_dir = str(Path(resized_dir) / "images")
-
-    # 将 YOLO 标注文件复制到 resized 目录旁边
-    # sliding_window 需要的是 mask 格式，但我们的标注已经是 YOLO 格式
-    # 所以这里跳过 sliding_window 的 mask→YOLO 转换，直接构建数据集
-
-    # ---- 阶段 2b: 直接用 YOLO 标注构建滑窗数据集 ----
-    # 如果 resize 后图像 == crop_size，不需要滑窗
-    if target_h == crop_size and target_w == crop_size:
-        # 不需要滑窗，直接用 raw 的 images + labels
-        cropped_dir = raw_dir
-    else:
-        # 需要滑窗切割图像，并对应裁剪标注
-        if progress_callback:
-            progress_callback(2, 4, "滑窗切割...")
-        cropped_dir = str(task_dir / "cropped")
-        _sliding_window_with_yolo_labels(
-            image_dir=resized_img_dir,
-            label_dir=raw_lbl_dir,
-            output_dir=cropped_dir,
-            crop_size=crop_size,
-            overlap=overlap,
-            img_h=target_h,
-            img_w=target_w,
-        )
-
-    # ---- 阶段 3: 数据集划分 ----
+    # ---- 阶段 4: 数据集划分 ----
     if progress_callback:
         progress_callback(3, 4, "数据集划分...")
 

@@ -5,6 +5,9 @@
 
 import logging
 import shutil
+import subprocess
+import time
+from datetime import datetime
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -240,3 +243,109 @@ def list_completed_tasks(project_id: int, db: Session = Depends(get_db)):
             "finished_at": t.finished_at.isoformat() if t.finished_at else None,
         })
     return result
+
+
+# ---------------------------------------------------------------------------
+# GPU 实时状态（训练监控页：温度 / 显存 / 利用率 / 频率 / 功耗）
+# ---------------------------------------------------------------------------
+
+_GPU_SMI_FIELDS = (
+    "index,name,temperature.gpu,utilization.gpu,memory.used,memory.total,"
+    "clocks.sm,clocks.mem,power.draw,power.limit,fan.speed"
+)
+_GPU_CACHE_TTL_S = 1.5          # 多个页面同时轮询时避免反复 shell 调 nvidia-smi
+_GPU_CACHE: dict = {"ts": 0.0, "payload": None}
+
+
+def _find_nvidia_smi() -> str | None:
+    """定位 nvidia-smi（Windows 下 PATH 未配置时走默认安装路径）。"""
+    exe = shutil.which("nvidia-smi")
+    if exe:
+        return exe
+    for candidate in (
+        r"C:\Program Files\NVIDIA Corporation\NVSMI\nvidia-smi.exe",
+        r"C:\Windows\System32\nvidia-smi.exe",
+    ):
+        if Path(candidate).exists():
+            return candidate
+    return None
+
+
+def _smi_num(value: str) -> float | None:
+    """解析 nvidia-smi 的数值字段，[N/A] / NOT SUPPORTED 返回 None。"""
+    text = (value or "").strip()
+    if not text or text.upper() in {"N/A", "[N/A]", "NOT SUPPORTED", "[NOT SUPPORTED]"}:
+        return None
+    try:
+        return float(text)
+    except ValueError:
+        return None
+
+
+def _parse_smi_line(line: str) -> dict | None:
+    parts = [p.strip() for p in line.split(",")]
+    if len(parts) < 11:
+        return None
+    index = _smi_num(parts[0])
+    used = _smi_num(parts[4])
+    total = _smi_num(parts[5])
+    return {
+        "index": int(index) if index is not None else None,
+        "name": parts[1],
+        "temperature_c": _smi_num(parts[2]),
+        "utilization_pct": _smi_num(parts[3]),
+        "memory_used_mb": used,
+        "memory_total_mb": total,
+        "memory_pct": round(used / total * 100, 1) if used is not None and total else None,
+        "clock_sm_mhz": _smi_num(parts[6]),
+        "clock_mem_mhz": _smi_num(parts[7]),
+        "power_w": _smi_num(parts[8]),
+        "power_limit_w": _smi_num(parts[9]),
+        "fan_pct": _smi_num(parts[10]),
+    }
+
+
+@router.get("/gpu/stats")
+def gpu_stats():
+    """读取 GPU 实时状态（nvidia-smi，1.5s 缓存）。
+
+    无 NVIDIA 显卡/驱动时返回 available=False，前端隐藏卡片；
+    仅读硬件传感器，不触碰 CUDA 上下文，对正在跑的训练无影响。
+    """
+    now = time.time()
+    if _GPU_CACHE["payload"] is not None and now - _GPU_CACHE["ts"] < _GPU_CACHE_TTL_S:
+        return _GPU_CACHE["payload"]
+
+    payload = {
+        "available": False,
+        "reason": "",
+        "sampled_at": datetime.now().isoformat(timespec="seconds"),
+        "gpus": [],
+    }
+    exe = _find_nvidia_smi()
+    if not exe:
+        payload["reason"] = "未找到 nvidia-smi（无 NVIDIA 驱动或无显卡）"
+    else:
+        try:
+            proc = subprocess.run(
+                [exe, f"--query-gpu={_GPU_SMI_FIELDS}", "--format=csv,noheader,nounits"],
+                capture_output=True,
+                text=True,
+                timeout=3,
+            )
+            if proc.returncode != 0:
+                payload["reason"] = (proc.stderr or proc.stdout).strip()[:300] or "nvidia-smi 执行失败"
+            else:
+                gpus = [
+                    g for g in (_parse_smi_line(l) for l in proc.stdout.splitlines() if l.strip()) if g
+                ]
+                payload["gpus"] = gpus
+                payload["available"] = bool(gpus)
+                if not gpus:
+                    payload["reason"] = "nvidia-smi 未返回 GPU 信息"
+        except Exception as exc:  # noqa: BLE001 - 任何驱动异常都不应影响 API
+            payload["reason"] = f"读取 GPU 状态失败: {exc}"
+
+    _GPU_CACHE["ts"] = now
+    _GPU_CACHE["payload"] = payload
+    return payload

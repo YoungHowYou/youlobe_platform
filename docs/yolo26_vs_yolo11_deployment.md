@@ -156,23 +156,34 @@ real_dets = detections[0][valid]
 
 ## 4. 避坑指南（部署端必看）
 
-### ❌ 坑 1：保持 `end2end=True` 时直接追加 `nms=True`
+### ❌ 坑 1：以为 `end2end=True` 和 `nms=True` 可以随便叠加
+
+YOLO26 原生模式是 one-to-one NMS-free，直接叠加传统 NMS 没有意义。
+平台现在提供**三种互斥模式**（前端「模型转换 → YOLO26 模式」，对应 DB 的 `head_mode`）：
+
+| 平台 `head_mode` | 实际导出参数 | 产物 | 部署端要做的事 |
+|---|---|---|---|
+| `native`（原生端到端） | `nms=False` | `(1, max_det, 6+nm)`，one-to-one NMS-free | 只按 conf 过滤 |
+| `nms`（内嵌 NMS） | `nms=True, conf=0.001` | `(1, max_det, 6+nm)`，图内有 `NonMaxSuppression` 节点 | 什么都不用做 |
+| `compat`（兼容/高召回） | `end2end=False`（等价 `nms=None`） | `(1, 4+nc+nm, anchors)` 原始候选 | 自己写 NMS + conf 过滤 |
 
 ```python
-# 错误做法
-model = YOLO('yolo26s-seg-best.pt')
-model.export(format='openvino', end2end=True, nms=True)  # ← 模式冲突
+# 原生模式：NMS-free，速度优先
+model.export(format='openvino', nms=False)
+
+# 内嵌 NMS：图内追加传统 NMS 节点，输出已过滤（推荐给不想写后处理的部署端）
+model.export(format='openvino', nms=True, conf=0.001)
+
+# 兼容/高召回：one-to-many 原始候选，由运行时统一做 NMS
+model.export(format='openvino', end2end=False)
 ```
 
-YOLO26 原生模式是 one-to-one NMS-free，不应直接叠加传统 NMS。平台现在提供两种互斥的正确模式：
-
-```python
-# 原生模式：速度和部署简单优先
-model.export(format='openvino', end2end=True, nms=False)
-
-# 兼容/高召回模式：导出 one-to-many 原始候选，由运行时统一做 NMS
-model.export(format='openvino', end2end=False, nms=False)
-```
+**注意（ultralytics 8.4+）**：
+- `nms` 的缺省值是 `None`，既不是原生也不是内嵌，而是退回 one-to-many 原始候选；
+  所以「原生」必须显式传 `nms=False`，不能靠缺省值。
+- `end2end=True/False` 已成为 deprecated，会分别映射到 `nms=False` / `nms=None`。
+- `nms=True` 时 ultralytics 会自动关闭 end2end 分支（换成 one-to-many head），
+  所以**不需要**再传 `end2end=False`，两者一起传只会互相覆盖。
 
 YOLO11-seg 保持既有 `nms=True/False` 选项，不受 YOLO26 模式影响。
 
@@ -247,9 +258,9 @@ i7+UHD 集显单帧推理上，YOLO26s 比 YOLO11n 慢估计 1.5~2 倍（未实�
 | 平台默认，全部新项目 | **YOLO11n-seg** — 小、快、跨平台一致性好 |
 | 部署到 i7+UHD 集显，1拖2 双相机 | **YOLO11n-seg** — 800ms 预算下更稳 |
 | 精度要求很高、速度有富余 | **YOLO26s-seg** — 架构更新，mAP 上限通常更高 |
-| 想直接得到筛选后的固定形状输出 | YOLO26 原生模式，或 YOLO11 用 `nms=True` 导出 |
-| 小缺陷召回优先、规避端到端导出兼容问题 | **YOLO26 兼容模式：`end2end=False, nms=False`，运行时统一 NMS** |
-| 想自己写 NMS / 自定义后处理 | YOLO11，或 YOLO26 `end2end=False, nms=False` |
+| 部署端**完全不想写后处理** | **YOLO26 内嵌 NMS 模式（`nms=True`）**，或 YOLO11 用 `nms=True` 导出 |
+| 小缺陷召回优先、规避端到端导出兼容问题 | **YOLO26 兼容模式：`end2end=False`（`nms=None`），运行时统一 NMS** |
+| 想自己写 NMS / 自定义后处理 | YOLO11，或 YOLO26 兼容模式 |
 
 **保守做法**：先把现有 YOLO11n-seg 部署跑稳，验证业务指标达标；然后用相同数据训一份 YOLO26s-seg 对比 mAP 和速度，再决定要不要切。
 
@@ -346,7 +357,8 @@ for (int i = 0; i < 300; ++i) {
 ## TL;DR
 
 1. **YOLO26-seg + OV 实测可用**，conf 是正常 prob，跟 PT 推理完全一致
-2. **YOLO26 原生模式是 one-to-one NMS-free + TopK**，不是 graph 内执行传统 NMS
-3. **小缺陷 OpenVINO 推荐兼容模式**：`end2end=False, nms=False`，由运行时统一 NMS
-4. **YOLO11 继续使用原有导出/NMS链路**，不受 YOLO26 兼容模式影响
-5. **跨滑窗切片的全局 NMS 仍必须保留**
+2. **YOLO26 有三种导出模式**：`native`（one-to-one NMS-free，需显式 `nms=False`）、
+   `nms`（图内追加传统 NMS 节点，输出已过滤）、`compat`（one-to-many 原始候选 + 运行时 NMS）
+3. **小缺陷 OpenVINO 推荐兼容模式**：`end2end=False`（等价 `nms=None`），由运行时统一 NMS
+4. **YOLO11 继续使用原有导出/NMS链路**，不受 YOLO26 各模式影响
+5. **跨滑窗切片的全局 NMS 仍必须保留**（无论产物是否内嵌/免 NMS）
