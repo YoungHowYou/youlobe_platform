@@ -7,12 +7,14 @@ from pydantic import BaseModel, Field
 class TrainConfig(BaseModel):
     """训练参数配置（硅片缺陷检测优化预设）"""
     # 训练模式
-    train_mode: str = Field(default="scratch", description="scratch=从头训练, finetune=继承训练")
+    train_mode: str = Field(default="scratch", description="scratch=从头训练, finetune=继承训练, custom=自定义预训练模型")
     resume_from_task_id: Optional[int] = Field(default=None, description="继承训练时，从哪个任务的模型开始")
     resume_model_type: str = Field(default="best", description="继承的模型类型: best/last")
 
     # 模型选择
     model_name: str = Field(default="yolo26s-seg", description="模型尺寸: yolo26n/s/m/l/x-seg")
+    # 自定义预训练模型（train_mode='custom'）：服务器本地 .pt 路径
+    model_path: Optional[str] = Field(default=None, description="自定义预训练权重路径（weights/ / 仓库根 / storage/models）")
 
     # 数据划分
     # cls 闭集复核训练允许 1.0：同一批人工复核小图同时作为训练/验证集，
@@ -82,6 +84,8 @@ class TrainTaskOut(BaseModel):
     error_message: Optional[str]
     config: Optional[dict] = None
     num_classes: Optional[int] = None
+    # 排队位置（1 基）：只有 status='pending' 且在队列里的任务才有值
+    queue_position: Optional[int] = None
     started_at: Optional[datetime]
     finished_at: Optional[datetime]
     created_at: datetime

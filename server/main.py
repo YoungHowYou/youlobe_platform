@@ -12,6 +12,7 @@ API 文档:
 
 from contextlib import asynccontextmanager
 import os
+import sys
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -28,6 +29,14 @@ try:
     _MPP.__init__ = _patched_init
 except Exception as _e:
     print(f"[WARN] 无法 patch MultiPartParser: {_e}")
+
+# stdout/stderr 重定向到文件时 Python 默认块缓冲，训练输出要等缓冲区满才落盘，
+# 监控页的「最近输出」会滞后几分钟。改成行缓冲，打印即落盘。
+try:
+    sys.stdout.reconfigure(line_buffering=True)
+    sys.stderr.reconfigure(line_buffering=True)
+except Exception as _e:
+    print(f"[WARN] 无法切换行缓冲: {_e}")
 
 from .config import settings
 from .database import init_db
@@ -113,8 +122,15 @@ async def lifespan(app: FastAPI):
                 .all()
             )
             for t in stale:
+                # 排队队列只存在内存里，进程重启后队列内容就没了，
+                # 所以待开始的（pending）任务需要明确告知用户“重新提交”
+                queued_only = t.status == "pending"
                 t.status = "failed"
-                t.error_message = "服务重启，训练中断；请重新创建训练任务"
+                t.error_message = (
+                    "服务重启，该任务还在排队未开始执行；请重新创建训练任务"
+                    if queued_only
+                    else "服务重启，训练中断；请重新创建训练任务"
+                )
                 from datetime import datetime as _dt
 
                 t.finished_at = _dt.now()
@@ -198,7 +214,7 @@ class AuthMiddleware(BaseHTTPMiddleware):
 app.add_middleware(AuthMiddleware)
 
 # ---- 注册路由 ----
-from .routers import projects, images, annotations, train, inference, export, import_data, auth
+from .routers import projects, images, annotations, train, inference, export, import_data, auth, monitor
 
 app.include_router(auth.router)
 app.include_router(projects.router)
@@ -208,6 +224,7 @@ app.include_router(train.router)
 app.include_router(inference.router)
 app.include_router(export.router)
 app.include_router(import_data.router)
+app.include_router(monitor.router)
 
 # ---- 静态文件（推断结果图片）----
 import os

@@ -296,13 +296,13 @@
         <!-- cls 项目隐藏 Resize/切割尺寸/重叠率（cls 训练统一走 imgsz=224，不切大图） -->
         <template v-if="project?.task_type !== 'cls'">
           <el-alert
-            v-if="project?.task_type === 'seg'"
             type="info" :closable="false" show-icon
             style="margin-bottom:12px"
-            title="训练不再统一缩放：原图直接按重叠滑窗切片"
+            title="训练不统一缩放：原图直接按重叠滑窗切片"
           >
             <div style="font-size:12px;line-height:1.7">
-              Resize 高/宽已停用，保留字段仅为兼容历史任务；训练只使用下方的切割尺寸与重叠率。
+              「切割尺寸」= 滑窗窗口大小（即模型输入尺寸），「重叠率」控制相邻窗口重叠；seg / det / obb 都按此口径切片。
+              Resize 字段已停用，仅保留以兼容历史任务。
             </div>
           </el-alert>
           <el-row :gutter="16">

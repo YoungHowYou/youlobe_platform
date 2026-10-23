@@ -25,6 +25,13 @@
           <el-input-number v-model="brushSize" :min="1" :max="500" :step="1" :controls="false" size="small" style="width:64px" />
           <span class="ctrl-value">px</span>
         </div>
+        <template v-if="currentTool==='circle'">
+          <el-divider direction="vertical" />
+          <el-radio-group v-model="circleMode" size="small" @change="cancelDrawing">
+            <el-radio-button label="center">圆心+半径</el-radio-button>
+            <el-radio-button label="three">3点共圆</el-radio-button>
+          </el-radio-group>
+        </template>
         <el-divider direction="vertical" />
         <el-button size="small" :disabled="!canUndo" @click="undo">撤销</el-button>
         <el-button size="small" :disabled="!canRedo" @click="redo">重做</el-button>
@@ -105,7 +112,17 @@
           <div v-if="annotations.length===0" class="empty-hint">暂无标注</div>
           <div v-for="(ann,idx) in annotations" :key="idx" :class="['ann-item',{selected:selectedAnnIdx===idx}]" @click="selectAnn(idx)">
             <span class="class-dot" :style="{background:clsColor(ann.class_id)}"></span>
-            <span class="ann-label">{{ clsName(ann.class_id) }} #{{ idx+1 }}</span>
+            <!-- 已画好的标注可直接改类别（换色 + 计入对应类别统计，可撤销） -->
+            <el-select
+              :model-value="ann.class_id"
+              size="small"
+              class="ann-class-select"
+              :title="clsName(ann.class_id)"
+              @change="(v:number)=>changeAnnClass(idx,v)"
+              @click.stop
+            >
+              <el-option v-for="dc in defectClasses" :key="dc.id" :label="dc.name" :value="dc.id!" />
+            </el-select>
             <span class="ann-points">{{ ann.polygon.length }}点</span>
             <el-button type="danger" text size="small" @click.stop="delAnn(idx)"><el-icon><Delete /></el-icon></el-button>
           </div>
@@ -146,7 +163,7 @@ import { ElMessage, ElMessageBox } from 'element-plus'
 import { fabric } from 'fabric'
 import { projectApi, type DefectClass } from '../api/project'
 import { imageApi, type ImageInfo } from '../api/image'
-import { annotationApi, type AnnotationData, type Point, type InferenceModelInfo } from '../api/annotation'
+import { annotationApi, type AnnotationData, type Point, type AnnShape, type ShapeParams, type InferenceModelInfo } from '../api/annotation'
 
 const props = defineProps<{ projectId: string; imageId: string }>()
 const router = useRouter()
@@ -188,6 +205,9 @@ watch(imageChannel,()=>{
   loadCanvasBackground(currentImageId.value,false)
 })
 const isDrawing = ref(false)
+/** 圆形工具的画法：center=圆心+半径，three=三点共圆 */
+const circleMode = ref<'center'|'three'>('center')
+const circleClicks = ref(0)   // 仅用于模板提示（circlePts 是普通变量，不响应式）
 const saving = ref(false)
 const saveState = ref<'idle'|'pending'|'saving'|'saved'|'error'>('idle')
 const saveStateText = computed(()=>({
@@ -214,10 +234,12 @@ const toolHint = computed(()=>{
     polygon:isDrawing.value?'点击加顶点·双击/回车完成·Esc取消':'点击开始画多边形（Alt+拖拽可平移已有区域）',
     rect:'点击拖拽画矩形（Alt+拖拽可平移已有区域）',
     brush:'按住涂抹·松开生成标注·按住 Shift 涂抹追加到上一段（大缺陷分多笔涂）',
-    circle:'点击拖拽画圆（Alt+拖拽可平移已有区域）',
+    circle:circleMode.value==='three'
+      ?`三点共圆：点 3 个点自动生成圆${circleClicks.value?`（已点 ${circleClicks.value}/3）`:''}·Esc 取消`
+      :'点击圆心后拖拽出半径（Alt+拖拽可平移已有区域）',
     polyline:isDrawing.value?'点击加折点·双击/回车完成':'点击开始画折线（Alt+拖拽可平移已有区域）',
     eraser:'按住涂抹擦除标注区域',boxEraser:'拖拽框选删除',
-    select:'拖动区域平移·拖绿色圆点旋转(Shift 吸附15°)·拖白点改顶点·Shift+方向键微调·[ ] 旋转15°',
+    select:'拖动区域平移·拖绿色圆点旋转(Shift 吸附15°)·白点改顶点·矩形拖角/圆拖圆心与半径·Shift+方向键微调·[ ] 旋转15°',
   })[currentTool.value]||''
 })
 const canvasAreaRef = ref<HTMLElement>()
@@ -233,6 +255,8 @@ let lastBrushPts:{x:number;y:number}[]=[]
 let isErasing=false
 let eraserPts:{x:number;y:number}[]=[]
 let circleStart:{x:number;y:number}|null=null
+// 3 点共圆：已点击的点（显示坐标像素），满 3 个就生成圆
+let circlePts:{x:number;y:number}[]=[]
 let rectStart:{x:number;y:number}|null=null
 let boxEraserStart:{x:number;y:number}|null=null
 let editHandles:fabric.Circle[]=[]
@@ -660,7 +684,11 @@ function initCanvas(){
     else if(tool==='polyline')onPolylineClick(p)
     else if(tool==='brush'){isBrushing=true;brushPts=[{x:p.x,y:p.y}]}
     else if(tool==='eraser'){isErasing=true;eraserPts=[{x:p.x,y:p.y}]}
-    else if(tool==='circle')circleStart={x:p.x,y:p.y}
+    else if(tool==='circle'){
+      // 3 点共圆：点击累加，满 3 个自动成圆；圆心+半径：按下记录圆心，松开拖出半径
+      if(circleMode.value==='three')onCircle3Click(p)
+      else circleStart={x:p.x,y:p.y}
+    }
     else if(tool==='rect')rectStart={x:p.x,y:p.y}
     else if(tool==='boxEraser')boxEraserStart={x:p.x,y:p.y}
   })
@@ -681,6 +709,7 @@ function initCanvas(){
     else if(currentTool.value==='brush'&&isBrushing){brushPts.push({x:p.x,y:p.y});drawDotAt(p,clsColor(selectedClassId.value)+'66')}
     else if(currentTool.value==='eraser'&&isErasing){eraserPts.push({x:p.x,y:p.y});drawDotAt(p,'rgba(255,80,80,0.5)')}
     else if(currentTool.value==='circle'&&circleStart)drawCirclePrev(p)
+    else if(currentTool.value==='circle'&&circleMode.value==='three'&&circlePts.length===2)drawCirclePrev3(p)
     else if(currentTool.value==='rect'&&rectStart)drawRectPrev(p)
     else if(currentTool.value==='boxEraser'&&boxEraserStart)drawBoxRect(p)
   })
@@ -734,6 +763,8 @@ async function loadImageAndAnnotations(){
     if(reqImageId!==currentImageId.value)return  // 切图了，本次响应作废
     annotations.value=data.map(a=>({
       class_id:a.class_id,
+      shape:(a.shape as AnnShape)||'polygon',
+      shape_params:a.shape_params||null,
       // 加载时也 clamp，避免历史 VOC 导入的越界数据被原样回写造成 422；
       // 再从原图坐标系换算到当前显示坐标系（viewRot=0 时为恒等）
       polygon:sanitizePolygon((a.polygon as any[]).map(p => Array.isArray(p) ? {x:p[0],y:p[1]} : {x:p.x,y:p.y})).map(origToDisp)
@@ -895,8 +926,38 @@ async function finishCircle(p:{x:number;y:number}){
   if(r<2){circleStart=null;cleanTmp();return}
   if(!(await ensureCanAddDefect())){circleStart=null;cleanTmp();return}
   const W=dispW(),H=dispH()
-  const poly:Point[]=[];for(let i=0;i<32;i++){const a=2*Math.PI*i/32;poly.push({x:Math.max(0,Math.min(1,(circleStart.x+r*Math.cos(a))/W)),y:Math.max(0,Math.min(1,(circleStart.y+r*Math.sin(a))/H))})}
-  addAnn(poly);circleStart=null;cleanTmp()
+  addAnn(circlePolyFrom(circleStart.x,circleStart.y,r,W,H),'circle')
+  circleStart=null;cleanTmp()
+}
+
+// ---- 3 点共圆 ----
+/** 3 点共圆时的第二点预览：用「已点两点 + 当前鼠标」的外接圆做虚线预览 */
+function drawCirclePrev3(p:{x:number;y:number}){
+  if(!canvas||circlePts.length!==2)return;cleanTmp()
+  const cc=circumcircle(circlePts[0],circlePts[1],p)
+  if(!cc||cc.r<1)return
+  const c=clsColor(selectedClassId.value)
+  const ci=new fabric.Circle({
+    left:cc.cx-cc.r,top:cc.cy-cc.r,radius:cc.r,
+    fill:'transparent',stroke:c,strokeWidth:1,strokeDashArray:[5,4],
+    selectable:false,evented:false,
+  })
+  ;(ci as any)._tmp=true;canvas.add(ci);canvas.requestRenderAll()
+}
+async function onCircle3Click(p:{x:number;y:number}){
+  drawDotFixed(p.x,p.y)
+  circlePts.push({x:p.x,y:p.y})
+  circleClicks.value=circlePts.length
+  if(circlePts.length<3)return
+  const[a,b,c]=circlePts
+  circlePts=[]
+  circleClicks.value=0
+  const cc=circumcircle(a,b,c)
+  if(!cc||cc.r<2){cleanTmp();ElMessage.warning('三点近似共线，无法确定一个圆，请重新点击');return}
+  if(!(await ensureCanAddDefect())){cleanTmp();return}
+  const W=dispW(),H=dispH()
+  addAnn(circlePolyFrom(cc.cx,cc.cy,cc.r,W,H),'circle')
+  cleanTmp()
 }
 
 // ====== 矩形 ======
@@ -914,12 +975,10 @@ async function finishRect(p:{x:number;y:number}){
   const x1=Math.min(rectStart.x,p.x),y1=Math.min(rectStart.y,p.y)
   const x2=Math.max(rectStart.x,p.x),y2=Math.max(rectStart.y,p.y)
   if(x2-x1<3||y2-y1<3){rectStart=null;cleanTmp();return} // 太小忽略
-  // 4 点多边形：左上 → 右上 → 右下 → 左下
+  // 4 点多边形：左上 → 右上 → 右下 → 左下（shape=rect，编辑时按矩形拖角点而不是拖顶点）
   if(!(await ensureCanAddDefect())){rectStart=null;cleanTmp();return}
-  const poly:Point[]=[
-    {x:x1/W,y:y1/H},{x:x2/W,y:y1/H},{x:x2/W,y:y2/H},{x:x1/W,y:y2/H},
-  ]
-  addAnn(poly);rectStart=null;cleanTmp()
+  addAnn(rectPolyFrom(x1,y1,x2,y2,W,H),'rect')
+  rectStart=null;cleanTmp()
 }
 
 // ====== 像素级擦除 ======
@@ -1023,16 +1082,71 @@ function sanitizePolygon(polygon:Point[]):Point[]{
   return out
 }
 
-function addAnn(polygon:Point[]){
+function addAnn(polygon:Point[],shape:AnnShape='polygon'){
   const cleaned=sanitizePolygon(polygon)
   if(cleaned.length<3)return // 至少 3 点
   pushUndo()
-  annotations.value.push({class_id:selectedClassId.value,polygon:cleaned})
+  // rect / circle 只记 shape 类型，几何参数一律从 polygon 反推（polygon 是唯一真相），
+  // 这样整体平移、旋转、剪贴板、撤销都不用维护第二份数据
+  annotations.value.push({class_id:selectedClassId.value,polygon:cleaned,shape,shape_params:shapeParamsFromPolygon(shape,cleaned,dispW(),dispH())})
   setLocalImageStatus('labeled',annotations.value.length)
   dirty.value=true
   renderAnnotations()
   scheduleAutoSave()
 }
+
+// ====== 参数化形状（矩形 / 圆形）======
+// 设计：`polygon` 始终是几何唯一真相（训练/推理只认它），`shape` 只声明“这是矩形/圆”，
+// 编辑时按形状给手柄（矩形拖 4 角、圆拖圆心/半径），改完重新生成 polygon。
+// 这样不会把圆/矩形退化成“一堆可随意拖的顶点”。
+const CIRCLE_SAMPLE=48
+const MANUAL_HANDLE_R=4
+
+/** 圆（显示坐标：中心归一化 + 像素半径）→ 归一化轮廓点 */
+function circlePolyFrom(cx:number,cy:number,rPx:number,W:number,H:number):Point[]{
+  const pts:Point[]=[]
+  for(let i=0;i<CIRCLE_SAMPLE;i++){
+    const a=2*Math.PI*i/CIRCLE_SAMPLE
+    pts.push({x:(cx+rPx*Math.cos(a))/W,y:(cy+rPx*Math.sin(a))/H})
+  }
+  return pts
+}
+
+/** 矩形四角（左上 → 右上 → 右下 → 左下），与绘制顺序一致 */
+function rectPolyFrom(x1:number,y1:number,x2:number,y2:number,W:number,H:number):Point[]{
+  return [
+    {x:x1/W,y:y1/H},{x:x2/W,y:y1/H},{x:x2/W,y:y2/H},{x:x1/W,y:y2/H},
+  ]
+}
+
+/** 从归一化轮廓点反推形状参数（坐标单位与传入的 W/H 一致） */
+function shapeParamsFromPolygon(shape:AnnShape|undefined,polygon:Point[],W:number,H:number):ShapeParams|undefined{
+  if(shape!=='rect'&&shape!=='circle')return undefined
+  if(!polygon.length)return undefined
+  const xs=polygon.map(p=>p.x),ys=polygon.map(p=>p.y)
+  const x1=Math.min(...xs),x2=Math.max(...xs),y1=Math.min(...ys),y2=Math.max(...ys)
+  if(shape==='rect')return{x1,y1,x2,y2}
+  return{
+    cx:(x1+x2)/2,cy:(y1+y2)/2,
+    r:((x2-x1)*W+(y2-y1)*H)/4,   // 圆在像素坐标下是正圆：宽高两个方向直径取均值 /2
+  }
+}
+
+/** 当前显示坐标系下的形状参数 */
+function dispShapeParams(ann:AnnotationData):ShapeParams|undefined{
+  return shapeParamsFromPolygon(ann.shape,ann.polygon,dispW(),dispH())
+}
+
+/** 三点外接圆（像素坐标）；返回 null 表示三点近似共线 */
+function circumcircle(a:Point,b:Point,c:Point):{cx:number;cy:number;r:number}|null{
+  const d=2*(a.x*(b.y-c.y)+b.x*(c.y-a.y)+c.x*(a.y-b.y))
+  if(Math.abs(d)<1e-6)return null
+  const a2=a.x*a.x+a.y*a.y,b2=b.x*b.x+b.y*b.y,c2=c.x*c.x+c.y*c.y
+  const cx=(a2*(b.y-c.y)+b2*(c.y-a.y)+c2*(a.y-b.y))/d
+  const cy=(a2*(c.x-b.x)+b2*(a.x-c.x)+c2*(b.x-a.x))/d
+  return{cx,cy,r:Math.hypot(a.x-cx,a.y-cy)}
+}
+
 function drawDotFixed(x:number,y:number){
   if(!canvas)return;const c=clsColor(selectedClassId.value)
   const d=new fabric.Circle({left:x-2,top:y-2,radius:2,fill:'#FFF',stroke:c,strokeWidth:1,selectable:false,evented:false})
@@ -1050,7 +1164,7 @@ function drawTmpLine(p:{x:number;y:number}){
   const ln=new fabric.Line([last.x,last.y,p.x,p.y],{stroke:c,strokeWidth:0.75,strokeDashArray:[5,3],selectable:false,evented:false})
   ;(ln as any)._tmp=true;(ln as any)._tl=true;canvas.add(ln);canvas.requestRenderAll()
 }
-function cancelDrawing(){finishManualDrag();isDrawing.value=false;drawingPoints=[];isBrushing=false;brushPts=[];isErasing=false;eraserPts=[];circleStart=null;rectStart=null;boxEraserStart=null;lastBrushAnnIdx=-1;lastBrushPts=[];cleanTmp()}
+function cancelDrawing(){finishManualDrag();isDrawing.value=false;drawingPoints=[];isBrushing=false;brushPts=[];isErasing=false;eraserPts=[];circleStart=null;circlePts=[];circleClicks.value=0;rectStart=null;boxEraserStart=null;lastBrushAnnIdx=-1;lastBrushPts=[];cleanTmp()}
 function cleanTmp(){if(!canvas)return;canvas.getObjects().filter(o=>(o as any)._tmp).forEach(o=>canvas!.remove(o));canvas.requestRenderAll()}
 function selectAnn(idx:number){
   selectedAnnIdx.value=idx
@@ -1073,12 +1187,136 @@ function highlightSelected(){
 }
 
 // ====== 顶点编辑 + 整体旋转（仅 select 工具）======
+/**
+ * 矩形 / 圆形的参数化手柄：矩形拖 4 个角（对角固定，轴对齐），
+ * 圆拖圆心（平移，半径不变）+ 拖半径手柄（改半径）。
+ * 不给顶点手柄，避免把形状退化成“一堆可随意拖的顶点”。
+ */
+function showShapeHandles(idx:number){
+  removeVertexHandles()
+  if(!canvas||!currentImage.value)return
+  if(isSegTask.value&&!showAnnotationLayer.value)return
+  const ann=annotations.value[idx]
+  if(!ann)return
+  const W=dispW(),H=dispH()
+  const params=dispShapeParams(ann)
+  if(!params)return
+  const R=MANUAL_HANDLE_R
+  const mkHandle=(x:number,y:number,color:string,cursor:string)=>{
+    const h=new fabric.Circle({
+      left:x-R,top:y-R,radius:R,
+      fill:color,stroke:'#409EFF',strokeWidth:1.5,
+      hasControls:false,hasBorders:false,
+      selectable:true,evented:true,hoverCursor:cursor,
+      originX:'left',originY:'top',
+      lockRotation:true,lockScalingX:true,lockScalingY:true,
+    })
+    ;(h as any)._handle=true
+    ;(h as any)._annIdx=idx
+    return h
+  }
+
+  if(ann.shape==='rect'){
+    const x1=params.x1!*W,y1=params.y1!*H,x2=params.x2!*W,y2=params.y2!*H
+    // [手柄 x,y, 对角点 x,y]
+    const corners:Array<[number,number,number,number]>=[
+      [x1,y1,x2,y2],[x2,y1,x1,y2],[x2,y2,x1,y1],[x1,y2,x2,y1],
+    ]
+    corners.forEach(([hx,hy,ox,oy])=>{
+      const handle=mkHandle(hx,hy,'#fff','nwse-resize')
+      let firstMove=true
+      handle.on('mousedown',()=>{firstMove=true})
+      handle.on('moving',()=>{
+        if(!currentImage.value)return
+        const mx=(handle.left||0)+R,my=(handle.top||0)+R
+        const nx1=Math.max(0,Math.min(W,Math.min(ox,mx)))
+        const nx2=Math.max(0,Math.min(W,Math.max(ox,mx)))
+        const ny1=Math.max(0,Math.min(H,Math.min(oy,my)))
+        const ny2=Math.max(0,Math.min(H,Math.max(oy,my)))
+        if(nx2-nx1<3||ny2-ny1<3)return
+        // 第一次真正改变尺寸才入栈，避免单击也 push undo
+        if(firstMove){pushUndo();firstMove=false}
+        ann.polygon=rectPolyFrom(nx1,ny1,nx2,ny2,W,H)
+        syncAnnShape(idx)
+        liveHint(`矩形 ${Math.round(nx2-nx1)}×${Math.round(ny2-ny1)} px`)
+        canvas!.requestRenderAll()
+      })
+      handle.on('modified',()=>{
+        dragHint.value=''
+        if(firstMove)return
+        dirty.value=true;scheduleAutoSave()
+        renderAnnotations();showShapeHandles(idx);highlightSelected()
+      })
+      canvas!.add(handle);editHandles.push(handle)
+    })
+    canvas.requestRenderAll()
+    return
+  }
+
+  // ---- 圆 ----
+  const cx=params.cx!*W,cy=params.cy!*H,r=params.r!
+  const cHandle=mkHandle(cx,cy,'#FFD666','move')
+  let origPoly:Point[]|null=null
+  let startPt={x:cx,y:cy}
+  let cMoved=false
+  cHandle.on('mousedown',()=>{
+    origPoly=ann.polygon.map(p=>({...p}))
+    startPt={x:(cHandle.left||0)+R,y:(cHandle.top||0)+R}
+    cMoved=false
+  })
+  cHandle.on('moving',()=>{
+    if(!origPoly)return
+    const mx=(cHandle.left||0)+R,my=(cHandle.top||0)+R
+    if(!cMoved){pushUndo();cMoved=true}
+    const dx=mx-startPt.x,dy=my-startPt.y
+    ann.polygon=origPoly.map(p=>({
+      x:Math.max(0,Math.min(1,p.x+dx/W)),
+      y:Math.max(0,Math.min(1,p.y+dy/H)),
+    }))
+    syncAnnShape(idx)
+    liveHint(`圆心 (${Math.round(mx)}, ${Math.round(my)}) · 半径不变`)
+    canvas!.requestRenderAll()
+  })
+  cHandle.on('modified',()=>{
+    dragHint.value=''
+    origPoly=null
+    if(!cMoved)return
+    dirty.value=true;scheduleAutoSave()
+    renderAnnotations();showShapeHandles(idx);highlightSelected()
+  })
+  canvas.add(cHandle);editHandles.push(cHandle)
+
+  const rHandle=mkHandle(cx+r,cy,'#409EFF','ew-resize')
+  let rFirst=true
+  rHandle.on('mousedown',()=>{rFirst=true})
+  rHandle.on('moving',()=>{
+    const mx=(rHandle.left||0)+R,my=(rHandle.top||0)+R
+    const nr=Math.hypot(mx-cx,my-cy)
+    if(nr<2)return
+    if(rFirst){pushUndo();rFirst=false}
+    ann.polygon=circlePolyFrom(cx,cy,nr,W,H)
+    syncAnnShape(idx)
+    liveHint(`半径 ${Math.round(nr)} px`)
+    canvas!.requestRenderAll()
+  })
+  rHandle.on('modified',()=>{
+    dragHint.value=''
+    if(rFirst)return
+    dirty.value=true;scheduleAutoSave()
+    renderAnnotations();showShapeHandles(idx);highlightSelected()
+  })
+  canvas.add(rHandle);editHandles.push(rHandle)
+  canvas.requestRenderAll()
+}
+
 function showVertexHandles(idx:number){
   removeVertexHandles()
   if(!canvas||!currentImage.value)return
   if(isSegTask.value&&!showAnnotationLayer.value)return
   const ann=annotations.value[idx]
   if(!ann)return
+  // 矩形 / 圆形走参数化手柄，不按多边形顶点编辑
+  if(ann.shape==='rect'||ann.shape==='circle'){showShapeHandles(idx);return}
   const W=dispW(),H=dispH()
 
   // ---- 旋转手柄（绿色圆点，在 polygon 上方）----
@@ -1264,6 +1502,15 @@ function rotateSelectedBy(deg:number){
   const ann=idx>=0?annotations.value[idx]:null
   if(!ann){ElMessage.warning('请先用「选择」工具点击一个标注区域');return}
   if(ann.polygon.length<3)return
+  // 矩形/圆是参数化形状：旋转会破坏“轴对齐矩形 / 正圆”的语义，不提供旋转
+  if(ann.shape==='rect'){
+    ElMessage.warning('矩形为轴对齐形状，不支持旋转；如需斜置请用多边形工具绘制')
+    return
+  }
+  if(ann.shape==='circle'){
+    ElMessage.info('圆形旋转后不变（圆心+半径定义），无需旋转')
+    return
+  }
   const W=dispW(),H=dispH()
   const n=ann.polygon.length
   const cx=ann.polygon.reduce((s,p)=>s+p.x*W,0)/n
@@ -1352,13 +1599,30 @@ function finishManualDrag(){
   scheduleAutoSave()
 }
 
+/**
+ * 改已画标注的类别：换颜色 + 重新计入类别统计，可撤销、自动保存。
+ * 只改 class_id，不动 polygon。
+ */
+function changeAnnClass(idx:number,classId:number){
+  const ann=annotations.value[idx]
+  if(!ann||classId==null||ann.class_id===classId)return
+  pushUndo()
+  ann.class_id=classId
+  dirty.value=true
+  renderAnnotations()
+  if(currentTool.value==='select'&&selectedAnnIdx.value===idx)showVertexHandles(idx)
+  highlightSelected()
+  scheduleAutoSave()
+}
+
 // ====== 复制粘贴 ======
 function copyAnn(){
   if(selectedAnnIdx.value<0)return
   const ann=annotations.value[selectedAnnIdx.value]
   if(!ann)return
   // 剪贴板统一存原图坐标系，粘贴时再转当前显示坐标系（旋转前后复制粘贴不错位）
-  clipboard={class_id:ann.class_id,polygon:ann.polygon.map(dispToOrig)}
+  // shape 一起复制，矩形/圆粘贴后仍然是矩形/圆（参数从轮廓反推，不用单独存）
+  clipboard={class_id:ann.class_id,polygon:ann.polygon.map(dispToOrig),shape:ann.shape}
   ElMessage.info('已复制')
 }
 async function pasteAnn(){
@@ -1372,7 +1636,7 @@ async function pasteAnn(){
     y:Math.max(0,Math.min(1,p.y+dy)),
   }))
   pushUndo()
-  annotations.value.push({class_id:clipboard.class_id,polygon:newPoly})
+  annotations.value.push({class_id:clipboard.class_id,polygon:newPoly,shape:clipboard.shape||'polygon',shape_params:shapeParamsFromPolygon(clipboard.shape,newPoly,W,H)})
   setLocalImageStatus('labeled',annotations.value.length)
   dirty.value=true
   selectedAnnIdx.value=annotations.value.length-1
@@ -1406,10 +1670,15 @@ async function handleSave(opt:{silent?:boolean;immediate?:boolean}={}){
   // 提交前：显示坐标系 → 原图坐标系（viewRot=0 时为恒等），
   // 再做兜底 sanitize：兼容历史 VOC 导入数据中的越界顶点
   // (后端 PointSchema 强制 [0,1]，越界值会 422)
-  const safeAnns=annotations.value.map(a=>({
-    ...a,
-    polygon:sanitizePolygon(a.polygon.map(dispToOrig)),
-  })).filter(a=>a.polygon.length>=3)
+  const safeAnns=annotations.value.map(a=>{
+    const polygon=sanitizePolygon(a.polygon.map(dispToOrig))
+    const shape:AnnShape=a.shape||'polygon'
+    // 参数一律从保存后的轮廓点反推，且用**原图**宽高（圆半径是像素值，
+    // 显示坐标系旋转 90° 后宽高互换，不能拿 dispW/dispH 算）
+    const img=currentImage.value
+    const params=shapeParamsFromPolygon(shape,polygon,img?.width||1,img?.height||1)
+    return {...a,polygon,shape,shape_params:params}
+  }).filter(a=>a.polygon.length>=3)
   try{
     await annotationApi.save(imgId,safeAnns)
     // 仅当当前图未切换时才更新状态（防止用户切图后异步回写覆盖新图状态）
@@ -1549,6 +1818,9 @@ function imgSC(img:ImageInfo){return{'sc-u':img.status==='unlabeled','sc-l':img.
 .ann-item{display:flex;align-items:center;gap:6px;padding:6px 12px;cursor:pointer;transition:background .15s}
 .ann-item:hover{background:#333}.ann-item.selected{background:#1a3a5c}
 .ann-label{flex:1;font-size:12px}.ann-points{font-size:11px;color:#888}
+.ann-class-select{flex:1;min-width:0}
+.ann-class-select :deep(.el-select__wrapper){min-height:24px;padding:0 8px}
+.ann-class-select :deep(.el-select__selected-item){font-size:12px}
 .statusbar{display:flex;align-items:center;gap:24px;padding:4px 16px;background:#2d2d2d;border-top:1px solid #444;font-size:12px;color:#888}
 .status-shortcuts{margin-left:auto;color:#666}
 .save-indicator{font-size:12px;min-width:80px;text-align:right;transition:color .2s}

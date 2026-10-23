@@ -14,6 +14,8 @@ export interface TrainTask {
   started_at: string | null
   finished_at: string | null
   created_at: string
+  /** 排队位置（1 基）：只有待开始且已入队的任务才有值，None 表示未排队 */
+  queue_position?: number | null
   config?: Record<string, any> | null   // 训练时使用的完整参数（model_name/epochs/lr0/...）
 }
 
@@ -76,6 +78,10 @@ export const trainApi = {
 
   cancelTask: (taskId: number) =>
     api.post(`/train/tasks/${taskId}/cancel`),
+
+  // 手动早停：当前 epoch 结束后停止，产物有效（状态记为 completed）
+  stopTask: (taskId: number) =>
+    api.post(`/train/tasks/${taskId}/stop`),
 
   deleteTask: (taskId: number) =>
     api.delete(`/train/tasks/${taskId}`),

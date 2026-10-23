@@ -325,16 +325,9 @@ def infer_single_image(
             display_image = cv2.resize(display_image, (new_w, new_h), interpolation=cv2.INTER_CUBIC)
             orig_h, orig_w = new_h, new_w
 
-    # ---- 边缘 Padding ----
-    if padding > 0:
-        padded = cv2.copyMakeBorder(
-            image_3ch, padding, padding, padding, padding,
-            cv2.BORDER_REFLECT_101
-        )
-    else:
-        padded = image_3ch
-
-    pad_h, pad_w = padded.shape[:2]
+    # ---- 尺寸判定：小图 pad，大图加边距后滑窗 ----
+    img_h, img_w = image_3ch.shape[:2]
+    applied_padding = 0
 
     # 获取模型类型
     model_type = getattr(model, '_model_type', 'pytorch')
@@ -356,18 +349,26 @@ def infer_single_image(
             predict_kwargs['device'] = formatted_device
     
     # ---- 判断是否需要滑窗 ----
-    if pad_h <= crop_size and pad_w <= crop_size:
-        # 图像小于等于 crop_size，直接推断，不滑窗
-        # 需要 Resize 到 crop_size
-        resized = cv2.resize(padded, (crop_size, crop_size), interpolation=cv2.INTER_CUBIC)
-        results = model.predict(resized, **predict_kwargs)
-        # 将结果映射回 padded 尺寸
+    if img_h <= crop_size and img_w <= crop_size:
+        # 小图：不缩放，右下 0 填充到 crop_size（与训练数据集一致，坐标 1:1）
+        canvas = np.zeros((crop_size, crop_size, image_3ch.shape[2]), dtype=image_3ch.dtype)
+        canvas[:img_h, :img_w] = image_3ch
+        results = model.predict(canvas, **predict_kwargs)
         all_boxes, all_scores, all_classes, all_masks = \
             _extract_results(results[0], crop_size, crop_size,
-                           0, 0, pad_h, pad_w,
-                           scale_x=pad_w / crop_size,
-                           scale_y=pad_h / crop_size)
+                             0, 0, crop_size, crop_size)
     else:
+        # 大图：先加边缘 pad 防止边缘目标被截断，再滑窗
+        applied_padding = padding
+        if padding > 0:
+            padded = cv2.copyMakeBorder(
+                image_3ch, padding, padding, padding, padding,
+                cv2.BORDER_REFLECT_101
+            )
+        else:
+            padded = image_3ch
+        pad_h, pad_w = padded.shape[:2]
+
         # 滑窗推断
         y_positions = compute_sliding_positions(pad_h, crop_size, overlap)
         x_positions = compute_sliding_positions(pad_w, crop_size, overlap)
@@ -419,24 +420,27 @@ def infer_single_image(
         final_classes = np.empty(0, dtype=int)
         final_masks = []
 
-    # ---- 去除 Padding 偏移 ----
-    if padding > 0 and len(final_boxes) > 0:
-        final_boxes[:, 0] -= padding  # x1
-        final_boxes[:, 1] -= padding  # y1
-        final_boxes[:, 2] -= padding  # x2
-        final_boxes[:, 3] -= padding  # y2
+    # ---- 去除 Padding 偏移 + 裁回原图尺寸 ----
+    if applied_padding > 0 and len(final_boxes) > 0:
+        final_boxes[:, 0] -= applied_padding  # x1
+        final_boxes[:, 1] -= applied_padding  # y1
+        final_boxes[:, 2] -= applied_padding  # x2
+        final_boxes[:, 3] -= applied_padding  # y2
+
+    if len(final_boxes) > 0:
         # 裁剪到原图范围
         final_boxes[:, 0] = np.clip(final_boxes[:, 0], 0, orig_w)
         final_boxes[:, 1] = np.clip(final_boxes[:, 1], 0, orig_h)
         final_boxes[:, 2] = np.clip(final_boxes[:, 2], 0, orig_w)
         final_boxes[:, 3] = np.clip(final_boxes[:, 3], 0, orig_h)
 
-        # Mask 也需要去除 Padding
+    # Mask 一律裁到原图尺寸（小图 pad 分支同样需要裁掉右下填充区）
+    if final_masks:
+        _y0 = _x0 = applied_padding
         trimmed_masks = []
         for m in final_masks:
-            if m is not None and m.shape[0] >= padding and m.shape[1] >= padding:
-                trimmed = m[padding:padding + orig_h, padding:padding + orig_w]
-                trimmed_masks.append(trimmed)
+            if m is not None and m.shape[0] >= _y0 + orig_h and m.shape[1] >= _x0 + orig_w:
+                trimmed_masks.append(m[_y0:_y0 + orig_h, _x0:_x0 + orig_w])
             else:
                 trimmed_masks.append(np.zeros((orig_h, orig_w), dtype=np.uint8))
         final_masks = trimmed_masks

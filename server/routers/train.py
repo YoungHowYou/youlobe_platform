@@ -16,9 +16,11 @@ from sqlalchemy.orm import Session
 
 from ..config import settings
 from ..database import get_db
+from ..models.defect_class import DefectClass
 from ..models.project import Project
 from ..models.train_task import TrainTask, TrainEpochLog
 from ..schemas.train_task import TrainTaskCreate, TrainTaskOut, EpochLogOut
+from ..services.epoch_csv import fill_missing_train_loss
 
 log = logging.getLogger(__name__)
 
@@ -43,6 +45,30 @@ def create_train_task(
     config["crop_size"] = project.crop_size
     config["overlap"] = project.overlap
 
+    # 自定义预训练模型：创建时就校验并在 config 里固化真实架构/类别信息
+    if config.get("train_mode") == "custom":
+        from ..services.model_source import inspect_local_model
+
+        try:
+            info = inspect_local_model(config.get("model_path"))
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(status_code=400, detail=f"自定义预训练模型不可用：{exc}")
+
+        expected = {"seg": "segment", "det": "detect", "obb": "obb", "cls": "classify"}.get(project.task_type)
+        if expected and info["task"] != expected:
+            raise HTTPException(
+                status_code=400,
+                detail=f"模型任务类型为 {info['task']}，与项目类型 {project.task_type} 不匹配",
+            )
+
+        project_nc = db.query(DefectClass).filter(DefectClass.project_id == project_id).count()
+        config["base_model_path"] = info["path"]
+        config["model_name"] = info["stem"]
+        config["is_end2end"] = info["end2end"]
+        config["base_model_nc"] = info["nc"]
+        # 类别数不一致不算错误：ultralytics 会重建检测/分割头，只迁移骨干权重
+        config["head_reinit"] = bool(project_nc and info["nc"] != project_nc)
+
     task = TrainTask(
         project_id=project_id,
         task_name=body.task_name,
@@ -54,16 +80,37 @@ def create_train_task(
     db.commit()
     db.refresh(task)
 
-    # 提交后台线程异步训练（无 Celery/Redis）；调度失败必须回滚，不留僵尸 pending
+    # 提交后台线程异步训练（无 Celery/Redis）。
+    # 已有任务在跑时不再报 409，而是进队（FIFO）：当前任务收尾后自动接着跑下一个。
+    # 想跳过排队可以传 queue=false（前端未使用，给脚本用）。
     from ..tasks.train_task import training_dispatcher
-    try:
-        training_dispatcher.start(task.id)
-    except RuntimeError as e:
-        db.delete(task)
-        db.commit()
-        raise HTTPException(status_code=409, detail=str(e))
+    started = training_dispatcher.start(task.id)
+    task.queue_position = None if started else training_dispatcher.queue_position(task.id)
+    if not started:
+        print(f"[训练队列] task_{task.id} 已入队，前面还有 {task.queue_position} 个任务")
 
     return task
+
+
+@router.get("/train/local-models")
+def list_train_local_models():
+    """列出服务器上的本地 .pt（weights/、仓库根目录、storage/models）。"""
+    from ..services.model_source import list_local_models
+
+    return list_local_models()
+
+
+@router.get("/train/inspect-model")
+def inspect_train_local_model(path: str):
+    """读取本地 .pt 的任务类型 / 类别数 / 是否 end2end，供训练配置页预览。"""
+    from ..services.model_source import inspect_local_model
+
+    try:
+        return inspect_local_model(path)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=400, detail=f"无法读取模型: {exc}")
 
 
 @router.get("/projects/{project_id}/train/tasks")
@@ -80,8 +127,12 @@ def list_train_tasks(project_id: int, db: Session = Depends(get_db)):
         .all()
     )
     result = []
+    from ..tasks.train_task import training_dispatcher
+
     for t in tasks:
         d = TrainTaskOut.model_validate(t).model_dump()
+        # 排队位置（None 表示没在排队：已在跑或已结束）
+        d["queue_position"] = training_dispatcher.queue_position(t.id)
         # 分类任务的最佳指标是 epoch 日志里的 Top-1，不是 train_tasks.best_map50。
         # 兼容旧表结构：继续复用 best_map50 输出字段，但在 API 中动态填入真实值。
         if is_cls_project:
@@ -105,19 +156,33 @@ def get_train_task(task_id: int, db: Session = Depends(get_db)):
     task = db.query(TrainTask).filter(TrainTask.id == task_id).first()
     if not task:
         raise HTTPException(status_code=404, detail="任务不存在")
+    from ..tasks.train_task import training_dispatcher
+    task.queue_position = training_dispatcher.queue_position(task.id)
     return task
 
 
 @router.get("/train/tasks/{task_id}/epochs", response_model=list[EpochLogOut])
 def get_epoch_logs(task_id: int, db: Session = Depends(get_db)):
-    """获取训练 Epoch 日志（用于前端绘制训练曲线）"""
+    """获取训练 Epoch 日志（用于前端绘制训练曲线）
+
+    注：旧版本训练（或仍在跑的旧进程）写入的 `train_*_loss` 是 NULL，
+    这里从任务目录的 `results.csv` 兑底补上，前端 Loss 曲线才能同时
+    画出 Train / Val 两条线（只补空值，不覆盖库里已有的数据）。
+    """
     logs = (
         db.query(TrainEpochLog)
         .filter(TrainEpochLog.task_id == task_id)
         .order_by(TrainEpochLog.epoch)
         .all()
     )
-    return logs
+    rows = [EpochLogOut.model_validate(log) for log in logs]
+    if rows:
+        task = db.query(TrainTask).filter(TrainTask.id == task_id).first()
+        try:
+            fill_missing_train_loss(task.output_dir if task else None, rows)
+        except Exception as exc:      # 兑底失败不影响正常返回曲线
+            print(f"[epochs] 从 results.csv 补训练集 loss 失败：{exc}")
+    return rows
 
 
 @router.post("/train/tasks/{task_id}/cancel")
@@ -135,12 +200,61 @@ def cancel_train_task(task_id: int, db: Session = Depends(get_db)):
     if task.status in ("completed", "failed", "cancelled"):
         raise HTTPException(status_code=400, detail=f"任务已处于终态: {task.status}")
 
+    # 还在排队（未开始训练）的任务：直接从队列摘掉即可，立即生效
+    from ..tasks.train_task import training_dispatcher
+    if task.status == "pending" and training_dispatcher.drop_queued(task_id):
+        task.status = "cancelled"
+        task.finished_at = datetime.now()
+        db.commit()
+        return {"ok": True, "message": "已从训练队列中移除"}
+
     task.status = "cancelled"
     # 不立即写 finished_at：训练线程会检测 cancelled 并在收尾后写入真实结束时间。
     # 这样前端计时不会在 trainer 仍在保存 best/last 时提前停止。
     task.finished_at = None
     db.commit()
     return {"ok": True, "message": "已请求友好取消，训练将在最近检查点停止"}
+
+
+@router.post("/train/tasks/{task_id}/stop")
+def stop_train_task(task_id: int, db: Session = Depends(get_db)):
+    """手动早停：在 epoch 边界优雅停止，但产物有效，最终记为 completed。
+
+    与「取消」的区别：取消的终态是 cancelled（当作放弃）；早停的终态是 completed，
+    并在 config 里记录 stop_reason='manual' / stopped_at_epoch，导出与继承直接可用。
+
+    限制（与前端保持一致）：
+      - 仅 status='training' 可用（pending/preparing 不允许）；
+      - 至少完成 1 个 epoch（current_epoch >= 1），否则还没有可用权重；
+      - 在 epoch 边界生效，最坏等一个 epoch。
+    """
+    task = db.query(TrainTask).filter(TrainTask.id == task_id).first()
+    if not task:
+        raise HTTPException(status_code=404, detail="任务不存在")
+
+    if task.status in ("completed", "failed", "cancelled"):
+        raise HTTPException(status_code=400, detail=f"任务已处于终态: {task.status}")
+    if task.status == "stopping":
+        return {"ok": True, "message": "已在停止中，等待当前 epoch 结束"}
+    if task.status != "training":
+        raise HTTPException(
+            status_code=400,
+            detail=f"仅训练中的任务支持早停（当前状态: {task.status}）",
+        )
+    if int(task.current_epoch or 0) < 1:
+        raise HTTPException(
+            status_code=400,
+            detail="尚未完成第一个 epoch，没有可用权重，暂时不能早停",
+        )
+
+    task.status = "stopping"
+    # finished_at 留给训练线程在收尾时写入，避免计时提前停住
+    task.finished_at = None
+    db.commit()
+    return {
+        "ok": True,
+        "message": f"已请求早停，将在第 {task.current_epoch} 个 epoch 结束后停止并保留模型",
+    }
 
 
 @router.delete("/train/tasks/{task_id}", status_code=204)
@@ -157,9 +271,12 @@ def delete_train_task(task_id: int, db: Session = Depends(get_db)):
     if not task:
         raise HTTPException(status_code=404, detail="任务不存在")
 
-    # 所有非终态都不允许直接删除，必须先取消（取消会让 Ultralytics 在 epoch 边界停训）
-    active_states = ("pending", "preparing", "training", "exporting")
-    if task.status in active_states:
+    # 持续中的状态不允许直接删除：必须先取消（取消会让 Ultralytics 在 epoch 边界停训）
+    # 例外：task.status == 'pending' 且还在队列里（未真正开训）—— 直接从队列摘掉后删
+    from ..tasks.train_task import training_dispatcher as _disp
+    if task.status == "pending" and _disp.drop_queued(task_id):
+        pass
+    elif task.status in ("pending", "preparing", "training", "exporting"):
         raise HTTPException(status_code=400, detail=f"任务处于活跃状态 ({task.status})，请先取消再删除")
 
     # 抓出磁盘路径再删 DB（output_dir 可能为空，回退到 runs/task_<id>）

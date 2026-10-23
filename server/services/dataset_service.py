@@ -450,6 +450,143 @@ def build_detection_dataset_from_db(
     return stats
 
 
+def _sliding_window_with_det_labels(
+    image_dir: str,
+    label_dir: str,
+    output_dir: str,
+    crop_size: int = 640,
+    overlap: float = 0.2,
+    task_type: str = "det",
+) -> int:
+    """把 det（cls cx cy w h）/ obb（cls x1 y1 … x4 y4）标注按重叠窗口切片。
+
+    切片口径与 seg 对齐：原图不缩放、小于窗口的图 0 填充、步长
+    ``int(crop_size*(1-overlap))``、末尾补一个贴边窗。
+
+    标签规则：目标中心落在窗口内才保留（避免同一目标在相邻窗口重复出框），
+    再把坐标平移到窗口坐标系并裁剪到 ``[0, crop_size]``；裁剪后过小的目标丢弃。
+    """
+    import cv2
+    import numpy as np
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    from core.preprocess import get_image_files
+    from core.sliding_window import compute_window_positions
+
+    img_dir = Path(image_dir)
+    lbl_dir = Path(label_dir)
+    out_img = Path(output_dir) / "images"
+    out_lbl = Path(output_dir) / "labels"
+    out_img.mkdir(parents=True, exist_ok=True)
+    out_lbl.mkdir(parents=True, exist_ok=True)
+
+    img_files = get_image_files(img_dir)
+    if not img_files:
+        return 0
+
+    print(f"[数据集] seg 滑窗开始：{len(img_files)} 张图，crop={crop_size}, overlap={overlap}")
+
+    def process_one_image(img_path: Path) -> int:
+        img = cv2.imread(str(img_path), cv2.IMREAD_UNCHANGED)
+        if img is None:
+            return 0
+        h, w = img.shape[:2]
+
+        # 解析成像素坐标点集（det 用 4 个角点表示水平框）
+        objects: list[tuple[int, list[tuple[float, float]]]] = []
+        lbl_path = lbl_dir / f"{img_path.stem}.txt"
+        if lbl_path.exists():
+            for line in lbl_path.read_text().splitlines():
+                parts = line.split()
+                if len(parts) < 5:
+                    continue
+                try:
+                    cls_id = int(parts[0])
+                    vals = [float(v) for v in parts[1:]]
+                except ValueError:
+                    continue
+                if task_type == "obb":
+                    if len(vals) < 8:
+                        continue
+                    pts = [(vals[i] * w, vals[i + 1] * h) for i in range(0, 8, 2)]
+                else:
+                    cx, cy, bw, bh = vals[:4]
+                    x1, y1 = (cx - bw / 2) * w, (cy - bh / 2) * h
+                    x2, y2 = (cx + bw / 2) * w, (cy + bh / 2) * h
+                    pts = [(x1, y1), (x2, y1), (x2, y2), (x1, y2)]
+                objects.append((cls_id, pts))
+
+        y_positions = compute_window_positions(h, crop_size, overlap)
+        x_positions = compute_window_positions(w, crop_size, overlap)
+        count = 0
+
+        for y0 in y_positions:
+            for x0 in x_positions:
+                crop = img[y0:y0 + crop_size, x0:x0 + crop_size]
+                if crop.shape[0] != crop_size or crop.shape[1] != crop_size:
+                    padded = np.zeros((crop_size, crop_size) + crop.shape[2:], dtype=crop.dtype)
+                    padded[:crop.shape[0], :crop.shape[1]] = crop
+                    crop = padded
+
+                crop_name = f"{img_path.stem}_{y0:04d}_{x0:04d}"
+                cv2.imwrite(str(out_img / f"{crop_name}.png"), crop)
+
+                lines = []
+                for cls_id, pts in objects:
+                    xs = [p[0] for p in pts]
+                    ys = [p[1] for p in pts]
+                    cx = (min(xs) + max(xs)) / 2.0
+                    cy = (min(ys) + max(ys)) / 2.0
+                    # 中心不在窗口内 → 交给相邻窗口负责
+                    if not (x0 <= cx < x0 + crop_size and y0 <= cy < y0 + crop_size):
+                        continue
+                    local = [
+                        (min(max(px - x0, 0.0), float(crop_size)),
+                         min(max(py - y0, 0.0), float(crop_size)))
+                        for px, py in pts
+                    ]
+                    lxs = [p[0] for p in local]
+                    lys = [p[1] for p in local]
+                    bw = max(lxs) - min(lxs)
+                    bh = max(lys) - min(lys)
+                    if bw < 1.0 or bh < 1.0:
+                        continue
+                    if task_type == "obb":
+                        area = cv2.contourArea(np.array(local, dtype=np.float32))
+                        if area < 9.0:
+                            continue
+                        coords = " ".join(
+                            f"{px / crop_size:.6f} {py / crop_size:.6f}" for px, py in local
+                        )
+                    else:
+                        coords = (
+                            f"{(min(lxs) + bw / 2.0) / crop_size:.6f} "
+                            f"{(min(lys) + bh / 2.0) / crop_size:.6f} "
+                            f"{bw / crop_size:.6f} {bh / crop_size:.6f}"
+                        )
+                    lines.append(f"{cls_id} {coords}")
+
+                (out_lbl / f"{crop_name}.txt").write_text(
+                    "\n".join(lines) + ("\n" if lines else "")
+                )
+                count += 1
+        return count
+
+    import os
+
+    max_workers = min(os.cpu_count() or 4, len(img_files), 8)
+    total = 0
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futures = {pool.submit(process_one_image, p): p for p in img_files}
+        for future in as_completed(futures):
+            try:
+                total += future.result()
+            except Exception as e:
+                print(f"[滑窗错误] {futures[future].name}: {e}")
+    print(f"[数据集] {task_type} 滑窗完成：{len(img_files)} 张图 → {total} 个子图")
+    return total
+
+
 def prepare_detection_dataset(
     project_id: int,
     task_output_dir: str,
@@ -457,12 +594,14 @@ def prepare_detection_dataset(
     train_ratio: float = 0.85,
     seed: int = 42,
     progress_callback=None,
+    crop_size: int = 640,
+    overlap: float = 0.2,
 ) -> dict:
-    """
-    目标检测数据集准备流程（不滑窗）：
-        1. build_detection_dataset_from_db() → 原图 + YOLO det txt
-        2. 按 train_ratio 划分 train/val
-        3. 复制到 dataset/images/{train,val} + dataset/labels/{train,val}
+    """目标检测数据集准备（原图不缩放 → 重叠滑窗 → 划分）。
+
+    1. build_detection_dataset_from_db() → 原图 + YOLO det txt
+    2. 按 crop_size / overlap 滑窗切片（与 seg 口径一致）
+    3. 按 train_ratio 划分 train/val
     """
     import random
 
@@ -470,26 +609,37 @@ def prepare_detection_dataset(
 
     # ---- 阶段 1: 从数据库导出 ----
     if progress_callback:
-        progress_callback(0, 2, "从数据库导出标注数据...")
+        progress_callback(0, 3, "从数据库导出标注数据...")
 
     raw_dir = str(task_dir / "raw")
     export_stats = build_detection_dataset_from_db(project_id, raw_dir, db)
     class_names = export_stats["class_names"]
 
     raw_path = Path(raw_dir)
-    img_files = sorted((raw_path / "images").iterdir())
-    if not img_files:
+    if not any((raw_path / "images").iterdir()):
         raise ValueError("数据集为空")
 
-    # 只保留有对应 label 的图（label 文件总是会被写出，但要保证图存在）
-    valid = []
-    for f in img_files:
-        if f.is_file():
-            valid.append(f)
-
-    # ---- 阶段 2: 划分 train/val ----
+    # ---- 阶段 2: 重叠滑窗 ----
     if progress_callback:
-        progress_callback(1, 2, "划分训练集 / 验证集...")
+        progress_callback(1, 3, f"滑窗切割（crop={crop_size}, overlap={overlap}）...")
+
+    cropped_dir = str(task_dir / "cropped")
+    _sliding_window_with_det_labels(
+        image_dir=str(raw_path / "images"),
+        label_dir=str(raw_path / "labels"),
+        output_dir=cropped_dir,
+        crop_size=crop_size,
+        overlap=overlap,
+        task_type="det",
+    )
+    crop_path = Path(cropped_dir)
+    valid = sorted(p for p in (crop_path / "images").iterdir() if p.is_file())
+    if not valid:
+        raise ValueError("滑窗后数据集为空")
+
+    # ---- 阶段 3: 划分 train/val ----
+    if progress_callback:
+        progress_callback(2, 3, "划分训练集 / 验证集...")
 
     random.seed(seed)
     indices = list(range(len(valid)))
@@ -513,7 +663,7 @@ def prepare_detection_dataset(
         # 复制图
         _link_or_copy(str(img_path), str(dataset_dir / "images" / split / img_path.name))
         # 复制 label（同名 .txt）
-        lbl_src = raw_path / "labels" / f"{img_path.stem}.txt"
+        lbl_src = crop_path / "labels" / f"{img_path.stem}.txt"
         if lbl_src.exists():
             _link_or_copy(str(lbl_src), str(dataset_dir / "labels" / split / f"{img_path.stem}.txt"))
         else:
@@ -521,7 +671,7 @@ def prepare_detection_dataset(
             (dataset_dir / "labels" / split / f"{img_path.stem}.txt").touch()
 
     if progress_callback:
-        progress_callback(2, 2, "数据集准备完成")
+        progress_callback(3, 3, "数据集准备完成")
 
     return {
         "dataset_dir": str(dataset_dir),
@@ -670,29 +820,45 @@ def prepare_obb_dataset(
     train_ratio: float = 0.85,
     seed: int = 42,
     progress_callback=None,
+    crop_size: int = 640,
+    overlap: float = 0.2,
 ) -> dict:
-    """
-    OBB 数据集准备（结构与 detection 一致，区别仅在 label 内容）。
-    """
+    """OBB 数据集准备（原图不缩放 → 重叠滑窗 → 划分，结构与 detection 一致）。"""
     import random
 
     task_dir = Path(task_output_dir)
 
     if progress_callback:
-        progress_callback(0, 2, "从数据库导出 OBB 标注数据...")
+        progress_callback(0, 3, "从数据库导出 OBB 标注数据...")
 
     raw_dir = str(task_dir / "raw")
     export_stats = build_obb_dataset_from_db(project_id, raw_dir, db)
     class_names = export_stats["class_names"]
 
     raw_path = Path(raw_dir)
-    img_files = sorted((raw_path / "images").iterdir())
-    if not img_files:
+    if not any((raw_path / "images").iterdir()):
         raise ValueError("数据集为空")
-    valid = [f for f in img_files if f.is_file()]
+
+    # ---- 阶段 2: 重叠滑窗 ----
+    if progress_callback:
+        progress_callback(1, 3, f"滑窗切割（crop={crop_size}, overlap={overlap}）...")
+
+    cropped_dir = str(task_dir / "cropped")
+    _sliding_window_with_det_labels(
+        image_dir=str(raw_path / "images"),
+        label_dir=str(raw_path / "labels"),
+        output_dir=cropped_dir,
+        crop_size=crop_size,
+        overlap=overlap,
+        task_type="obb",
+    )
+    crop_path = Path(cropped_dir)
+    valid = sorted(p for p in (crop_path / "images").iterdir() if p.is_file())
+    if not valid:
+        raise ValueError("滑窗后数据集为空")
 
     if progress_callback:
-        progress_callback(1, 2, "划分训练集 / 验证集...")
+        progress_callback(2, 3, "划分训练集 / 验证集...")
 
     random.seed(seed)
     indices = list(range(len(valid)))
@@ -713,14 +879,14 @@ def prepare_obb_dataset(
         else:
             val_count += 1
         _link_or_copy(str(img_path), str(dataset_dir / "images" / split / img_path.name))
-        lbl_src = raw_path / "labels" / f"{img_path.stem}.txt"
+        lbl_src = crop_path / "labels" / f"{img_path.stem}.txt"
         if lbl_src.exists():
             _link_or_copy(str(lbl_src), str(dataset_dir / "labels" / split / f"{img_path.stem}.txt"))
         else:
             (dataset_dir / "labels" / split / f"{img_path.stem}.txt").touch()
 
     if progress_callback:
-        progress_callback(2, 2, "OBB 数据集准备完成")
+        progress_callback(3, 3, "OBB 数据集准备完成")
 
     return {
         "dataset_dir": str(dataset_dir),
@@ -978,6 +1144,11 @@ def prepare_full_dataset(
     export_stats = build_dataset_from_db(project_id, raw_dir, db)
     class_names = export_stats["class_names"]
 
+    print(
+        f"[数据集] 导出完成：{export_stats.get('total_images', '?')} 张图 / "
+        f"{export_stats.get('total_annotations', '?')} 个标注 → {raw_dir}"
+    )
+
     raw_img_dir = str(Path(raw_dir) / "images")
     raw_lbl_dir = str(Path(raw_dir) / "labels")
 
@@ -991,6 +1162,7 @@ def prepare_full_dataset(
 
     if use_morphology:
         # 形态学需要在整图上做（与推理端一致），否则切片边界会出现核窗口差异
+        print(f"[数据集] 形态学三通道处理（原图分辨率，不缩放）...")
         pre_dir = str(task_dir / "preprocessed")
         run_preprocess(
             image_dir=raw_img_dir,
@@ -1028,6 +1200,7 @@ def prepare_full_dataset(
 
     from core.dataset_split import run_dataset_split
     dataset_dir = str(task_dir / "dataset")
+    print(f"[数据集] 划分 train/val（train_ratio={train_ratio}, oversample={oversample_factor}）...")
     split_stats = run_dataset_split(
         cropped_dir=cropped_dir,
         output_dir=dataset_dir,
@@ -1179,3 +1352,6 @@ def _sliding_window_with_yolo_labels(
                 total_crops += future.result()
             except Exception as e:
                 print(f"[滑窗错误] {futures[future].name}: {e}")
+
+    print(f"[数据集] seg 滑窗完成：{len(img_files)} 张图 → {total_crops} 个子图")
+    return total_crops

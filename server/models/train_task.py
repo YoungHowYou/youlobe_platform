@@ -18,7 +18,7 @@ class TrainTask(Base):
 
     task_name: Mapped[str] = mapped_column(String(200), nullable=False)
     status: Mapped[str] = mapped_column(
-        Enum("pending", "preparing", "training", "exporting",
+        Enum("pending", "preparing", "training", "stopping", "exporting",
              "completed", "failed", "cancelled", name="task_status"),
         default="pending"
     )

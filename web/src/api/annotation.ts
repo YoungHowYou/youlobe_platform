@@ -5,11 +5,30 @@ export interface Point {
   y: number
 }
 
+/** 参数化形状的几何定义（rect / circle 用） */
+export interface ShapeParams {
+  /** rect：归一化坐标，x1<x2、y1<y2 */
+  x1?: number
+  y1?: number
+  x2?: number
+  y2?: number
+  /** circle：中心归一化坐标 + 像素半径 */
+  cx?: number
+  cy?: number
+  r?: number
+}
+
+export type AnnShape = 'polygon' | 'rect' | 'circle'
+
 export interface AnnotationData {
   id?: number
   image_id?: number
   class_id: number
   polygon: Point[]
+  /** 形状类型：polygon=任意多边形，rect=轴对齐矩形，circle=圆 */
+  shape?: AnnShape
+  /** rect/circle 的参数（保持形状可参数化编辑，不退化成一堆顶点） */
+  shape_params?: ShapeParams | null
   area?: number
   bbox?: { x1: number; y1: number; x2: number; y2: number }
   created_by?: string

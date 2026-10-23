@@ -191,6 +191,8 @@ def run_training_pipeline(task_id: int) -> dict:
                 task_output_dir=str(task_dir),
                 db=db,
                 train_ratio=config.get("train_ratio", 0.85),
+                crop_size=config.get("crop_size", 640),
+                overlap=config.get("overlap", 0.2),
             )
         elif task_type == "obb":
             dataset_result = prepare_obb_dataset(
@@ -198,6 +200,8 @@ def run_training_pipeline(task_id: int) -> dict:
                 task_output_dir=str(task_dir),
                 db=db,
                 train_ratio=config.get("train_ratio", 0.85),
+                crop_size=config.get("crop_size", 640),
+                overlap=config.get("overlap", 0.2),
             )
         else:
             dataset_result = prepare_full_dataset(
@@ -259,10 +263,42 @@ def run_training_pipeline(task_id: int) -> dict:
                     if prev_path and Path(prev_path).exists():
                         model_name = prev_path
                         print(f"[继承训练] 从 Task#{resume_task_id} {resume_model_type}.pt 继续: {prev_path}")
+                        # 记录真实来源与父模型架构：导出页靠 model_name 判断是否 end2end，
+                        # 继承时用户选的模型尺寸无效，应以父模型的架构为准。
+                        config["inherited_from_task_id"] = resume_task_id
+                        config["base_model_path"] = prev_path
+                        parent_model = (prev_task.config or {}).get("model_name")
+                        if parent_model:
+                            config["model_name"] = parent_model
                     else:
                         print(f"[警告] 继承模型不存在，回退为从头训练")
                 else:
                     print(f"[警告] 找不到 Task#{resume_task_id}，回退为从头训练")
+        elif train_mode == "custom":
+            # 自定义预训练模型：用户在服务器 weights/ 等目录里放自己的 .pt
+            custom_path = config.get("model_path") or config.get("base_model_path")
+            try:
+                from ..services.model_source import inspect_local_model
+
+                info = inspect_local_model(custom_path)
+            except Exception as exc:  # noqa: BLE001
+                raise ValueError(f"自定义预训练模型不可用：{exc}") from exc
+
+            expected = {"seg": "segment", "det": "detect", "obb": "obb", "cls": "classify"}.get(task_type)
+            if expected and info["task"] != expected:
+                raise ValueError(
+                    f"自定义模型的 task={info['task']} 与项目类型 {task_type} 不匹配"
+                )
+
+            model_name = info["path"]
+            config["base_model_path"] = info["path"]
+            config["model_name"] = info["stem"]
+            config["is_end2end"] = info["end2end"]
+            config["base_model_nc"] = info["nc"]
+            print(
+                f"[自定义预训练] 使用 {info['path']} "
+                f"(task={info['task']}, nc={info['nc']}, end2end={info['end2end']})"
+            )
 
         def cancel_check() -> bool:
             """
@@ -278,7 +314,7 @@ def run_training_pipeline(task_id: int) -> dict:
                 t = check_db.query(TrainTask).filter(TrainTask.id == task_id).first()
                 if t is None:
                     return True  # 任务被删除
-                if t.status == "cancelled":
+                if t.status in ("cancelled", "stopping"):
                     return True
                 return False
             except Exception as e:
@@ -435,6 +471,27 @@ def run_training_pipeline(task_id: int) -> dict:
             db.commit()
             return {"status": "cancelled", "best_pt": train_result.get("best_pt")}
 
+        if task.status == "stopping":
+            # 手动早停：训练被主动终止，但权重有效，按“已完成”收尾并记录停在哪一轮
+            stopped_epoch = int(task.current_epoch or 0)
+            cfg = dict(task.config or {})
+            cfg["stop_reason"] = "manual"
+            cfg["stopped_at_epoch"] = stopped_epoch
+            task.config = cfg
+            task.status = "completed"
+            task.best_model_path = train_result.get("best_pt")
+            task.last_model_path = train_result.get("last_pt")
+            task.finished_at = datetime.now()
+            db.commit()
+            print(f"[训练任务] Task#{task_id} 手动早停 @ epoch {stopped_epoch}，已保留 best/last")
+            return {
+                "status": "completed",
+                "stop_reason": "manual",
+                "stopped_at_epoch": stopped_epoch,
+                "best_pt": train_result.get("best_pt"),
+                "last_pt": train_result.get("last_pt"),
+            }
+
         task.status = "completed"
         task.best_model_path = train_result.get("best_pt")
         task.last_model_path = train_result.get("last_pt")
@@ -471,6 +528,30 @@ def run_training_pipeline(task_id: int) -> dict:
                 db.commit()
                 return {"status": "cancelled", "warning": str(e)}
 
+            if task.status == "stopping":
+                # 手动早停后 trainer 收尾抛异常：权重通常已落盘，按 completed 收尾，
+                # 不写 error_message（避免前端误显示为“训练失败”）。
+                try:
+                    run_root = Path(settings.runs_path) / f"task_{task_id}"
+                    for p in run_root.rglob("best.pt"):
+                        task.best_model_path = str(p)
+                        break
+                    for p in run_root.rglob("last.pt"):
+                        task.last_model_path = str(p)
+                        break
+                except Exception:
+                    pass
+                stopped_epoch = int(task.current_epoch or 0)
+                cfg = dict(task.config or {})
+                cfg["stop_reason"] = "manual"
+                cfg["stopped_at_epoch"] = stopped_epoch
+                task.config = cfg
+                task.status = "completed"
+                task.finished_at = datetime.now()
+                db.commit()
+                print(f"[训练任务] Task#{task_id} 手动早停收尾告警（已按完成处理）: {e}")
+                return {"status": "completed", "warning": str(e)}
+
             # 真正训练失败
             task.status = "failed"
             failure_config = config or task.config or {}
@@ -487,12 +568,18 @@ def run_training_pipeline(task_id: int) -> dict:
 
 
 class TrainingDispatcher:
-    """后台训练调度器（单例）：替代 Celery，单并发地在守护线程中跑训练流水线。"""
+    """后台训练调度器（单例）：替代 Celery，单并发地在守护线程中跑训练流水线。
+
+    支持**排队**：已有任务在跑时，新提交的任务进入 FIFO 队列（DB 里保持
+    status='pending'），当前任务收尾后自动启动队列里的下一个，无需人工干预。
+    队列只在内存里（进程重启即丢失，启动时 lifespan 会把遗留的 pending 标 failed）。
+    """
 
     def __init__(self):
         self._lock = threading.Lock()
         self._thread: threading.Thread | None = None
         self._current_task_id: int | None = None
+        self._queue: list[int] = []
 
     @property
     def is_running(self) -> bool:
@@ -502,31 +589,89 @@ class TrainingDispatcher:
     def current_task_id(self) -> int | None:
         return self._current_task_id if self.is_running else None
 
-    def start(self, task_id: int) -> None:
-        """启动训练任务；已有任务在跑时抛 RuntimeError（路由层负责回滚任务记录）。"""
+    def queue_snapshot(self) -> list[int]:
+        """当前排队中的任务 id（FIFO 顺序）"""
+        with self._lock:
+            return list(self._queue)
+
+    def queue_position(self, task_id: int) -> int | None:
+        """任务在队列里的位置（1 基）；不在队列返回 None"""
+        with self._lock:
+            try:
+                return self._queue.index(task_id) + 1
+            except ValueError:
+                return None
+
+    def start(self, task_id: int) -> bool:
+        """提交任务。
+
+        返回 True = 立刻开始训练；False = 已进入队列排队。
+        同一个任务重复提交不会重复入队。
+        """
         with self._lock:
             if self.is_running:
-                raise RuntimeError(
-                    f"已有训练任务 #{self._current_task_id} 正在运行，请等待完成或先取消后再提交"
-                )
-            self._current_task_id = task_id
-            self._thread = threading.Thread(
-                target=self._run,
-                args=(task_id,),
-                daemon=True,
-                name=f"train-task-{task_id}",
-            )
-            self._thread.start()
+                if task_id != self._current_task_id and task_id not in self._queue:
+                    self._queue.append(task_id)
+                return False
+            self._spawn_locked(task_id)
+            return True
+
+    def drop_queued(self, task_id: int) -> bool:
+        """把还在排队（未开始）的任务从队列里摘掉，返回是否真的摘到了"""
+        with self._lock:
+            if task_id in self._queue:
+                self._queue.remove(task_id)
+                return True
+        return False
+
+    def _spawn_locked(self, task_id: int) -> None:
+        self._current_task_id = task_id
+        self._thread = threading.Thread(
+            target=self._run,
+            args=(task_id,),
+            daemon=True,
+            name=f"train-task-{task_id}",
+        )
+        self._thread.start()
+
+    @staticmethod
+    def _skip_reason(task_id: int) -> str | None:
+        """出队前的兜底检查：任务被删/已被取消/状态被改过就不要跑"""
+        from ..database import SessionLocal
+        from ..models.train_task import TrainTask
+
+        db = SessionLocal()
+        try:
+            task = db.query(TrainTask).filter(TrainTask.id == task_id).first()
+            if task is None:
+                return "任务已被删除"
+            if task.status != "pending":
+                return f"状态已变为 {task.status}"
+            return None
+        except Exception as exc:          # 查库失败就别拦着，交给流水线自己兜底
+            print(f"[training_dispatcher] 出队检查失败 task_{task_id}: {exc}")
+            return None
+        finally:
+            db.close()
 
     def _run(self, task_id: int) -> None:
         try:
-            run_training_pipeline(task_id)
+            reason = self._skip_reason(task_id)
+            if reason:
+                print(f"[training_dispatcher] 跳过排队任务 task_{task_id}：{reason}")
+            else:
+                run_training_pipeline(task_id)
         except Exception:
             # run_training_pipeline 内部已兜底任务状态；这里再兜一层防线程静默死亡
             print(f"[training_dispatcher] task_{task_id} 未捕获异常:\n{traceback.format_exc()}")
         finally:
             with self._lock:
                 self._current_task_id = None
+                # 队列里的下一个自动开跑（FIFO）
+                next_id = self._queue.pop(0) if self._queue else None
+                if next_id is not None:
+                    print(f"[training_dispatcher] 启动队列中的下一个任务 task_{next_id}")
+                    self._spawn_locked(next_id)
 
 
 # 全局单例（uvicorn 进程内单并发训练）

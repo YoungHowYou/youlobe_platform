@@ -398,23 +398,51 @@ def run_train(
             }
 
             # ---- 提取 Train Loss ----
-            # trainer.loss_items 是训练 loss (Tensor)
-            if trainer.loss_items is not None:
+            # 注意：ultralytics 8.3+ 把 `trainer.loss_items` / `trainer.tloss`
+            # 从 Tensor 列表改成了 {loss名: Tensor} 的 **dict**（key 形如
+            # 'box_loss' / 'seg_loss' / 'cls_loss' / 'dfl_loss'，YOLO26 还有
+            # 'l1_loss' / 'sem_loss'），老代码按 Tensor 处理 → AttributeError
+            # 被 except 吞掉，于是所有 train_* 一直是 None，前端 Loss 曲线只剩 Val。
+            # 这里两种形态都兼容，并优先用 tloss（本 epoch 训练 loss 的滑动平均，
+            # 与 results.csv 的 train/*_loss 一致）。
+            raw_train_loss = getattr(trainer, "tloss", None)
+            if raw_train_loss is None:
+                raw_train_loss = getattr(trainer, "loss_items", None)
+
+            def _loss_key(name: str) -> str:
+                name = str(name)
+                if name == "loss":          # cls 任务只有一个 'loss'
+                    return "loss"
+                return name if name.endswith("_loss") else f"{name}_loss"
+
+            train_total = 0.0
+            got_train_loss = False
+            if isinstance(raw_train_loss, dict):
+                for name, val in raw_train_loss.items():
+                    try:
+                        num = float(val.detach().item() if hasattr(val, "detach") else val)
+                    except Exception:
+                        continue
+                    data[f"train_{_loss_key(name)}"] = num
+                    train_total += num
+                    got_train_loss = True
+            elif raw_train_loss is not None:
+                # 老版本：Tensor / list，需要配 trainer.loss_names
                 try:
-                    loss_values = trainer.loss_items.cpu().tolist()
-                    loss_names = trainer.loss_names if trainer.loss_names else []
-                    for name, val in zip(loss_names, loss_values):
-                        # 名称如 'box_loss', 'seg_loss', 'cls_loss', 'dfl_loss'
-                        data[f"train_{name}"] = float(val)
+                    values = raw_train_loss.cpu().tolist() if hasattr(raw_train_loss, "cpu") else list(raw_train_loss)
+                    if isinstance(values, (int, float)):
+                        values = [values]
+                    names = list(trainer.loss_names or [])
+                    for idx, val in enumerate(values):
+                        name = names[idx] if idx < len(names) else f"loss{idx}"
+                        data[f"train_{_loss_key(name)}"] = float(val)
+                        train_total += float(val)
+                        got_train_loss = True
                 except Exception:
                     pass
 
-            # 总 train loss
-            if trainer.tloss is not None:
-                try:
-                    data["train_total_loss"] = float(trainer.tloss.cpu().item()) if hasattr(trainer.tloss, 'item') else float(trainer.tloss)
-                except Exception:
-                    data["train_total_loss"] = 0.0
+            if got_train_loss:
+                data["train_total_loss"] = round(train_total, 6)
 
             # ---- 提取 Val Loss ----
             # 方法1: 从 trainer.metrics 中获取（新版 Ultralytics）
@@ -447,8 +475,20 @@ def run_train(
                 except Exception:
                     pass
 
-            # 方法3: 从 results.csv 最后一行读取
-            if 'val_box_loss' not in data:
+            # 方法3: 从 results.csv 最后一行兜底（train 与 val 都补）
+            csv_cols = [
+                ('train/box_loss', 'train_box_loss'),
+                ('train/seg_loss', 'train_seg_loss'),
+                ('train/cls_loss', 'train_cls_loss'),
+                ('train/dfl_loss', 'train_dfl_loss'),
+                ('train/loss', 'train_loss'),        # cls 单一 loss
+                ('val/box_loss', 'val_box_loss'),
+                ('val/seg_loss', 'val_seg_loss'),
+                ('val/cls_loss', 'val_cls_loss'),
+                ('val/dfl_loss', 'val_dfl_loss'),
+                ('val/loss', 'val_loss'),
+            ]
+            if 'val_box_loss' not in data or not got_train_loss:
                 try:
                     csv_path = Path(trainer.save_dir) / 'results.csv'
                     if csv_path.exists():
@@ -457,11 +497,12 @@ def run_train(
                         df.columns = df.columns.str.strip()
                         if len(df) > 0:
                             last = df.iloc[-1]
-                            for col, key in [('val/box_loss','val_box_loss'),('val/seg_loss','val_seg_loss'),
-                                             ('val/cls_loss','val_cls_loss'),('val/dfl_loss','val_dfl_loss'),
-                                             ('val/loss','val_loss'),('train/loss','train_loss')]:
-                                if col in df.columns:
-                                    data[key] = float(last[col])
+                            for col, key in csv_cols:
+                                if col in df.columns and data.get(key) is None:
+                                    val = float(last[col])
+                                    if key.startswith('train_'):
+                                        got_train_loss = True
+                                    data[key] = val
                 except Exception:
                     pass
 

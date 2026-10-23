@@ -134,13 +134,13 @@
 
         <el-divider content-position="left">预处理参数</el-divider>
         <el-alert
-          v-if="form.task_type === 'seg'"
+          v-if="form.task_type !== 'cls'"
           type="info" :closable="false" show-icon
           style="margin-bottom:12px"
           title="不再统一缩放：原图直接按滑窗切片"
         >
           <div style="font-size:12px;line-height:1.7">
-            训练时不再把图缩放到固定尺寸，而是按原图分辨率 → 以「切割尺寸」为窗口、按「重叠率」滑窗后送入模型。
+            训练时不再把图缩放到固定尺寸，而是按原图分辨率 → 以「切割尺寸」为窗口、按「重叠率」滑窗后送入模型（seg / det / obb 一致）。
           </div>
         </el-alert>
         <el-row :gutter="16" v-if="form.task_type !== 'cls'">
@@ -258,8 +258,6 @@ const form = ref<ProjectCreate & { class_names: DefectClass[] }>({
 const cropSizeLabel = computed(() => {
   const t = form.value.task_type
   if (t === 'cls') return '训练图尺寸'
-  if (t === 'det') return '训练图尺寸'
-  if (t === 'obb') return '训练图尺寸'
   return '切割尺寸'
 })
 

@@ -257,6 +257,7 @@ interface TaskInfo {
   epochs:number
   imgsz:number
   model_name:string|null
+  is_end2end?:boolean|null
   models:{type:string;path:string}[]
   finished_at:string|null
   created_at:string|null
@@ -346,6 +347,8 @@ const isClsTask = computed(() => {
 // 当前选中任务是否 end2end 架构模型（YOLO26/10 head 支持 native/compat/nms 三种导出模式）
 const isEnd2endModel = computed(() => {
   const t = tasks.value.find(x => x.task_id === selTaskId.value)
+  // 训练时已记录的架构信息优先（自定义预训练模型的名字可能不含 yolo26）
+  if (t?.is_end2end != null) return !!t.is_end2end
   const name = (t?.model_name || '').toLowerCase()
   return name.includes('yolo26') || name.includes('yolo10')
 })

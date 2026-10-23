@@ -31,6 +31,11 @@ const router = createRouter({
       meta: { adminOnly: true },
     },
     {
+      path: '/monitor',
+      name: 'SystemMonitor',
+      component: () => import('../views/SystemMonitor.vue'),
+    },
+    {
       path: '/project/:id',
       name: 'ProjectDetail',
       component: () => import('../views/ProjectDetail.vue'),

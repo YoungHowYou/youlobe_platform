@@ -15,7 +15,19 @@ class Annotation(Base):
     class_id: Mapped[int] = mapped_column(Integer, ForeignKey("defect_classes.id"), nullable=False)
 
     # 多边形坐标（归一化 0~1）: [{"x": 0.1, "y": 0.2}, {"x": 0.3, "y": 0.4}, ...]
+    # 注意：shape=rect/circle 时这里依然存**等价轮廓点**（矩形=4 角点，圆=48 点采样），
+    # 训练/推理/统计全部照旧只读 polygon，不需要认识形状类型。
     polygon: Mapped[list] = mapped_column(JSON, nullable=False)
+
+    # 形状类型：polygon（任意多边形）/ rect（轴对齐矩形）/ circle（圆）。
+    # 参数化形状的几何定义放在 shape_params 里，标注器按形状编辑（拖角点/拖半径），
+    # 而不是退化成逐个顶点拖拽。
+    shape: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="polygon", server_default="polygon",
+    )
+    # rect:   {"x1","y1","x2","y2"} 归一化坐标（x1<x2, y1<y2）
+    # circle: {"cx","cy"} 归一化中心 + {"r"} 像素半径（原图坐标系）
+    shape_params: Mapped[dict | None] = mapped_column(JSON, nullable=True)
 
     # 冗余字段：便于统计和过滤
     area: Mapped[float | None] = mapped_column(Float, nullable=True, comment="多边形面积(像素)")

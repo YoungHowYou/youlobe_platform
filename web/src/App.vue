@@ -22,6 +22,10 @@
           <el-icon><MagicStick /></el-icon>
           <span>标注转换</span>
         </el-menu-item>
+        <el-menu-item index="/monitor">
+          <el-icon><Monitor /></el-icon>
+          <span>运行监控</span>
+        </el-menu-item>
         <el-menu-item v-if="isAdmin" index="/users">
           <el-icon><User /></el-icon>
           <span>用户管理</span>

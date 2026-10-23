@@ -90,7 +90,10 @@ def read_rows(csv_path: Path) -> list[dict]:
             ep = _to_float(row.get("epoch"))
             if ep is None:
                 continue
-            fields = {"epoch": int(ep)}
+            # Ultralytics 的 results.csv 里 epoch 从 1 开始（save_metrics 写 self.epoch+1），
+            # 而库里的 train_epoch_logs.epoch 用的是 trainer.epoch（0 基），
+            # 这里必须 -1 对齐，否则每条记录都会错位一格、把真实数据覆盖掉。
+            fields = {"epoch": int(ep) - 1}
             for col, field in FLOAT_MAP.items():
                 if col in row:
                     val = _to_float(row[col])

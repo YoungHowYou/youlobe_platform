@@ -16,9 +16,18 @@
       <el-table :data="tasks" stripe @row-click="selectTask" highlight-current-row style="width:100%">
         <el-table-column prop="id" label="ID" width="60" />
         <el-table-column prop="task_name" label="任务名称" min-width="160" />
-        <el-table-column label="状态" width="120">
+        <el-table-column label="状态" width="190">
           <template #default="{row}">
             <el-tag :type="statusType(row.status)" size="small">{{ statusText(row.status) }}</el-tag>
+            <el-tag v-if="row.queue_position" type="info" size="small" effect="plain" style="margin-left:4px">
+              队列第 {{ row.queue_position }} 位
+            </el-tag>
+            <el-tag
+              v-if="row.config?.stop_reason === 'manual'"
+              type="warning" size="small" effect="plain" style="margin-left:4px"
+            >
+              早停@{{ row.config?.stopped_at_epoch }}ep
+            </el-tag>
           </template>
         </el-table-column>
         <el-table-column label="进度" width="200">
@@ -45,10 +54,17 @@
             <span v-else style="color:#999">-</span>
           </template>
         </el-table-column>
-        <el-table-column label="操作" width="120">
+        <el-table-column label="操作" width="180">
           <template #default="{row}">
+            <el-button
+              v-if="row.status==='training' && row.current_epoch>0"
+              type="primary" text size="small"
+              @click.stop="stopTask(row.id)"
+            >早停</el-button>
             <el-button v-if="row.status==='training'||row.status==='preparing'" type="warning" text size="small" @click.stop="cancelTask(row.id)">取消</el-button>
-            <el-button v-if="isAdmin && (row.status==='completed'||row.status==='failed'||row.status==='cancelled')" type="danger" text size="small" @click.stop="deleteTask(row.id)">删除</el-button>
+            <!-- 排队中（未开训）的任务可退队，也可以直接删除 -->
+            <el-button v-if="row.status==='pending'" type="warning" text size="small" @click.stop="cancelTask(row.id)">退出队列</el-button>
+            <el-button v-if="isAdmin && (row.status==='completed'||row.status==='failed'||row.status==='cancelled'||row.status==='pending')" type="danger" text size="small" @click.stop="deleteTask(row.id)">删除</el-button>
           </template>
         </el-table-column>
       </el-table>
@@ -207,26 +223,22 @@
         <div v-if="isClsTask" class="chart-box">
           <div ref="chartClsLoss" style="width:100%;height:320px"></div>
         </div>
-        <!-- seg/det/obb：四张子图 -->
+        <!-- seg/det/obb：按实际存在的 loss 项动态渲染（YOLO26 没有 dfl） -->
         <div v-else class="charts-grid">
-          <div class="chart-box">
-            <div ref="chartBoxLoss" style="width:100%;height:280px"></div>
-          </div>
-          <div class="chart-box">
-            <div ref="chartSegLoss" style="width:100%;height:280px"></div>
-          </div>
-          <div class="chart-box">
-            <div ref="chartClsLoss" style="width:100%;height:280px"></div>
-          </div>
-          <div class="chart-box">
-            <div ref="chartDflLoss" style="width:100%;height:280px"></div>
+          <div v-for="def in lossDefs" :key="def.key" class="chart-box">
+            <div :ref="(el: any) => setLossChartEl(def.key, el)" style="width:100%;height:280px"></div>
           </div>
         </div>
       </el-card>
 
       <!-- 验证指标曲线 -->
       <el-card shadow="never" style="margin-bottom:20px">
-        <template #header><span style="font-weight:600">验证指标</span></template>
+        <template #header>
+          <div style="display:flex;justify-content:space-between;align-items:center">
+            <span style="font-weight:600">验证指标</span>
+            <span style="font-size:12px;color:#999">Ultralytics 每轮只在验证集上评估，因此本区只有验证集曲线</span>
+          </div>
+        </template>
         <!-- cls：Top1 / Top5 准确率 -->
         <div v-if="isClsTask" class="charts-grid">
           <div class="chart-box">
@@ -439,10 +451,26 @@ function exportConfig() {
 }
 
 // Chart refs
-const chartBoxLoss = ref<HTMLElement>()
-const chartSegLoss = ref<HTMLElement>()
+// Loss 图按实际数据动态生成（见 lossDefs），用 key → DOM 的映射存句柄
+const lossChartEls: Record<string, HTMLElement> = {}
+function setLossChartEl(key: string, el: any) {
+  if (el) lossChartEls[key] = el as HTMLElement
+}
+const LOSS_DEFS = [
+  { key: 'box', title: 'Box Loss' },
+  { key: 'seg', title: 'Seg Loss' },
+  { key: 'cls', title: 'Cls Loss' },
+  { key: 'dfl', title: 'DFL Loss' },
+]
+// 只保留库里真有数据的 loss 项（YOLO26 没有 dfl_loss，就不再画空图）
+const lossDefs = computed(() => {
+  const ep = epochs.value as any[]
+  if (!ep.length) return LOSS_DEFS
+  const shown = LOSS_DEFS.filter(d =>
+    ep.some(e => e[`train_${d.key}_loss`] != null || e[`val_${d.key}_loss`] != null))
+  return shown.length ? shown : LOSS_DEFS
+})
 const chartClsLoss = ref<HTMLElement>()
-const chartDflLoss = ref<HTMLElement>()
 const chartPrecision = ref<HTMLElement>()
 const chartRecall = ref<HTMLElement>()
 const chartMap50 = ref<HTMLElement>()
@@ -512,14 +540,38 @@ async function loadEpochs() {
 }
 
 async function cancelTask(taskId: number) {
+  const row = tasks.value.find(t => t.id === taskId)
+  const queued = row?.status === 'pending'
+  try {
+    if (queued) {
+      await ElMessageBox.confirm(
+        '该任务还在队列中（未开始训练），确定退出队列？',
+        '退出队列',
+        { type: 'warning', confirmButtonText: '退出队列', cancelButtonText: '保留' }
+      )
+    } else {
+      await ElMessageBox.confirm(
+        '将请求训练在最近的检查点友好停止，已产生的 best.pt / last.pt 会尽量保留。确定取消？',
+        '友好取消训练',
+        { type: 'warning', confirmButtonText: '请求取消', cancelButtonText: '继续训练' }
+      )
+    }
+    await trainApi.cancelTask(taskId)
+    ElMessage.success(queued ? '已从训练队列移除' : '已请求友好取消，训练会在最近检查点停止')
+    loadTasks()
+  } catch {}
+}
+
+// 手动早停：当前 epoch 结束后停止，产物按“已完成”保留（不是取消）
+async function stopTask(taskId: number) {
   try {
     await ElMessageBox.confirm(
-      '将请求训练在最近的检查点友好停止，已产生的 best.pt / last.pt 会尽量保留。确定取消？',
-      '友好取消训练',
-      { type: 'warning', confirmButtonText: '请求取消', cancelButtonText: '继续训练' }
+      '早停会在当前 epoch 结束后停止训练，并保留 best.pt / last.pt（状态记为“已完成”，可直接导出/继承）。\n注意：最坏需要等一个 epoch。确定早停？',
+      '手动早停',
+      { type: 'warning', confirmButtonText: '早停', cancelButtonText: '继续训练' }
     )
-    await trainApi.cancelTask(taskId)
-    ElMessage.success('已请求友好取消，训练会在最近检查点停止')
+    await trainApi.stopTask(taskId)
+    ElMessage.success('已请求早停，将在当前 epoch 结束后停止')
     loadTasks()
   } catch {}
 }
@@ -557,15 +609,12 @@ function renderCharts() {
     renderMetricChart(chartTop1.value, 'Top-1 Accuracy', x, ep.map(e => e.top1_acc), '#67C23A')
     renderMetricChart(chartTop5.value, 'Top-5 Accuracy', x, ep.map(e => e.top5_acc), '#409EFF')
   } else {
-    // ---- 检测/分割/旋转：4 张 Loss + 4 张 Metric ----
-    renderLossChart(chartBoxLoss.value, 'Box Loss', x,
-      ep.map(e => e.train_box_loss), ep.map(e => e.val_box_loss))
-    renderLossChart(chartSegLoss.value, 'Seg Loss', x,
-      ep.map(e => e.train_seg_loss), ep.map(e => e.val_seg_loss))
-    renderLossChart(chartClsLoss.value, 'Cls Loss', x,
-      ep.map(e => e.train_cls_loss), ep.map(e => e.val_cls_loss))
-    renderLossChart(chartDflLoss.value, 'DFL Loss', x,
-      ep.map(e => e.train_dfl_loss), ep.map(e => e.val_dfl_loss))
+    // ---- 检测/分割/旋转：Loss 按实际数据动态出图 + 4 张 Metric ----
+    const raw = ep as any[]
+    for (const def of lossDefs.value) {
+      renderLossChart(lossChartEls[def.key], def.title, x,
+        raw.map(e => e[`train_${def.key}_loss`]), raw.map(e => e[`val_${def.key}_loss`]))
+    }
 
     renderMetricChart(chartPrecision.value, 'Precision', x, ep.map(e => e.precision_b), '#409EFF')
     renderMetricChart(chartRecall.value, 'Recall', x, ep.map(e => e.recall_b), '#E6A23C')
@@ -580,17 +629,28 @@ function renderCharts() {
 function renderLossChart(el: HTMLElement | undefined, title: string, x: number[], train: (number|null)[], val: (number|null)[]) {
   const chart = makeChart(el)
   if (!chart) return
+  const hasTrain = train.some(v => v != null)
+  const hasVal = val.some(v => v != null)
+  const series: any[] = []
+  if (hasTrain) {
+    series.push({ name: 'Train', type: 'line', data: train, smooth: true, lineStyle: { width: 2 }, itemStyle: { color: '#409EFF' }, symbol: 'none' })
+  }
+  if (hasVal) {
+    series.push({ name: 'Val', type: 'line', data: val, smooth: true, lineStyle: { width: 2, type: 'dashed' }, itemStyle: { color: '#F56C6C' }, symbol: 'none' })
+  }
   chart.setOption({
-    title: { text: title, left: 'center', top: 0, textStyle: { fontSize: 14 } },
+    title: {
+      text: title,
+      subtext: hasTrain ? '' : '无训练集数据（历史任务未记录，可用 tools/backfill_epoch_logs.py 回填）',
+      subtextStyle: { color: '#E6A23C', fontSize: 11 },
+      left: 'center', top: 0, textStyle: { fontSize: 14 },
+    },
     tooltip: { trigger: 'axis' },
-    legend: { data: ['Train', 'Val'], bottom: 0 },
-    grid: { left: 50, right: 20, top: 40, bottom: 40 },
+    legend: { data: series.map(s => s.name), bottom: 0 },
+    grid: { left: 50, right: 20, top: 46, bottom: 40 },
     xAxis: { type: 'category', data: x, name: 'Epoch' },
     yAxis: { type: 'value', name: 'Loss' },
-    series: [
-      { name: 'Train', type: 'line', data: train, smooth: true, lineStyle: { width: 2 }, itemStyle: { color: '#409EFF' }, symbol: 'none' },
-      { name: 'Val', type: 'line', data: val, smooth: true, lineStyle: { width: 2, type: 'dashed' }, itemStyle: { color: '#F56C6C' }, symbol: 'none' },
-    ],
+    series,
   }, true)
 }
 
@@ -632,13 +692,13 @@ function renderMetricChart(el: HTMLElement | undefined, title: string, x: number
 
 // Utils
 function statusType(s: string) {
-  return ({ pending: 'info', preparing: 'warning', training: '', completed: 'success', failed: 'danger', cancelled: 'info' } as any)[s] || 'info'
+  return ({ pending: 'info', preparing: 'warning', training: '', stopping: 'warning', completed: 'success', failed: 'danger', cancelled: 'info' } as any)[s] || 'info'
 }
 function statusText(s: string) {
-  return ({ pending: '排队中', preparing: '准备数据', training: '训练中', completed: '已完成', failed: '失败', cancelled: '已取消' } as any)[s] || s
+  return ({ pending: '排队中', preparing: '准备数据', training: '训练中', stopping: '停止中', completed: '已完成', failed: '失败', cancelled: '已取消' } as any)[s] || s
 }
 function isActiveStatus(s: string) {
-  return ['pending', 'preparing', 'training', 'exporting'].includes(s)
+  return ['pending', 'preparing', 'training', 'stopping', 'exporting'].includes(s)
 }
 function duration(start: string, end: string | null) {
   const s = new Date(start).getTime()

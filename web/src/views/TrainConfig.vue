@@ -40,6 +40,7 @@
               <el-radio-group v-model="trainMode">
                 <el-radio label="scratch">从头训练</el-radio>
                 <el-radio label="finetune" :disabled="completedTasks.length===0">继承训练</el-radio>
+                <el-radio label="custom">自定义预训练模型</el-radio>
               </el-radio-group>
             </el-form-item>
             <template v-if="trainMode==='finetune'">
@@ -73,6 +74,40 @@
                 </div>
               </el-alert>
             </template>
+            <template v-else-if="trainMode==='custom'">
+              <el-form-item label="本地模型">
+                <div style="display:flex;gap:8px;width:100%">
+                  <el-select v-model="customModelPath" placeholder="选择服务器上的 .pt 文件" style="flex:1" :loading="loadingModels" @change="inspectCustomModel">
+                    <el-option v-for="m in localModels" :key="m.path"
+                      :label="`${m.name} · ${m.size_mb} MB · ${m.mtime.replace('T',' ')}`"
+                      :value="m.path" />
+                  </el-select>
+                  <el-button size="default" :loading="loadingModels" @click="loadLocalModels">刷新</el-button>
+                </div>
+              </el-form-item>
+              <div style="font-size:12px;color:#909399;margin:-8px 0 10px">
+                把 .pt 放到服务器的 <code>weights/</code> 目录（或仓库根目录 / <code>storage/models</code>），点「刷新」即可出现
+              </div>
+              <el-alert v-if="inspectingModel" type="info" :closable="false">
+                <div style="font-size:12px">正在读取模型信息...</div>
+              </el-alert>
+              <el-alert v-else-if="customModelInfo" :type="customModelWarning ? 'warning' : 'success'" :closable="false">
+                <div style="font-size:12px">
+                  {{ customModelInfo.name }} · 任务 {{ customModelInfo.task }} · 类别数 {{ customModelInfo.nc }}
+                  · {{ customModelInfo.end2end ? 'end2end（NMS-free）' : '常规头（需 NMS）' }}
+                </div>
+                <div v-if="customModelWarning" style="font-size:12px;margin-top:4px">{{ customModelWarning }}</div>
+                <div v-else-if="customModelInfo.names?.length" style="font-size:12px;margin-top:4px;color:#909399">
+                  类别：{{ customModelInfo.names.slice(0, 10).join(' / ') }}{{ customModelInfo.names.length > 10 ? ' …' : '' }}
+                </div>
+              </el-alert>
+              <el-alert v-else type="info" :closable="false">
+                <div style="font-size:12px">
+                  自定义预训练：用你自己的 .pt 作为初始权重（可跨项目/跨数据集，不同于继承训练）。<br>
+                  类别数不一致时会重建检测/分割头，只迁移骨干权重。
+                </div>
+              </el-alert>
+            </template>
             <el-alert v-else type="info" :closable="false">
               <div style="font-size:12px">从头训练：使用预训练的 YOLO26s-seg 权重开始，适合首次训练或类别变更后。</div>
             </el-alert>
@@ -84,7 +119,7 @@
             <el-form-item label="任务名称">
               <el-input v-model="taskName" />
             </el-form-item>
-            <el-form-item label="模型尺寸">
+            <el-form-item v-if="trainMode === 'scratch'" label="模型尺寸">
               <el-select v-model="c.model_name" style="width:100%">
                 <template v-if="taskType === 'cls'">
                   <el-option label="yolo11n-cls.pt · Nano — 最快，~1.5M 参数（推荐小数据）" value="yolo11n-cls.pt" />
@@ -123,6 +158,19 @@
                 YOLO26 是 end2end 架构（训练阶段 NMS-free）；是否把 NMS 写进模型在训练完成后的
                 「模型转换」页选：兼容/高召回 / 内嵌 NMS / 原生端到端。
               </div>
+            </el-form-item>
+            <!-- 继承训练：权重来自父模型，模型尺寸选择无效，隐藏 -->
+            <el-form-item v-else-if="trainMode === 'finetune'" label="模型尺寸">
+              <el-tag type="info" size="small">随父模型</el-tag>
+              <span class="hint">
+                继承训练的权重来自 Task#{{ resumeTaskId ?? '-' }} 的 {{ resumeModelType }}.pt，
+                模型结构由父模型决定，不在此处选择
+              </span>
+            </el-form-item>
+            <!-- 自定义预训练：模型尺寸由所选 .pt 决定 -->
+            <el-form-item v-else label="模型尺寸">
+              <el-tag type="info" size="small">自定义权重</el-tag>
+              <span class="hint">{{ customModelInfo ? customModelInfo.name : '尚未选择本地模型' }}</span>
             </el-form-item>
             <el-form-item label="Epochs">
               <el-input-number v-model="c.epochs" :min="1" :max="2000" />
@@ -324,12 +372,58 @@ const savingDefaults = ref(false)
 const taskName = ref('训练任务-' + new Date().toLocaleDateString('zh-CN'))
 
 // 训练模式
-const trainMode = ref<'scratch'|'finetune'>('scratch')
+const trainMode = ref<'scratch'|'finetune'|'custom'>('scratch')
 const resumeTaskId = ref<number|null>(null)
 const resumeModelType = ref('best')
 const completedTasks = ref<any[]>([])
 const currentClassCount = ref(0)
 const taskType = ref<'seg'|'det'|'cls'|'obb'>('seg')
+
+// ---- 自定义预训练模型（服务器本地 .pt）----
+interface LocalModel { path: string; name: string; size_mb: number; mtime: string }
+interface LocalModelInfo {
+  path: string; name: string; stem: string; task: string; task_alias: string
+  nc: number; names: string[]; end2end: boolean
+}
+const localModels = ref<LocalModel[]>([])
+const customModelPath = ref('')
+const customModelInfo = ref<LocalModelInfo | null>(null)
+const loadingModels = ref(false)
+const inspectingModel = ref(false)
+
+async function loadLocalModels() {
+  loadingModels.value = true
+  try {
+    const { data } = await api.get<LocalModel[]>('/train/local-models')
+    localModels.value = data || []
+  } catch {} finally { loadingModels.value = false }
+}
+
+async function inspectCustomModel() {
+  customModelInfo.value = null
+  if (!customModelPath.value) return
+  inspectingModel.value = true
+  try {
+    const { data } = await api.get<LocalModelInfo>('/train/inspect-model', {
+      params: { path: customModelPath.value },
+    })
+    customModelInfo.value = data
+  } catch (e: any) {
+    ElMessage.error(e?.response?.data?.detail || '读取模型信息失败')
+  } finally { inspectingModel.value = false }
+}
+
+const customModelWarning = computed(() => {
+  const info = customModelInfo.value
+  if (!info) return ''
+  if (info.task_alias !== taskType.value) {
+    return `⚠ 模型任务类型为 ${info.task}，与当前项目（${taskType.value}）不匹配，无法使用`
+  }
+  if (currentClassCount.value > 0 && info.nc !== currentClassCount.value) {
+    return `⚠ 模型类别数 ${info.nc} 与项目类别数 ${currentClassCount.value} 不一致：训练时会重建检测/分割头，只迁移骨干权重`
+  }
+  return ''
+})
 
 // ---- 默认参数（按 task_type 分支生成）----
 function getBaseDefaults() {
@@ -435,6 +529,7 @@ watch(trainMode, (m) => {
   } else {
     recommendReason.value = ''
   }
+  if (m === 'custom') loadLocalModels()
 })
 
 onMounted(async () => {
@@ -550,6 +645,16 @@ async function startTrain() {
     ElMessage.error('类别数量不一致，无法继承训练')
     return
   }
+  if (trainMode.value === 'custom') {
+    if (!customModelPath.value) {
+      ElMessage.error('请先选择本地 .pt 模型')
+      return
+    }
+    if (customModelWarning.value) {
+      ElMessage.error('模型与当前项目不匹配，无法开始训练')
+      return
+    }
+  }
   submitting.value = true
   try {
     const config: any = { ...c.value }
@@ -558,11 +663,18 @@ async function startTrain() {
       config.resume_from_task_id = resumeTaskId.value
       config.resume_model_type = resumeModelType.value
     }
-    await api.post(`/projects/${props.id}/train`, {
+    if (trainMode.value === 'custom') {
+      config.model_path = customModelPath.value
+    }
+    const { data } = await api.post(`/projects/${props.id}/train`, {
       task_name: taskName.value,
       config,
     })
-    ElMessage.success('训练任务已提交！')
+    if (data?.queue_position) {
+      ElMessage.success(`已加入训练队列，前面还有 ${data.queue_position} 个任务`)
+    } else {
+      ElMessage.success('训练任务已提交！')
+    }
     router.push(`/project/${props.id}/train/monitor`)
   } catch {} finally { submitting.value = false }
 }

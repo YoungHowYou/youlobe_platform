@@ -51,15 +51,16 @@ uvicorn 没开 `--reload`，必须手动 kill PID + 重启。重启会把未跑�
 | type | 含义 | 训练数据集 | 模型默认 | 切片 |
 |---|---|---|---|---|
 | `seg` | 实例分割 | YOLO polygon txt | yolo26s-seg.pt | **原图 → 按 crop_size/overlap 滑窗（不缩放）** |
-| `det` | 目标检测 | YOLO bbox txt | yolo26s.pt | **不切片**（原图 letterbox 到 imgsz） |
+| `det` | 目标检测 | YOLO bbox txt | yolo26s.pt | **原图 → 按 crop_size/overlap 滑窗（不缩放）** |
 | `cls` | 图像分类 | ImageFolder `dataset/<class>/` | yolo11s-cls.pt | **不切片**，整图 letterbox 到 imgsz |
-| `obb` | 旋转目标检测 | YOLO 4 角点 txt（8 归一化坐标） | yolo11s-obb.pt | **不切片**（同 det） |
+| `obb` | 旋转目标检测 | YOLO 4 角点 txt（8 归一化坐标） | yolo11s-obb.pt | **原图 → 按 crop_size/overlap 滑窗（不缩放）** |
 
 cls 标签存 `images.class_id`（图级），其他 task 标签存 `annotations.polygon`（实例级）。
 
-> **seg 从 2026-10-22 起不再统一缩放**：数据集准备直接读原图（需要形态学时在整图做三通道），
+> **seg/det/obb 从 2026-10-22 起不再统一缩放**：数据集准备直接读原图（需要形态学时在整图做三通道），
 > 再按 `crop_size` / `overlap` 滑窗。`projects.resize_h/w` 仅保留字段兼容，**不再参与训练**；
-> 小于 `crop_size` 的图用 0 填充到窗口尺寸。推理页「长边缩放」建议保持 0 与训练一致。
+> 小于 `crop_size` 的图用 0 填充到窗口尺寸。推理端小图同样走 pad（不 resize），「长边缩放」建议保持 0。
+> 切片标签规则：seg 保留顶点落在窗内的多边形；det/obb 只保留**中心落在窗内**的目标（det 裁成窗口内 bbox，obb 把 4 点裁到窗口），切片后过小的目标丢弃。
 >
 > **切片口径决策（2026-10-22）**：保持 overlap 滑窗 + 类内 NMS，**不引入 halo**。
 > 当前 640×640 图、缺陷最长边 38px、模型输入 640 → 不切片，halo 无收益；
@@ -149,6 +150,38 @@ PUT  /api/projects/{id}/images/batch-class    cls 批量打分类标签
 
 ---
 
+## 训练模式（2026-10-23 增加第三种）
+
+| train_mode | 含义 | 权重来源 | 记录字段 |
+|---|---|---|---|
+| `scratch` | 从官方预训练起步（按模型尺寸下拉） | ultralytics 自动下载/本地 `weights/` | `model_name`=尺寸名 |
+| `finetune` | 继承本项目历史任务的 best/last | `storage/runs/task_<N>/...` | `inherited_from_task_id` |
+| `custom` | **用户放服务器本地的任意 `.pt`** | `config.model_path` | `base_model_path`、`head_reinit`、`is_end2end` |
+
+自定义模型的约束（`server/services/model_source.py`）：
+
+- 只允许 `.pt`，且必须落在 `<仓库根>`、`<仓库根>/weights`、`<仓库根>/storage/models` 三个目录内（防止随意读盘），路径用绝对路径传给 `config.model_path`。
+- `GET /api/train/local-models` 列出可选用模型（`path/name/size_mb/mtime`，按 mtime 倒序）；`GET /api/train/inspect-model?path=` 返回 `task/nc/names/end2end`（加载一次 YOLO 读元信息）。
+- **任务类型不匹配 = 硬失败 400**（`detect` 模型不能进 `seg` 项目等）；**类别数不一致 = 只警告**，ultralytics 会重建检测/分割头、只迁移骨干，`config.head_reinit=true` 留痕。
+- 前端训练页「模型尺寸」在 custom 模式下改为「自定义权重」显示，不再让人误以为尺寸下拉有效。
+
+## 标注形状：矩形 / 圆形保持参数化（2026-10-23）
+
+- `annotations.shape`：`polygon`（默认）/ `rect` / `circle`；`annotations.shape_params` 存参数（rect: `{x1,y1,x2,y2}` 归一化；circle: `{cx,cy}` 归一化 + `r` **像素**半径）。
+- **`polygon` 仍是几何唯一真相**：矩形的 4 角点、圆的 48 点采样都写进 `polygon`，训练/推理/统计/项目导出全部只认 polygon，不需要认识形状类型；`shape_params` 只用于标注器参数化编辑，保存时由 polygon 反推（不维护第二份数据，平移/旋转/剪贴板/撤销无需特殊处理）。
+- 标注器编辑：矩形给 4 个角点手柄（对角固定、轴对齐），圆形给「圆心（平移，半径不变）+ 半径手柄」；**不再给顶点手柄**（不会退化成拖一堆顶点）。
+- 圆形工具有两种画法：「圆心+半径」和「**3点共圆**」（三点外接圆，共线时报错提示）。
+- 矩形/圆形不支持旋转（`rotateSelectedBy` 直接提示），需要斜置矩形请用多边形工具。
+- 老库迁移：`server/database.py::_ensure_columns()` 启动时用 `PRAGMA table_info` 比对并 `ALTER TABLE ... ADD COLUMN`（幂等），新增字段往这个清单里追加即可；新列必须可空或带默认值。
+
+## 训练曲线（train_epoch_logs）
+
+- `core/train.py` 的 `on_fit_epoch_end` 从 `trainer.tloss` 取训练集 loss。**ultralytics 8.3+ 里 `tloss` / `loss_items` 是 `{loss名: Tensor}` 的 dict**（老版是 Tensor 列表），按 Tensor 处理会静默失败 → `train_*_loss` 恒为 NULL、前端 Loss 曲线只剩 Val。
+- YOLO26 的 loss 项是 `box/seg/cls/l1/sem`（**没有 dfl**），库里只存 box/seg/cls/dfl，所以前端 Loss 图按实际有数据的项动态渲染（不再出现空的 DFL 图）。
+- `results.csv` 的 `epoch` 从 **1** 开始，而库里 `train_epoch_logs.epoch` 是 `trainer.epoch`（0 基）：回填/对齐必须 **-1**。
+- 历史数据补全：`tools/backfill_epoch_logs.py`（已修正 -1 偏移）；接口层另有 `server/services/epoch_csv.py::fill_missing_train_loss`，读 `/train/tasks/{id}/epochs` 时从 `results.csv` 只补 NULL，不覆盖已有值。
+- 验证指标（precision/recall/mAP、cls 的 top1/top5）**只有验证集**——ultralytics 每轮只在 val 集上评估，不存在训练集指标曲线。
+
 ## 训练任务可继承的状态
 
 `completed` + `cancelled` 都允许（cancelled 任务硬盘上仍有 best.pt/last.pt，ultralytics 实时写盘）。
@@ -167,6 +200,14 @@ PUT  /api/projects/{id}/images/batch-class    cls 批量打分类标签
 检测到 `task.status == 'cancelled'` 或任务被删 → `trainer.stop = True`，YOLO 在 epoch 边界优雅退出。最坏 ~20 秒生效。
 
 `server/routers/train.py` delete 接口拒绝删 `pending/preparing/training/exporting`。服务重启时 `main.py` lifespan 会把上次未跑完的任务统一标记 failed。
+
+## 手动早停（2026-10-22）
+
+- `POST /api/train/tasks/{id}/stop`：仅 `training` 且 `current_epoch ≥ 1` 可用（`pending/preparing` 与第 0 个 epoch 一律 400）。
+- 置 `status='stopping'` → `cancel_check` 在 epoch 边界返回 True → 收尾把状态改回 `completed`，
+  并写 `config.stop_reason='manual'`、`config.stopped_at_epoch=N`。
+- 与「取消」的区别：取消的终态是 `cancelled`（当作放弃）；早停按完成处理，导出/继承直接可用。
+- 最坏等一个 epoch 生效（不做 batch 级加速）；`epochs` 字段不改写，前端显示「早停@N ep」。
 
 ## 训练并发模型（2026-09 去除 Celery 后）
 

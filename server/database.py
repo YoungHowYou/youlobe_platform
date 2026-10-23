@@ -106,12 +106,48 @@ def _repair_bigint_pk_tables() -> None:
         print(f"[数据库] {table} 已重建完成")
 
 
+def _ensure_columns() -> None:
+    """给已有 SQLite 库补新列（幂等，启动时自动执行）。
+
+    `create_all` 只负责建**新表**，不会给已存在的表加列；而 SQLite 又支持
+    `ALTER TABLE ... ADD COLUMN`。所以新增字段时把「表 → (列名, DDL)」写进
+    下面的清单，老库启动时自动补齐，避免查询直接因缺列 500。
+    新加的列必须是可空或带默认值的（SQLite 限制）。
+    """
+    if not IS_SQLITE:
+        return
+
+    wanted: dict[str, list[tuple[str, str]]] = {
+        "annotations": [
+            ("shape", "VARCHAR(16) NOT NULL DEFAULT 'polygon'"),
+            ("shape_params", "JSON"),
+        ],
+    }
+
+    with engine.begin() as conn:
+        for table, columns in wanted.items():
+            row = conn.exec_driver_sql(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name=?", (table,)
+            ).fetchone()
+            if not row:
+                continue                     # 新库交给 create_all
+            existing = {
+                r[1] for r in conn.exec_driver_sql(f"PRAGMA table_info({table})").fetchall()
+            }
+            for name, ddl in columns:
+                if name in existing:
+                    continue
+                conn.exec_driver_sql(f"ALTER TABLE {table} ADD COLUMN {name} {ddl}")
+                print(f"[数据库] {table} 补列 {name}")
+
+
 def init_db():
     """建表（SQLite 下模型即完整表结构，不再有 MySQL 增量迁移）"""
     from . import models  # noqa
     # 先修历史遗留：否则 create_all 可能撞上中断残留的孤儿索引，直接起不来
     _repair_bigint_pk_tables()
     Base.metadata.create_all(bind=engine)
+    _ensure_columns()                        # 老库补新列（如 annotations.shape）
     if not IS_SQLITE:
         print("[数据库] 警告：正在使用非 SQLite 数据库，本平台已去除 MySQL 增量迁移，"
               "表结构将以 ORM 模型为准直接 create_all。")

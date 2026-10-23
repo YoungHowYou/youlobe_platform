@@ -335,7 +335,8 @@ async def import_voc_project(
         resize_h=crop_size,
         resize_w=crop_size,
         crop_size=crop_size,
-        overlap=0.0,
+        # det/obb 现在也按滑窗切片训练，给 0.2 的重叠避免跨窗目标被切断
+        overlap=0.2,
     )
     db.add(project)
     db.flush()
