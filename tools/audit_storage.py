@@ -210,6 +210,57 @@ def purge_missing_images(db) -> None:
     print(f"  [已删除] 文件缺失的图片记录 {removed} 条（含其标注）")
 
 
+def purge_orphan_files(db) -> None:
+    """删掉 DB 里已经没有对应记录的磁盘目录 / 下载缓存。
+
+    覆盖：
+      - storage/runs/task_<n>  （n 不在 train_tasks）
+      - storage/uploads/<pid>  （pid 不在 projects）
+      - storage/runs/inference/ 下已无记录的图片（整目录扫）
+      - /tmp/model_downloads/*.zip （导出模型下载缓存，与记录无关的直接清）
+    """
+    from server.services.artifact_cleanup import (
+        DOWNLOAD_CACHE_DIR, remove_tree,
+        runs_root, sweep_orphan_task_dirs, sweep_orphan_upload_dirs, uploads_root,
+    )
+
+    alive_tasks = [row[0] for row in db.query(TrainTask.id).all()]
+    alive_projects = [row[0] for row in db.query(Project.id).all()]
+
+    freed = 0.0
+    for name in sweep_orphan_task_dirs(alive_tasks):
+        print(f"  [已删] runs/{name}")
+    for name in sweep_orphan_upload_dirs(alive_projects):
+        print(f"  [已删] uploads/{name}")
+
+    # 推理图：库里记录的 URL 之外的都算孤儿（整目录平铺，直接按文件名比对）
+    infer_dir = runs_root() / "inference"
+    if infer_dir.is_dir():
+        keep = set()
+        for r in db.query(InferenceResult).all():
+            for url in (r.original_path, r.overlay_path, r.overlay_morph_path, r.mask_path):
+                if url:
+                    keep.add(Path(url).name)
+        for f in infer_dir.iterdir():
+            if f.is_file() and f.name not in keep:
+                freed += f.stat().st_size / 1024 / 1024
+                f.unlink(missing_ok=True)
+                print(f"  [已删] runs/inference/{f.name}")
+        try:
+            if not any(infer_dir.iterdir()):
+                infer_dir.rmdir()
+        except Exception:
+            pass
+
+    if DOWNLOAD_CACHE_DIR.is_dir():
+        for f in DOWNLOAD_CACHE_DIR.glob("*.zip"):
+            freed += f.stat().st_size / 1024 / 1024
+            f.unlink(missing_ok=True)
+            print(f"  [已删] {f}")
+    if freed:
+        print(f"  下载/推理缓存释放约 {freed:.1f} MB")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="存储体检 / 清理")
     parser.add_argument("--purge-orphan-projects", action="store_true",
@@ -220,6 +271,8 @@ def main() -> int:
                         help="删除没有任何图片的空项目")
     parser.add_argument("--purge-missing-images", action="store_true",
                         help="只删除文件已丢失的图片记录（保留项目）")
+    parser.add_argument("--purge-orphan-files", action="store_true",
+                        help="删除 DB 里已无记录的磁盘目录（runs/task_*、uploads/<pid>）与下载缓存")
     parser.add_argument("--vacuum", action="store_true", help="VACUUM 整理 app.db")
     parser.add_argument("--yes", action="store_true", help="跳过确认")
     args = parser.parse_args()
@@ -239,7 +292,7 @@ def main() -> int:
             targets += [r["project"].id for r in rows if r["images"] == 0]
         targets = sorted(set(targets))
 
-        doing = targets or args.purge_missing_images or args.vacuum
+        doing = targets or args.purge_missing_images or args.vacuum or args.purge_orphan_files
         if not doing:
             print("\n（体检模式，未做任何改动）")
             return 0
@@ -255,6 +308,8 @@ def main() -> int:
             purge_projects(db, targets)
         if args.purge_missing_images:
             purge_missing_images(db)
+        if args.purge_orphan_files:
+            purge_orphan_files(db)
 
         if args.vacuum:
             before = Path(engine.url.database).stat().st_size if engine.url.database else 0

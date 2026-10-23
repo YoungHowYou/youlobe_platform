@@ -59,6 +59,47 @@
       </div>
     </el-card>
 
+    <!-- 训练队列（FIFO，当前任务跑完自动接下一个） -->
+    <el-card shadow="never" style="margin-bottom:16px">
+      <template #header>
+        <div class="card-head">
+          <span>
+            训练队列
+            <el-tag v-if="status.queue?.length" size="small" type="warning" effect="plain" style="margin-left:8px">
+              排队 {{ status.queue.length }} 个
+            </el-tag>
+          </span>
+          <span class="muted">
+            {{ activeTask ? `当前 #${activeTask.id} 跑完后自动接下一个` : '同一时间只跑一个，按提交顺序串行' }}
+          </span>
+        </div>
+      </template>
+      <div v-if="!status.queue?.length" class="idle">
+        <el-icon><Coffee /></el-icon>
+        <span>队列为空</span>
+      </div>
+      <el-table v-else :data="status.queue" size="small" style="width:100%">
+        <el-table-column prop="position" label="位次" width="70" />
+        <el-table-column prop="id" label="ID" width="70" />
+        <el-table-column prop="task_name" label="任务名称" min-width="180" />
+        <el-table-column label="模型" width="140">
+          <template #default="{ row }">{{ row.model_name || '-' }}</template>
+        </el-table-column>
+        <el-table-column label="epochs" width="90">
+          <template #default="{ row }">{{ row.epochs || '-' }}</template>
+        </el-table-column>
+        <el-table-column label="提交时间" width="170">
+          <template #default="{ row }">{{ row.created_at ? fmtTime(row.created_at) : '-' }}</template>
+        </el-table-column>
+        <el-table-column label="操作" width="150">
+          <template #default="{ row }">
+            <el-button size="small" text @click="openProject(row.project_id)">监控</el-button>
+            <el-button size="small" text type="warning" @click="quitQueue(row.id)">退出队列</el-button>
+          </template>
+        </el-table-column>
+      </el-table>
+    </el-card>
+
     <!-- 资源概况 -->
     <el-row :gutter="16" style="margin-bottom:16px">
       <el-col :span="6">
@@ -97,6 +138,10 @@
           <div class="res-title">日志文件</div>
           <div class="res-line">{{ logInfo.file || '未找到日志' }}</div>
           <div class="res-line muted">{{ fmtSize(logInfo.size) }} · {{ logInfo.mtime ? fmtTime(logInfo.mtime) : '-' }}</div>
+          <div v-if="status.log?.max_bytes" class="res-line muted">
+            轮转：{{ fmtSize(status.log.max_bytes) }} × {{ status.log.backup_count }} 份 ·
+            已有备份 {{ status.log.backups?.length || 0 }} 个
+          </div>
         </el-card>
       </el-col>
     </el-row>
@@ -150,6 +195,8 @@
 
 <script setup lang="ts">
 import { ref, onMounted, onBeforeUnmount, watch, nextTick, computed } from 'vue'
+import { useRouter } from 'vue-router'
+import { ElMessage, ElMessageBox } from 'element-plus'
 import api from '../api/index'
 
 interface GpuStat {
@@ -180,11 +227,31 @@ interface ActiveTask {
   pct: number
 }
 
-interface LogInfo { file: string | null; size: number; mtime: string | null }
+interface LogInfo {
+  file: string | null
+  size: number
+  mtime: string | null
+  /** 轮转：单个文件上限字节数 / 保留份数 / 已有备份 */
+  max_bytes?: number
+  backup_count?: number
+  backups?: { file: string; size: number; mtime: string }[]
+}
+
+/** 排队中的训练任务（内存 FIFO 队列，position 从 1 开始） */
+interface QueueItem {
+  position: number
+  id: number
+  project_id: number
+  task_name: string
+  epochs: number | null
+  model_name: string | null
+  created_at: string | null
+}
 
 interface StatusPayload {
   now: string
   active_tasks: ActiveTask[]
+  queue?: QueueItem[]
   dispatcher_task_id: number | null
   cpu_pct: number | null
   cpu_count: number | null
@@ -199,6 +266,7 @@ interface StatusPayload {
 const status = ref<StatusPayload>({
   now: '',
   active_tasks: [],
+  queue: [],
   dispatcher_task_id: null,
   cpu_pct: null,
   cpu_count: null,
@@ -249,6 +317,27 @@ async function scrollToBottom() {
 
 async function refreshAll() {
   await Promise.all([loadStatus(), loadLogs()])
+}
+
+const router = useRouter()
+
+/** 跳到该任务所属项目的训练监控页 */
+function openProject(projectId: number) {
+  router.push(`/project/${projectId}/train/monitor`)
+}
+
+/** 把排队中的任务从队列里摘掉（不开始训练） */
+async function quitQueue(taskId: number) {
+  try {
+    await ElMessageBox.confirm(
+      `确定把任务 #${taskId} 从训练队列移除？它不会再开始训练。`,
+      '退出队列',
+      { type: 'warning', confirmButtonText: '退出队列', cancelButtonText: '保留' },
+    )
+    await api.post(`/train/tasks/${taskId}/cancel`)
+    ElMessage.success('已从训练队列移除')
+    await refreshAll()
+  } catch {}
 }
 
 function startTimer() {

@@ -11,7 +11,8 @@ Windows 服务封装（pywin32）
     显示名     Labelyou 缺陷标注平台后端
     服务镜像   "<项目>\\venv\\Scripts\\python.exe" "<项目>\\tools\\win_service.py" service
     监听       0.0.0.0:8000（可用环境变量 LABELYOU_HOST / LABELYOU_PORT 覆盖）
-    日志       logs\\service.log（轮转，8MB × 5）+ logs\\service.stdout.log
+    日志       logs\\service.log（RotatingFileHandler，默认 20MB × 5，可用 LOG_MAX_MB / LOG_BACKUP_COUNT 覆盖）+ logs\\service.stdout.log
+               其它 logs/*.log 由 app 内 copytruncate 轮转（server/services/log_rotation.py，60s 检查）
 
     [!] 服务镜像刻意用 **venv 的 python.exe**，而不是 pywin32 自带的 pythonservice.exe。
       后者按注册表定位基础解释器且不处理 .pth，连它引导时要用的 servicemanager 都导入不了
@@ -99,7 +100,12 @@ LOG_DIR = ROOT / "logs"
 
 
 def setup_file_logging(stream: bool = False) -> None:
-    """服务没有控制台，日志必须落到文件；控制台模式额外打屏。"""
+    """服务没有控制台，日志必须落到文件；控制台模式额外打屏。
+
+    轮转参数统一读 settings.LOG_MAX_MB / LOG_BACKUP_COUNT（默认 20MB × 5），
+    和 app 内部的 copytruncate 轮转（server/services/log_rotation.py）保持同一口径；
+    service.log 由本 handler 自己轮转，app 的 worker 会识别并跳过它。
+    """
     import logging
     from logging.handlers import RotatingFileHandler
 
@@ -107,9 +113,16 @@ def setup_file_logging(stream: bool = False) -> None:
     root = logging.getLogger()
     root.setLevel(logging.INFO)
 
+    try:
+        from server.config import settings as _settings
+        max_bytes = max(1, int(_settings.LOG_MAX_MB)) * 1024 * 1024
+        backup_count = max(1, int(_settings.LOG_BACKUP_COUNT))
+    except Exception:                      # 配置读不到时回到历史默认值
+        max_bytes, backup_count = 8 * 1024 * 1024, 5
+
     if not any(isinstance(h, RotatingFileHandler) for h in root.handlers):
-        fh = RotatingFileHandler(LOG_DIR / "service.log", maxBytes=8 * 1024 * 1024,
-                                 backupCount=5, encoding="utf-8")
+        fh = RotatingFileHandler(LOG_DIR / "service.log", maxBytes=max_bytes,
+                                 backupCount=backup_count, encoding="utf-8")
         fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)-7s [%(name)s] %(message)s"))
         root.addHandler(fh)
 

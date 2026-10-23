@@ -54,7 +54,7 @@
             <span v-else style="color:#999">-</span>
           </template>
         </el-table-column>
-        <el-table-column label="操作" width="180">
+        <el-table-column label="操作" width="230">
           <template #default="{row}">
             <el-button
               v-if="row.status==='training' && row.current_epoch>0"
@@ -64,6 +64,11 @@
             <el-button v-if="row.status==='training'||row.status==='preparing'" type="warning" text size="small" @click.stop="cancelTask(row.id)">取消</el-button>
             <!-- 排队中（未开训）的任务可退队，也可以直接删除 -->
             <el-button v-if="row.status==='pending'" type="warning" text size="small" @click.stop="cancelTask(row.id)">退出队列</el-button>
+            <el-button
+              v-if="['completed','cancelled','failed'].includes(row.status)"
+              type="info" text size="small"
+              @click.stop="purgeTask(row.id)"
+            >清理中间产物</el-button>
             <el-button v-if="isAdmin && (row.status==='completed'||row.status==='failed'||row.status==='cancelled'||row.status==='pending')" type="danger" text size="small" @click.stop="deleteTask(row.id)">删除</el-button>
           </template>
         </el-table-column>
@@ -110,63 +115,11 @@
         </div>
       </el-card>
 
-      <!-- GPU 实时状态（nvidia-smi 采样，只读传感器，不影响训练） -->
-      <el-card v-if="gpuStats.gpus.length" shadow="never" class="gpu-card">
-        <template #header>
-          <div style="display:flex;justify-content:space-between;align-items:center">
-            <span style="font-weight:600">GPU 状态</span>
-            <span style="font-size:12px;color:#909399">
-              <template v-if="gpuStats.sampled_at">采样于 {{ gpuStats.sampled_at.replace('T', ' ') }}</template>
-              <template v-else>每 3 秒刷新</template>
-            </span>
-          </div>
-        </template>
-        <div v-for="g in gpuStats.gpus" :key="g.index ?? 0" class="gpu-row">
-          <div class="gpu-name">
-            <el-tag size="small" type="info">GPU {{ g.index }}</el-tag>
-            <span>{{ g.name }}</span>
-          </div>
-          <div class="gpu-metrics">
-            <div class="gpu-metric">
-              <div class="gpu-metric-label">温度</div>
-              <div class="gpu-metric-value" :class="gpuTempClass(g.temperature_c)">
-                {{ fmtGpuNum(g.temperature_c, 0) }} <span class="unit">°C</span>
-              </div>
-            </div>
-            <div class="gpu-metric">
-              <div class="gpu-metric-label">GPU 占用</div>
-              <div class="gpu-metric-value">{{ fmtGpuNum(g.utilization_pct, 0) }} <span class="unit">%</span></div>
-              <el-progress :percentage="Math.round(g.utilization_pct ?? 0)" :show-text="false" :stroke-width="6" />
-            </div>
-            <div class="gpu-metric">
-              <div class="gpu-metric-label">显存</div>
-              <div class="gpu-metric-value">
-                {{ fmtGpuMb(g.memory_used_mb) }} <span class="unit">/ {{ fmtGpuMb(g.memory_total_mb) }} MB</span>
-              </div>
-              <el-progress
-                :percentage="Math.min(100, Math.round(g.memory_pct ?? 0))"
-                :show-text="false"
-                :stroke-width="6"
-                :status="(g.memory_pct ?? 0) >= 90 ? 'exception' : ''"
-              />
-            </div>
-            <div class="gpu-metric">
-              <div class="gpu-metric-label">核心频率</div>
-              <div class="gpu-metric-value">{{ fmtGpuNum(g.clock_sm_mhz, 0) }} <span class="unit">MHz</span></div>
-            </div>
-            <div class="gpu-metric">
-              <div class="gpu-metric-label">显存频率</div>
-              <div class="gpu-metric-value">{{ fmtGpuNum(g.clock_mem_mhz, 0) }} <span class="unit">MHz</span></div>
-            </div>
-            <div class="gpu-metric">
-              <div class="gpu-metric-label">功耗</div>
-              <div class="gpu-metric-value">
-                {{ fmtGpuNum(g.power_w, 0) }} <span class="unit">/ {{ fmtGpuNum(g.power_limit_w, 0) }} W</span>
-              </div>
-            </div>
-          </div>
-        </div>
-      </el-card>
+      <!-- GPU 状态统一在「运行监控」页看，这里不再重复一张卡 -->
+      <div class="gpu-hint">
+        GPU 温度 / 显存 / 占用 / 频率 / 功耗 →
+        <el-button link type="primary" size="small" @click="router.push('/monitor')">运行监控</el-button>
+      </div>
 
       <!-- 训练参数（点击展开/收起） -->
       <el-card v-if="selectedTask?.config" shadow="never" style="margin-bottom:20px">
@@ -186,6 +139,7 @@
         <div v-show="paramsExpanded">
           <div v-for="group in paramGroups" :key="group.title" class="param-group">
             <div class="param-group-title">{{ group.title }}</div>
+            <div v-if="group.note" class="param-group-note">{{ group.note }}</div>
             <div class="param-grid">
               <div
                 v-for="item in group.items.filter(i => hasValue(i.key))"
@@ -282,7 +236,7 @@ import { ref, onMounted, onBeforeUnmount, watch, nextTick, computed } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import * as echarts from 'echarts'
-import { trainApi, type TrainTask, type EpochLog, type GpuStatsPayload } from '../api/train'
+import { trainApi, type TrainTask, type EpochLog } from '../api/train'
 
 const props = defineProps<{ id: string }>()
 const router = useRouter()
@@ -302,32 +256,6 @@ let pollTimer: any = null
 let clockTimer: any = null
 const nowTs = ref(Date.now())
 
-// ---- GPU 实时状态（温度/显存/占用/频率/功耗）----
-const gpuStats = ref<GpuStatsPayload>({ available: false, gpus: [] })
-let gpuTimer: any = null
-
-async function loadGpuStats() {
-  try {
-    const { data } = await trainApi.getGpuStats()
-    gpuStats.value = data
-  } catch {
-    // 后端尚未重启/接口不存在时静默失败，不影响监控页其他内容
-  }
-}
-
-function fmtGpuNum(v: number | null | undefined, digits = 0) {
-  return v == null ? '-' : v.toFixed(digits)
-}
-function fmtGpuMb(v: number | null | undefined) {
-  return v == null ? '-' : Math.round(v).toLocaleString()
-}
-function gpuTempClass(t: number | null | undefined) {
-  if (t == null) return ''
-  if (t >= 85) return 'hot'
-  if (t >= 75) return 'warm'
-  return ''
-}
-
 const selectedTask = computed(() => tasks.value.find(t => t.id === selectedTaskId.value))
 
 // 是否分类任务（cls 的指标和 seg/det/obb 不同：单一 loss + Top1/Top5 准确率）
@@ -339,7 +267,7 @@ const paramsExpanded = ref(true)
 const cfg = computed<Record<string, any>>(() => (selectedTask.value?.config || {}) as any)
 
 interface ParamItem { key: string; label: string; tip?: string; fmt?: 'pct' | 'fix2' | 'fix4' | 'json' }
-interface ParamGroup { title: string; items: ParamItem[] }
+interface ParamGroup { title: string; items: ParamItem[]; note?: string }
 
 const paramGroups: ParamGroup[] = [
   {
@@ -408,9 +336,10 @@ const paramGroups: ParamGroup[] = [
   },
   {
     title: '数据集预处理',
+    // 2026-10-22 起 seg/det/obb 不再统一缩放：直接按原图分辨率 + crop_size/overlap 滑窗，
+    // projects.resize_h/w 只保留字段兼容，所以这里不再展示（老任务配置里可能还残留）
+    note: '图像不缩放：按原图分辨率 + 切割尺寸/重叠率滑窗（旧的 Resize H/W 已废弃、不参与训练）',
     items: [
-      { key: 'resize_h',          label: 'Resize H' },
-      { key: 'resize_w',          label: 'Resize W' },
       { key: 'crop_size',         label: '切割尺寸' },
       { key: 'overlap',           label: '滑窗重叠率' },
       { key: 'oversample_factor', label: '过采样倍数' },
@@ -498,9 +427,7 @@ onMounted(async () => {
   if (tasks.value.length > 0) {
     selectTask(tasks.value[0])
   }
-  // GPU 状态：与训练无关，始终刷新（3 秒）
-  await loadGpuStats()
-  gpuTimer = setInterval(loadGpuStats, 3000)
+  // GPU 状态不在这里轮询了（统一放「运行监控」页，避免两处重复调 nvidia-smi）
   // 轮询刷新（训练中时每 5 秒刷新）
   pollTimer = setInterval(async () => {
     const running = tasks.value.some(t => t.status === 'training' || t.status === 'preparing' || t.status === 'pending')
@@ -516,7 +443,6 @@ onBeforeUnmount(() => {
   window.removeEventListener('resize', onWindowResize)
   if (pollTimer) clearInterval(pollTimer)
   if (clockTimer) clearInterval(clockTimer)
-  if (gpuTimer) clearInterval(gpuTimer)
   charts.forEach(c => c.dispose())
   charts = []
 })
@@ -586,6 +512,22 @@ async function deleteTask(taskId: number) {
   } catch {}
 }
 
+/** 清理中间产物：切图 / 数据集 / epoch 快照，保留 best.pt / last.pt / results.csv */
+async function purgeTask(taskId: number) {
+  try {
+    await ElMessageBox.confirm(
+      '将删除该任务的中间产物：raw / preprocessed / cropped / dataset 与 weights/epochN.pt。\n' +
+      '保留 best.pt / last.pt / results.csv / args.yaml / 曲线图 / 导出模型，' +
+      '所以训练曲线照常看、仍可导出、仍可被继承训练。\n确定清理？',
+      '清理中间产物',
+      { type: 'warning', confirmButtonText: '清理', cancelButtonText: '取消' },
+    )
+    const { data } = await trainApi.purgeIntermediates(taskId)
+    ElMessage.success(data?.message || '已清理')
+    loadTasks()
+  } catch {}
+}
+
 // ====== ECharts ======
 function makeChart(el: HTMLElement | undefined): echarts.ECharts | null {
   if (!el) return null
@@ -633,10 +575,13 @@ function renderLossChart(el: HTMLElement | undefined, title: string, x: number[]
   const hasVal = val.some(v => v != null)
   const series: any[] = []
   if (hasTrain) {
-    series.push({ name: 'Train', type: 'line', data: train, smooth: true, lineStyle: { width: 2 }, itemStyle: { color: '#409EFF' }, symbol: 'none' })
+    series.push({ name: 'Train', type: 'line', data: train, smooth: true, connectNulls: true, lineStyle: { width: 2 }, itemStyle: { color: '#409EFF' }, symbol: 'none' })
   }
   if (hasVal) {
-    series.push({ name: 'Val', type: 'line', data: val, smooth: true, lineStyle: { width: 2, type: 'dashed' }, itemStyle: { color: '#F56C6C' }, symbol: 'none' })
+    // 统一实线：Train / Val 只用颜色区分（蓝/红），不用虚线
+    // connectNulls：个别 epoch 的 loss 在 ultralytics 里是 nan（val loss 未算/发散），
+    // 库里存为 NULL —— 跨过它连成直线，不要断成两截
+    series.push({ name: 'Val', type: 'line', data: val, smooth: true, connectNulls: true, lineStyle: { width: 2 }, itemStyle: { color: '#F56C6C' }, symbol: 'none' })
   }
   chart.setOption({
     title: {
@@ -674,6 +619,8 @@ function renderMetricChart(el: HTMLElement | undefined, title: string, x: number
     yAxis: { type: 'value' },
     series: [{
       name: title, type: 'line', data, smooth: true,
+      // 空值不要断线（个别 epoch 指标缺失时连成直线）
+      connectNulls: true,
       lineStyle: { width: 2, color },
       itemStyle: { color },
       symbol: 'none',
@@ -821,6 +768,11 @@ pre {
   padding-left: 8px;
   margin-bottom: 10px;
 }
+.param-group-note {
+  font-size: 12px;
+  color: #E6A23C;
+  margin: -4px 0 10px 11px;
+}
 .param-grid {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(190px, 1fr));
@@ -863,57 +815,13 @@ pre {
   margin-right: 4px;
 }
 
-/* ---- GPU 状态卡片 ---- */
-.gpu-card {
-  margin-bottom: 20px;
-}
-.gpu-row {
-  padding: 10px 0;
-  border-bottom: 1px dashed #ebeef5;
-}
-.gpu-row:last-child {
-  border-bottom: none;
-}
-.gpu-name {
+/* ---- GPU 状态改为「运行监控」页查看，这里只留一行引导 ---- */
+.gpu-hint {
+  margin: -6px 0 16px;
+  font-size: 12px;
+  color: #909399;
   display: flex;
   align-items: center;
-  gap: 8px;
-  font-size: 13px;
-  font-weight: 600;
-  color: #303133;
-  margin-bottom: 10px;
-}
-.gpu-metrics {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
-  gap: 12px;
-}
-.gpu-metric {
-  background: #fafbfc;
-  border: 1px solid #ebeef5;
-  border-radius: 8px;
-  padding: 8px 10px;
-}
-.gpu-metric-label {
-  font-size: 12px;
-  color: #909399;
-  margin-bottom: 4px;
-}
-.gpu-metric-value {
-  font-size: 16px;
-  font-weight: 600;
-  color: #303133;
-  margin-bottom: 6px;
-}
-.gpu-metric-value .unit {
-  font-size: 12px;
-  font-weight: normal;
-  color: #909399;
-}
-.gpu-metric-value.warm {
-  color: #e6a23c;
-}
-.gpu-metric-value.hot {
-  color: #f56c6c;
+  gap: 4px;
 }
 </style>

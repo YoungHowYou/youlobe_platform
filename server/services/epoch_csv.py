@@ -54,9 +54,13 @@ def _find_results_csv(output_dir: Optional[str]) -> Optional[Path]:
 
 def _to_float(value: Any) -> Optional[float]:
     try:
-        return float(value)
+        f = float(value)
     except (TypeError, ValueError):
         return None
+    # CSV 里的 nan/inf 不能原样回传：既会让前端曲线断开，也会让 JSON 序列化失败
+    if f != f or f in (float("inf"), float("-inf")):
+        return None
+    return f
 
 
 def _load_csv(csv_path: Path) -> Dict[int, Dict[str, float]]:

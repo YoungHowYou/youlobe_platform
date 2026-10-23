@@ -13,6 +13,7 @@ API 文档:
 from contextlib import asynccontextmanager
 import os
 import sys
+from pathlib import Path
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -146,8 +147,25 @@ async def lifespan(app: FastAPI):
     if is_using_default_secret():
         print("  [!! 安全告警 !!] JWT_SECRET 未配置，正在使用编译进代码的默认密钥；")
         print("                    生产环境务必在 .env 中设置 JWT_SECRET=<随机长串>")
+
+    # ---- 日志轮转（logs/*.log 超限 copytruncate：不重启进程、不丢 append fd）----
+    from .services.log_rotation import LogRotationWorker, backups_info, log_dir_candidates
+
+    logs_dir = Path(__file__).resolve().parents[1] / "logs"
+    rotator = LogRotationWorker(
+        log_dir_candidates(logs_dir),
+        max_bytes=max(1, settings.LOG_MAX_MB) * 1024 * 1024,
+        backups=max(1, settings.LOG_BACKUP_COUNT),
+        interval_s=settings.LOG_ROTATE_INTERVAL_S,
+    )
+    rotator.start()
+    print(
+        f"  日志轮转: logs/*.log 上限 {settings.LOG_MAX_MB} MB × {settings.LOG_BACKUP_COUNT} 份"
+        f"（现有备份 {len(backups_info(logs_dir))} 个）"
+    )
     print("=" * 60)
     yield
+    rotator.stop()
 
 
 app = FastAPI(

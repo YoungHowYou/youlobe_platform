@@ -21,6 +21,7 @@ from sqlalchemy.orm import Session
 from ..config import settings
 from ..database import get_db
 from ..models.train_task import TrainTask
+from ..services.log_rotation import backups_info
 from ..tasks.train_task import training_dispatcher
 from .train import gpu_stats
 
@@ -88,13 +89,37 @@ def monitor_logs(
 
 @router.get("/status")
 def monitor_status(db: Session = Depends(get_db)):
-    """当前活动任务 + CPU/内存/磁盘/GPU/进程信息。"""
+    """当前活动任务 + 排队队列 + CPU/内存/磁盘/GPU/进程信息。"""
     tasks = (
         db.query(TrainTask)
-        .filter(TrainTask.status.in_(_ACTIVE_STATUS))
+        # pending 已单独归入 queue（它是“排队中”而不是“正在跑”），
+        # 否则训练进度卡片会把下一个待跑的任务当成当前任务。
+        .filter(TrainTask.status.in_([s for s in _ACTIVE_STATUS if s != "pending"]))
         .order_by(TrainTask.id.desc())
         .all()
     )
+
+    # ---- 排队队列（内存 FIFO，顺序就是即将执行的顺序）----
+    queue_ids = training_dispatcher.queue_snapshot()
+    queue: list[dict] = []
+    if queue_ids:
+        rows = {
+            t.id: t
+            for t in db.query(TrainTask).filter(TrainTask.id.in_(queue_ids)).all()
+        }
+        for pos, tid in enumerate(queue_ids, start=1):
+            t = rows.get(tid)
+            if t is None:
+                continue
+            queue.append({
+                "position": pos,
+                "id": t.id,
+                "project_id": t.project_id,
+                "task_name": t.task_name,
+                "epochs": t.epochs,
+                "model_name": (t.config or {}).get("model_name"),
+                "created_at": t.created_at.isoformat(timespec="seconds") if t.created_at else None,
+            })
 
     mem = psutil.virtual_memory()
     try:
@@ -112,6 +137,12 @@ def monitor_status(db: Session = Depends(get_db)):
                 "file": str(log.relative_to(_ROOT)) if log.is_relative_to(_ROOT) else str(log),
                 "size": st.st_size,
                 "mtime": datetime.fromtimestamp(st.st_mtime).isoformat(timespec="seconds"),
+                # 轮转信息：超过 max_bytes 会自动切成 <name>.1/.2…，保留 backup_count 份
+                "max_bytes": max(1, settings.LOG_MAX_MB) * 1024 * 1024,
+                "backup_count": max(1, settings.LOG_BACKUP_COUNT),
+                "backups": [
+                    {**b, "file": f"logs/{b['file']}"} for b in backups_info(_ROOT / "logs")
+                ],
             }
         except Exception:  # noqa: BLE001
             log_stat = None
@@ -150,6 +181,7 @@ def monitor_status(db: Session = Depends(get_db)):
     return {
         "now": now.isoformat(timespec="seconds"),
         "active_tasks": active_tasks,
+        "queue": queue,
         "dispatcher_task_id": training_dispatcher.current_task_id,
         "cpu_pct": psutil.cpu_percent(interval=None),
         "cpu_count": psutil.cpu_count(),

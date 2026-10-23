@@ -85,4 +85,10 @@ export const trainApi = {
 
   deleteTask: (taskId: number) =>
     api.delete(`/train/tasks/${taskId}`),
+
+  /** 清理已结束任务的中间产物（切图/数据集/epoch 快照；保留 best/last/results.csv） */
+  purgeIntermediates: (taskId: number) =>
+    api.post<{ ok: boolean; freed_mb: number; removed: string[]; message: string }>(
+      `/train/tasks/${taskId}/purge-intermediates`,
+    ),
 }

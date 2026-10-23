@@ -40,8 +40,11 @@ def create_train_task(
 
     # 将项目参数合并到训练配置中
     config = body.config.model_dump()
-    config["resize_h"] = project.resize_h
-    config["resize_w"] = project.resize_w
+    # 不再写 resize_h / resize_w：2026-10-22 起 seg/det/obb 都按原图分辨率 +
+    # crop_size/overlap 滑窗，这两个字段仅保留在 projects 表里做旧数据兼容。
+    # （写进 config 会让训练监控页/参数导出里多出一对实际不生效的值）
+    config.pop("resize_h", None)
+    config.pop("resize_w", None)
     config["crop_size"] = project.crop_size
     config["overlap"] = project.overlap
 
@@ -185,6 +188,35 @@ def get_epoch_logs(task_id: int, db: Session = Depends(get_db)):
     return rows
 
 
+@router.post("/train/tasks/{task_id}/purge-intermediates")
+def purge_task_intermediates_api(task_id: int, db: Session = Depends(get_db)):
+    """手动清理某个已结束任务的中间产物（切图 / 数据集 / epoch 快照）。
+
+    只删可再生的东西，保留 best.pt / last.pt / results.csv / args.yaml / plots /
+    exports，所以删除后：训练曲线仍可看、模型仍能导出与推理、仍可被继承训练。
+    """
+    task = db.query(TrainTask).filter(TrainTask.id == task_id).first()
+    if not task:
+        raise HTTPException(status_code=404, detail="任务不存在")
+    if task.status in ("pending", "preparing", "training", "stopping", "exporting"):
+        raise HTTPException(
+            status_code=400,
+            detail=f"任务正在运行（{task.status}），结束后才能清理中间产物",
+        )
+
+    from ..services.artifact_cleanup import purge_task_intermediates
+
+    result = purge_task_intermediates(task_id, task.output_dir)
+    log.info("purge_intermediates task=%s freed=%s MB", task_id, result.get("freed_mb"))
+    return {
+        "ok": True,
+        "task_id": task_id,
+        "freed_mb": result.get("freed_mb", 0),
+        "removed": result.get("removed", []),
+        "message": f"已清理 {len(result.get('removed', []))} 项，释放 {result.get('freed_mb', 0)} MB",
+    }
+
+
 @router.post("/train/tasks/{task_id}/cancel")
 def cancel_train_task(task_id: int, db: Session = Depends(get_db)):
     """友好取消训练任务。
@@ -286,11 +318,11 @@ def delete_train_task(task_id: int, db: Session = Depends(get_db)):
     else:
         run_dir = Path(settings.STORAGE_ROOT).resolve() / settings.RUNS_DIR / f"task_{task_id}"
 
-    export_paths: list[str] = [
-        e.export_path for e in db.query(ExportedModel)
-            .filter(ExportedModel.task_id == task_id, ExportedModel.export_path.isnot(None))
-            .all()
-    ]
+    export_records = (
+        db.query(ExportedModel).filter(ExportedModel.task_id == task_id).all()
+    )
+    export_paths: list[str] = [e.export_path for e in export_records if e.export_path]
+    export_ids: list[int] = [e.id for e in export_records]
     inference_paths: list[str] = []
     for r in db.query(InferenceResult).filter(InferenceResult.task_id == task_id).all():
         for p in (r.original_path, r.overlay_path, r.overlay_morph_path, r.mask_path):
@@ -302,33 +334,25 @@ def delete_train_task(task_id: int, db: Session = Depends(get_db)):
     db.delete(task)
     db.commit()
 
-    storage_root = Path(settings.STORAGE_ROOT).resolve()
-    runs_root = (storage_root / settings.RUNS_DIR).resolve()
-    try:
-        if run_dir and run_dir.exists() and run_dir.resolve().is_relative_to(runs_root):
-            shutil.rmtree(str(run_dir), ignore_errors=True)
-    except Exception:
-        log.exception("delete_train_task: failed to rm run_dir %s", run_dir)
+    # ---- 磁盘清理（统一走 artifact_cleanup，覆盖切图/日志/中间产物/导出/推理图）----
+    from ..services.artifact_cleanup import (
+        remove_download_zip_cache,
+        remove_inference_files,
+        remove_path,
+        remove_tree,
+        runs_root,
+        storage_root,
+    )
+
+    removed_dir = remove_tree(run_dir, runs_root())
     for ep_str in export_paths:
-        try:
-            ep = Path(ep_str).resolve()
-            if ep.exists() and ep.is_relative_to(storage_root):
-                if ep.is_file():
-                    ep.unlink(missing_ok=True)
-                elif ep.is_dir():
-                    shutil.rmtree(str(ep), ignore_errors=True)
-        except Exception:
-            log.exception("delete_train_task: failed to rm export %s", ep_str)
-    for url in inference_paths:
-        try:
-            rel = url.replace("/static/storage/", "", 1).lstrip("/\\")
-            if not rel:
-                continue
-            target = (storage_root / rel).resolve()
-            if target.exists() and target.is_relative_to(storage_root):
-                target.unlink(missing_ok=True)
-        except Exception:
-            log.exception("delete_train_task: failed to rm inference file %s", url)
+        remove_path(ep_str, storage_root())
+    removed_infer = remove_inference_files(inference_paths)
+    removed_zip = remove_download_zip_cache(export_ids)
+    log.info(
+        "delete_train_task %s: run_dir=%s exports=%s inference=%s zip_cache=%s",
+        task_id, removed_dir, len(export_paths), removed_infer, removed_zip,
+    )
 
 
 @router.get("/projects/{project_id}/train/completed-tasks")

@@ -58,7 +58,8 @@ uvicorn 没开 `--reload`，必须手动 kill PID + 重启。重启会把未跑�
 cls 标签存 `images.class_id`（图级），其他 task 标签存 `annotations.polygon`（实例级）。
 
 > **seg/det/obb 从 2026-10-22 起不再统一缩放**：数据集准备直接读原图（需要形态学时在整图做三通道），
-> 再按 `crop_size` / `overlap` 滑窗。`projects.resize_h/w` 仅保留字段兼容，**不再参与训练**；
+> 再按 `crop_size` / `overlap` 滑窗。`projects.resize_h/w` 仅保留字段兼容，**不再参与训练**，
+> 且训练任务的 `config` 里也不再写入这两个字段（2026-10-23 清理，训练监控页/参数导出不再出现“假的 Resize”）；
 > 小于 `crop_size` 的图用 0 填充到窗口尺寸。推理端小图同样走 pad（不 resize），「长边缩放」建议保持 0。
 > 切片标签规则：seg 保留顶点落在窗内的多边形；det/obb 只保留**中心落在窗内**的目标（det 裁成窗口内 bbox，obb 把 4 点裁到窗口），切片后过小的目标丢弃。
 >
@@ -174,11 +175,48 @@ PUT  /api/projects/{id}/images/batch-class    cls 批量打分类标签
 - 矩形/圆形不支持旋转（`rotateSelectedBy` 直接提示），需要斜置矩形请用多边形工具。
 - 老库迁移：`server/database.py::_ensure_columns()` 启动时用 `PRAGMA table_info` 比对并 `ALTER TABLE ... ADD COLUMN`（幂等），新增字段往这个清单里追加即可；新列必须可空或带默认值。
 
+## 存储产物与删除口径（2026-10-23 统一收口）
+
+磁盘产物都在这几处，**删除项目 / 删除训练任务必须走 `server/services/artifact_cleanup.py`**：
+
+| 产物 | 路径 | 归属 |
+|---|---|---|
+| 原图 + thumbs | `storage/uploads/<pid>/` | 项目 |
+| raw / preprocessed / cropped / dataset / runs(train) | `storage/runs/task_<id>/` | 任务 |
+| 导出模型（ONNX/OpenVINO 目录） | `<task>/runs/train/exports/`（路径登记在 `exported_models.export_path`） | 任务 |
+| 推理可视化图 | `storage/runs/inference/<id>_*.png` | 任务 |
+| 导出模型下载缓存 | `<tmp>/model_downloads/<name>_id<record>.zip` | 任务 |
+| 服务日志 | `logs/backend.log`（全局，不随项目/任务删） | — |
+
+**日志轮转**（`server/services/log_rotation.py`，默认 20 MB × 5 份，`config/.env` 可用 `LOG_MAX_MB` / `LOG_BACKUP_COUNT` / `LOG_ROTATE_INTERVAL_S` 覆盖）：
+
+- shell 重定向到 `logs/backend.log` 的情况用 **copytruncate**（拷成 `.1` → 旧的顺移 → 截断原文件），append fd 不用重开，进程无需重启。
+- Windows 服务的 `logs/service.log` 由 `RotatingFileHandler` 自己转，worker 会识别 handler 的 `baseFilename` 并跳过，不会双重轮转。
+- 运行监控页显示当前日志大小 + 轮转上限/份数/已有备份数。
+
+- 删除项目会额外做**孤儿兜底**：`runs/task_<n>` / `uploads/<pid>` 里 DB 已无对应行的目录一并清掉（之前删失败的残留不会永久占盘）。
+- 手动清理：`.venv/bin/python tools/audit_storage.py --purge-orphan-files --yes`（孤儿目录 + 推理图 + 下载缓存）。
+
+### 训练中间产物（可自动回收）
+
+训练结束（`completed` / `cancelled`）后会自动删掉**可再生**的大体积中间产物：
+`raw/`、`preprocessed/`、`cropped/`、`dataset/`、`dataset.yaml`、`runs/*/weights/epoch*.pt`、`labels.cache`；
+**保留** `best.pt` / `last.pt`（继承训练、导出、在线推理）、`results.csv`（曲线回填）、
+`args.yaml`、`plots`、`exports/`、batch 预览图。
+
+- 开关：`server/config.py` 的 `TRAIN_AUTO_PURGE_INTERMEDIATES`（`.env` 写 `False` 可关闭）。
+- `failed` 任务不自动清（方便排查切片/标签问题），可手动清：
+  训练监控页每行「清理中间产物」，或 `POST /api/train/tasks/{id}/purge-intermediates`。
+- 实现：`server/services/artifact_cleanup.py::purge_task_intermediates`。
+
 ## 训练曲线（train_epoch_logs）
 
 - `core/train.py` 的 `on_fit_epoch_end` 从 `trainer.tloss` 取训练集 loss。**ultralytics 8.3+ 里 `tloss` / `loss_items` 是 `{loss名: Tensor}` 的 dict**（老版是 Tensor 列表），按 Tensor 处理会静默失败 → `train_*_loss` 恒为 NULL、前端 Loss 曲线只剩 Val。
 - YOLO26 的 loss 项是 `box/seg/cls/l1/sem`（**没有 dfl**），库里只存 box/seg/cls/dfl，所以前端 Loss 图按实际有数据的项动态渲染（不再出现空的 DFL 图）。
 - `results.csv` 的 `epoch` 从 **1** 开始，而库里 `train_epoch_logs.epoch` 是 `trainer.epoch`（0 基）：回填/对齐必须 **-1**。
+- **曲线断线的两个真因**（2026-10-23 修复）：
+  1. 训练结束后 ultralytics 用 best.pt 再做一次 final val，此时 `trainer.epoch` 已自增到 `epochs`、`tloss` 还是最后一轮的值 → 早年会多写一条越界 epoch 行（曲线尾部多一个点、`current_epoch` 比 epochs 大 1 显示 110%）。现在 `ep >= total_epochs` 的回调直接忽略，且 upsert 不用 None 覆盖已有值。
+  2. 某些 epoch 的 val loss 在 ultralytics 里是 `nan`（发散/未计算），入库变 NULL → 曲线中间断。现在 nan/inf 统一归为 SQL NULL，前端 `connectNulls: true` 跨空值连直线。
 - 历史数据补全：`tools/backfill_epoch_logs.py`（已修正 -1 偏移）；接口层另有 `server/services/epoch_csv.py::fill_missing_train_loss`，读 `/train/tasks/{id}/epochs` 时从 `results.csv` 只补 NULL，不覆盖已有值。
 - 验证指标（precision/recall/mAP、cls 的 top1/top5）**只有验证集**——ultralytics 每轮只在 val 集上评估，不存在训练集指标曲线。
 
@@ -211,9 +249,14 @@ PUT  /api/projects/{id}/images/batch-class    cls 批量打分类标签
 
 ## 训练并发模型（2026-09 去除 Celery 后）
 
-- 训练在 uvicorn 进程内的**守护线程**执行（`TrainingDispatcher` 单例，同一时间只允许一个任务；第二个任务返回 409 并回滚记录）。
-- 创建任务先 `db.commit()` 再 `dispatcher.start()`，启动失败会删除任务记录，不会留僵尸 pending（旧 Celery 文件队列的"永久排队"问题随之消除）。
+- 训练在 uvicorn 进程内的**守护线程**执行（`TrainingDispatcher` 单例，同一时间只允许一个任务在跑）。
+- **支持排队（FIFO）**：已有任务在跑时提交新任务不再报 409，而是进入内存队列（DB 里保持 `status='pending'`，接口返回 `queue_position`）；当前任务收尾后自动启动队列里的下一个。
+  - 出队前会重新查库：任务被删 / 已被取消 / 状态已变 → 直接跳过，不会带着陈旧状态开跑。
+  - 取消排队中的任务 = 从队列摘掉（立即生效，`finished_at` 当场写）；排队任务也可直接删除（`drop_queued` 后再删）。
+  - 队列只在内存里：进程重启后 `main.py` lifespan 把遗留的 `pending` 标为 failed（错误信息提示“排队任务未开始执行，请重新创建”）。
+- 创建任务先 `db.commit()` 再 `dispatcher.start()`。
 - 取消仍是查库软取消（`cancel_check`），约 20 秒内于 epoch 边界生效；**不要**直接 kill 训练线程，会截断 best.pt 写盘。
+- 回归测试：`.venv/bin/python -m unittest tests.test_training_queue -v`（假流水线，验证 FIFO、去重、退队、自动续跑）。
 
 ---
 

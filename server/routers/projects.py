@@ -32,6 +32,7 @@ from ..services.project_package import (
     import_full_project_from_zip,
 )
 from ..services.project_convert import convert_project_task_type
+from ..services.artifact_cleanup import task_dir
 
 router = APIRouter(prefix="/api/projects", tags=["项目管理"])
 
@@ -187,17 +188,17 @@ def delete_project(project_id: int, db: Session = Depends(get_db)):
 
     # 先抓出磁盘上要清的路径（DB 删完后就查不到 task_id 了）
     upload_dir = settings.upload_path / str(project_id)
-    train_dirs: list[Path] = []
-    export_paths: list[str] = []
-    inference_paths: list[str] = []
     task_ids: list[int] = []
+    task_dirs: list[Path] = []
+    export_paths: list[str] = []
+    export_ids: list[int] = []
+    inference_paths: list[str] = []
     for t in db.query(TrainTask).filter(TrainTask.project_id == project_id).all():
         task_ids.append(t.id)
-        run_root = Path(settings.STORAGE_ROOT).resolve() / settings.RUNS_DIR / f"task_{t.id}"
-        if run_root.exists():
-            train_dirs.append(run_root)
+        task_dirs.append(task_dir(t.id, t.output_dir))
     if task_ids:
         for e in db.query(ExportedModel).filter(ExportedModel.task_id.in_(task_ids)).all():
+            export_ids.append(e.id)
             if e.export_path:
                 export_paths.append(e.export_path)
     for r in db.query(InferenceResult).filter(InferenceResult.project_id == project_id).all():
@@ -213,43 +214,38 @@ def delete_project(project_id: int, db: Session = Depends(get_db)):
     db.delete(project)
     db.commit()
 
+    # ---- 磁盘清理：统一走 artifact_cleanup（切图/日志/中间产物/导出/推理图/下载缓存）----
+    from ..services.artifact_cleanup import (
+        remove_download_zip_cache,
+        remove_inference_files,
+        remove_path,
+        remove_tree,
+        runs_root,
+        storage_root,
+        sweep_orphan_task_dirs,
+        sweep_orphan_upload_dirs,
+        uploads_root,
+    )
+
     # 磁盘清理失败不回滚 DB —— DB 已经一致，文件残留下次再清比 DB 半残更可控
-    upload_root = settings.upload_path.resolve()
-    storage_root = Path(settings.STORAGE_ROOT).resolve()
-    runs_root = (storage_root / settings.RUNS_DIR).resolve()
-    try:
-        if upload_dir.exists() and upload_dir.resolve().is_relative_to(upload_root):
-            shutil.rmtree(str(upload_dir), ignore_errors=True)
-    except Exception:
-        log.exception("delete_project: failed to rm upload_dir %s", upload_dir)
-    for d in train_dirs:
-        try:
-            if d.resolve().is_relative_to(runs_root):
-                shutil.rmtree(str(d), ignore_errors=True)
-        except Exception:
-            log.exception("delete_project: failed to rm train_dir %s", d)
-    # 导出的模型文件（可能在 storage 外，比如直接复制到了别处）
+    remove_tree(upload_dir, uploads_root())
+    for d in task_dirs:
+        remove_tree(d, runs_root())
     for ep_str in export_paths:
-        try:
-            ep = Path(ep_str).resolve()
-            if ep.exists() and ep.is_relative_to(storage_root):
-                if ep.is_file():
-                    ep.unlink(missing_ok=True)
-                elif ep.is_dir():
-                    shutil.rmtree(str(ep), ignore_errors=True)
-        except Exception:
-            log.exception("delete_project: failed to rm export %s", ep_str)
-    # 推断结果图片（在 /static/storage/runs/inference/ 下）
-    for url in inference_paths:
-        try:
-            rel = url.replace("/static/storage/", "", 1).lstrip("/\\")
-            if not rel:
-                continue
-            target = (storage_root / rel).resolve()
-            if target.exists() and target.is_relative_to(storage_root):
-                target.unlink(missing_ok=True)
-        except Exception:
-            log.exception("delete_project: failed to rm inference file %s", url)
+        remove_path(ep_str, storage_root())
+    removed_infer = remove_inference_files(inference_paths)
+    removed_zip = remove_download_zip_cache(export_ids)
+
+    # 历史残留兜底：DB 里已没有对应行的 task_<n> / uploads/<pid> 目录一起收掉，
+    # 否则「删过但当时删失败」的目录会永久占盘（本项目刚删，这里连带清全库孤儿）
+    alive_tasks = [row[0] for row in db.query(TrainTask.id).all()]
+    alive_projects = [row[0] for row in db.query(Project.id).all()]
+    orphan_tasks = sweep_orphan_task_dirs(alive_tasks)
+    orphan_uploads = sweep_orphan_upload_dirs(alive_projects)
+    log.info(
+        "delete_project %s: tasks=%s inference=%s zip_cache=%s orphan_tasks=%s orphan_uploads=%s",
+        project_id, len(task_ids), removed_infer, removed_zip, orphan_tasks, orphan_uploads,
+    )
 
 
 @router.get("/{project_id}/export-package")

@@ -88,6 +88,35 @@ def _format_training_failure(exc: Exception, config: dict, trace_text: str) -> s
     return f"{guidance}\n\n技术详情：\n{detail}"
 
 
+def _purge_intermediates_if_needed(db, task_id: int) -> None:
+    """训练结束（completed / cancelled）后清掉可再生的大体积中间产物。
+
+    删：raw / preprocessed / cropped / dataset / dataset.yaml、
+        weights/epoch*.pt（周期性快照，动辄几百 MB）、labels.cache
+    留：best.pt / last.pt（继承训练、导出、在线推理都要）、
+        results.csv（训练曲线回填）、args.yaml、plots、exports/
+    failed 任务不自动清，方便排查数据集/标签问题；需要时用手动接口或
+    tools/cleanup_storage.py 清理。
+    """
+    from ..config import settings
+
+    if not getattr(settings, "TRAIN_AUTO_PURGE_INTERMEDIATES", True):
+        return
+
+    task = db.query(TrainTask).filter(TrainTask.id == task_id).first()
+    if task is None or task.status not in ("completed", "cancelled"):
+        return
+
+    from ..services.artifact_cleanup import purge_task_intermediates
+
+    res = purge_task_intermediates(task_id, task.output_dir)
+    if res.get("removed"):
+        print(
+            f"[训练任务] Task#{task_id} 已清理中间产物 {len(res['removed'])} 项，"
+            f"释放 {res['freed_mb']} MB（保留 best/last/results.csv/plots/exports）"
+        )
+
+
 def _release_training_resources() -> None:
     """训练宿主进程常驻，任务结束后显式回收内存缓存。"""
     import gc
@@ -208,8 +237,8 @@ def run_training_pipeline(task_id: int) -> dict:
                 project_id=project_id,
                 task_output_dir=str(task_dir),
                 db=db,
-                target_h=config.get("resize_h", 2048),
-                target_w=config.get("resize_w", 2048),
+                # target_h / target_w 不传：图像不再缩放（2026-10-22 起按原图 + 滑窗），
+                # 该参数仅为函数签名兼容保留，传了也不生效。
                 crop_size=config.get("crop_size", 640),
                 overlap=config.get("overlap", 0.2),
                 train_ratio=config.get("train_ratio", 0.8),
@@ -338,6 +367,15 @@ def run_training_pipeline(task_id: int) -> dict:
             """
             try:
                 ep = data.get("epoch", 0)
+                total_ep = int(data.get("total_epochs") or 0)
+
+                # 训练结束后 ultralytics 会用 best.pt 再做一次 final val：
+                # 此时 trainer.epoch 已经自增到 epochs（超出真实轮次），
+                # 且 trainer.tloss 仍是最后一轮的值。若照常落库就会多一条
+                # “重复最后一轮”的 epoch 行：曲线尾部多一个点、current_epoch 比
+                # epochs 大 1（界面 110%）。这里直接忽略越界的回调。
+                if total_ep and ep >= total_ep:
+                    return
 
                 # ---- upsert epoch 日志 ----
                 existing = (
@@ -351,6 +389,12 @@ def run_training_pipeline(task_id: int) -> dict:
                     data["train_cls_loss"] = data["train_loss"]
                 if data.get("val_loss") is not None and data.get("val_cls_loss") is None:
                     data["val_cls_loss"] = data["val_loss"]
+
+                # ultralytics 某些 epoch 会写出 nan（val loss 未算出来 / 发散），
+                # 直接入库会变成 NULL，前端曲线就在那里断开。统一当空值处理。
+                for _k, _v in list(data.items()):
+                    if isinstance(_v, float) and (_v != _v or _v in (float("inf"), float("-inf"))):
+                        data[_k] = None
 
                 fields = dict(
                     train_box_loss=data.get("train_box_loss"),
@@ -372,10 +416,27 @@ def run_training_pipeline(task_id: int) -> dict:
                     lr=data.get("lr"),
                 )
                 if existing is not None:
-                    # 已存在则覆盖（final val 会触发同 epoch 的二次回调，用最新值覆盖）
+                    # final val 会触发同 epoch 的二次回调，用最新值覆盖；
+                    # 但**不能用 None 覆盖已有值**：训练结束后的那次 final val 里
+                    # trainer.tloss 已经是 None，照直覆盖会把最后一轮真实的
+                    # train_loss 抹掉 → 前端 Loss 曲线最后一截断掉。
                     for k, v in fields.items():
+                        if v is None and getattr(existing, k, None) is not None:
+                            continue
                         setattr(existing, k, v)
                 else:
+                    # 训练结束后 ultralytics 会用 best.pt 再做一次 final val，
+                    # 此时 trainer.tloss 为 None、epoch 却已自增，如果照常插入就会多出
+                    # 一条“只有验证指标、没有训练 loss”的空 epoch 行：
+                    #   - 曲线尾部多一个断点
+                    #   - current_epoch 会比 epochs 大 1（界面出现 110%）
+                    # 这种纯验证的回调只用来刷 best 指标，不建新行。
+                    has_train_loss = any(
+                        fields.get(k) is not None
+                        for k in ("train_box_loss", "train_seg_loss", "train_cls_loss", "train_dfl_loss")
+                    )
+                    if not has_train_loss:
+                        return
                     db.add(TrainEpochLog(task_id=task_id, epoch=ep, **fields))
 
                 # ---- 更新任务进度 + best 指标 ----
@@ -561,6 +622,13 @@ def run_training_pipeline(task_id: int) -> dict:
         return {"status": "failed", "error": str(e)}
 
     finally:
+        # 训练结束后清掉可再生的中间产物（切图 / 数据集 / epoch 快照），
+        # 保留 best.pt / last.pt / results.csv / args.yaml / plots / exports。
+        # failed 不自动清，方便排查；completed / cancelled 才清。
+        try:
+            _purge_intermediates_if_needed(db, task_id)
+        except Exception as exc:       # noqa: BLE001 - 清理失败不影响训练结果
+            print(f"[训练任务] Task#{task_id} 中间产物清理失败: {exc}")
         try:
             db.close()
         finally:

@@ -29,6 +29,17 @@ class Settings(BaseSettings):
     DEBUG: bool = True
     CORS_ORIGINS: list[str] = ["http://localhost:5173", "http://localhost:3000", "http://localhost:80"]
 
+    # ---- 日志轮转（logs/*.log，copytruncate）----
+    LOG_MAX_MB: int = 20          # 单个日志文件超过这个大小就转
+    LOG_BACKUP_COUNT: int = 5     # 保留几份 .1 / .2 …
+    LOG_ROTATE_INTERVAL_S: int = 60
+
+    # ---- 训练中间产物 ----
+    # 训练结束（completed/cancelled）后自动删 raw/preprocessed/cropped/dataset
+    # 与 weights/epochN.pt（保留 best.pt/last.pt/results.csv/args.yaml/plots/exports）；
+    # 想保留现场调试就设 TRAIN_AUTO_PURGE_INTERMEDIATES=False
+    TRAIN_AUTO_PURGE_INTERMEDIATES: bool = True
+
     # ---- Offline license ----
     LABELYOU_LICENSE_REQUIRED: bool = False
     LABELYOU_LICENSE_FILE: str = "config/license.dat"

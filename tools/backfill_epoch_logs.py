@@ -65,9 +65,14 @@ FLOAT_MAP = {
 
 def _to_float(v):
     try:
-        return float(v)
+        f = float(v)
     except (TypeError, ValueError):
         return None
+    # ultralytics 的 results.csv 会写入 nan（val loss 未算 / 发散）；
+    # float('nan') 入库后会变成 NULL，前端曲线就断开，这里统一当空值
+    if f != f or f in (float("inf"), float("-inf")):
+        return None
+    return f
 
 
 def find_results_csv(task: TrainTask) -> Path | None:

@@ -52,11 +52,11 @@
           <el-input v-model="description" type="textarea" :rows="2" />
         </el-form-item>
         <template v-if="taskType === 'seg'">
-          <el-form-item label="Resize 高">
-            <el-input-number v-model="resizeH" :min="640" :step="256" />
-          </el-form-item>
-          <el-form-item label="Resize 宽">
-            <el-input-number v-model="resizeW" :min="640" :step="256" />
+          <el-form-item label="图像尺寸">
+            <div class="hint" style="line-height:1.6">
+              分割项目不再做 Resize：训练直接按<b>原图分辨率</b> + 重叠滑窗切割。
+              滑窗窗口（切割尺寸）与重叠率在项目详情里调，默认 640 / 0.2。
+            </div>
           </el-form-item>
         </template>
         <template v-else-if="taskType === 'det' || taskType === 'obb'">
