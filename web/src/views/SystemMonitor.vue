@@ -119,9 +119,19 @@
       </el-col>
       <el-col :span="6">
         <el-card shadow="never" class="res-card">
-          <div class="res-title">磁盘（storage）</div>
-          <div class="res-line">剩余 <b>{{ status.disk ? status.disk.free_gb + ' GB' : '-' }}</b></div>
-          <div class="res-line muted">总计 {{ status.disk ? status.disk.total_gb + ' GB' : '-' }}</div>
+          <div class="res-title">磁盘（剩余 / 总量）</div>
+          <div class="res-line">
+            原图·导出 <b>{{ status.disk ? status.disk.free_gb + ' GB' : '-' }}</b>
+            <span class="muted">/ {{ status.disk ? status.disk.total_gb + ' GB' : '-' }}</span>
+          </div>
+          <div class="res-line">
+            训练盘 <b>{{ status.disk_runs ? status.disk_runs.free_gb + ' GB' : '-' }}</b>
+            <span class="muted">/ {{ status.disk_runs ? status.disk_runs.total_gb + ' GB' : '-' }}</span>
+          </div>
+          <div class="res-line">
+            归档盘 <b>{{ status.disk_archive ? status.disk_archive.free_gb + ' GB' : '-' }}</b>
+            <span class="muted">/ {{ status.disk_archive ? status.disk_archive.total_gb + ' GB' : '-' }}</span>
+          </div>
         </el-card>
       </el-col>
       <el-col :span="6">
@@ -248,6 +258,13 @@ interface QueueItem {
   created_at: string | null
 }
 
+interface DiskInfo {
+  free_gb: number
+  total_gb: number
+  used_gb?: number
+  path?: string
+}
+
 interface StatusPayload {
   now: string
   active_tasks: ActiveTask[]
@@ -256,7 +273,9 @@ interface StatusPayload {
   cpu_pct: number | null
   cpu_count: number | null
   mem: { used_mb: number; total_mb: number; pct: number } | null
-  disk: { free_gb: number; total_gb: number } | null
+  disk: DiskInfo | null
+  disk_runs?: DiskInfo | null
+  disk_archive?: DiskInfo | null
   process: { pid: number; uptime_s: number; rss_mb: number } | null
   gpu: { available: boolean; sampled_at?: string | null; gpus: GpuStat[] } | null
   log: LogInfo | null

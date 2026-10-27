@@ -309,17 +309,12 @@ def delete_export(export_id: int, db: Session = Depends(get_db)):
     db.delete(record)
     db.commit()
 
-    # 限制只删除 STORAGE_ROOT 内的路径，防止 DB 被改后误删任意文件
+    # 导出目录可能在训练任务目录里（SSD 或已归档的 HDD），由 remove_any 自动判定根，
+    # 同时防止 DB 被改后误删已知根之外的任意文件
     if ep_str:
         try:
-            ep = Path(ep_str).resolve()
-            storage_root = Path(settings.STORAGE_ROOT).resolve()
-            if ep.exists() and ep.is_relative_to(storage_root):
-                if ep.is_file():
-                    ep.unlink(missing_ok=True)
-                elif ep.is_dir():
-                    import shutil
-                    shutil.rmtree(str(ep), ignore_errors=True)
+            from ..services.artifact_cleanup import remove_any
+            remove_any(ep_str)
         except Exception:
             # 删 DB 已成功，盘上残留不致命
             pass

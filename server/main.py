@@ -163,6 +163,18 @@ async def lifespan(app: FastAPI):
         f"  日志轮转: logs/*.log 上限 {settings.LOG_MAX_MB} MB × {settings.LOG_BACKUP_COUNT} 份"
         f"（现有备份 {len(backups_info(logs_dir))} 个）"
     )
+
+    # ---- 数据库定期备份到归档盘（原图在机械盘、DB 在 SSD 时的兜底）----
+    try:
+        from .services.db_backup import start_background_backup
+
+        start_background_backup()
+    except Exception as _e:  # noqa: BLE001 - 备份失败不影响服务启动
+        print(f"[WARN] 数据库备份未启动: {_e}")
+
+    # ---- 存储分布（方便确认挂载是否正常）----
+    print(f"  原图/导出: {settings.upload_path.parent}  |  训练工作区: {settings.runs_path}")
+    print(f"  训练归档: {settings.archive_path}")
     print("=" * 60)
     yield
     rotator.stop()

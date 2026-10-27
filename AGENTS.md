@@ -209,6 +209,28 @@ PUT  /api/projects/{id}/images/batch-class    cls 批量打分类标签
   训练监控页每行「清理中间产物」，或 `POST /api/train/tasks/{id}/purge-intermediates`。
 - 实现：`server/services/artifact_cleanup.py::purge_task_intermediates`。
 
+## 存储分层（Linux 多盘部署，2026-10-27）
+
+本机按性能把产物分到三块盘，`.env` 用绝对路径指定（`UPLOAD_DIR / DATASET_DIR / RUNS_DIR / EXPORT_DIR / ARCHIVE_DIR` 都支持绝对路径，判定逻辑在 `Settings._resolve_dir()`）：
+
+| 用途 | 路径（`.env` 键） | 设备 / 文件系统 |
+|---|---|---|
+| 原图 + thumbs、datasets、exports | `/data/hdd/youlobe/storage`（`STORAGE_ROOT`） | `/dev/sda1` 916G ext4（机械盘） |
+| 训练工作区 raw/preprocessed/cropped/dataset/runs、推理图 | `/data/ssd/youlobe/runs`（`RUNS_DIR`） | `/dev/nvme0n1p1` 117G ext4（NVMe） |
+| 训练结果归档 `task_<id>`、DB 备份 | `/data/hdd/youlobe/archive`（`ARCHIVE_DIR`） | 机械盘 |
+| SQLite `app.db` + WAL | `/data/ssd/youlobe/db/app.db`（`DATABASE_URL`） | NVMe ext4（WAL 更稳） |
+| 系统盘 | `/`（LVM on nvme1n1） | 232G ext4，只放代码/venv |
+
+- **训练结束自动归档**：`server/tasks/train_task.py` 的 `finally` 先 `_purge_intermediates_if_needed()` 清中间产物，再 `_archive_task_if_needed()` 把整个 `task_<id>` 目录 `shutil.move` 到 `<ARCHIVE_DIR>/task_<id>`，然后用 `artifact_cleanup.relocate_task_paths()` 回写 `train_tasks.output_dir / best_model_path / last_model_path / export_path` 与 `exported_models.export_path`。所以归档后在线推理、模型导出、继承训练都照常可用（读的是 DB 里的绝对路径）。`TRAIN_AUTO_ARCHIVE=False` 可关闭。
+- **删除路径收口**：`artifact_cleanup.remove_any() / remove_tree_any()` 自动判定 runs / archive / storage 三个根，归档到机械盘的任务也能删干净；`sweep_orphan_archive_dirs()` 兜底清归档盘上的孤儿目录（`db_backups/` 不动）。
+- **磁盘监控**：`GET /api/monitor/status` 返回 `disk`（原图盘）、`disk_runs`（训练盘）、`disk_archive`（归档盘）。
+- **数据库自动备份**：`server/services/db_backup.py` 启动即备份一份，之后每 `DB_BACKUP_INTERVAL_H` 小时用 sqlite3 online backup API 写到 `<ARCHIVE_DIR>/db_backups/app-<时间>.db`，保留 `DB_BACKUP_KEEP` 份（默认 6h / 14 份）。
+- **挂载持久化**：`/etc/fstab` 两条 UUID（`nofail,x-systemd.device-timeout=10s`）；drop-in `/etc/systemd/system/labelyou-backend.service.d/storage.conf` 用 `RequiresMountsFor=/data/ssd /data/hdd`，盘没挂上就不起服务（避免把数据写进根分区）。
+- **换盘/迁移步骤**：`systemctl stop labelyou-backend` → 挂新盘 → `uploads/` 拷到 `STORAGE_ROOT/uploads`、`task_*` 拷到 `ARCHIVE_DIR/task_*` → 用 `archive_task()`/`relocate_task_paths()`（或 SQL `replace()`）改 DB 绝对路径 → `systemctl start labelyou-backend`。
+- 迁移时的项目内副本（`storage.old-20261027/`，约 890M）已逐文件核对一致后删除，仓库根只剩空的 `storage/` 占位目录（默认配置回退用）。
+- 回归测试：`.venv/bin/python -m unittest tests.test_storage_layout -v`。
+- 存储体检：`.venv/bin/python tools/audit_storage.py`（现在会把 archive 一起统计）。
+
 ## 训练曲线（train_epoch_logs）
 
 - `core/train.py` 的 `on_fit_epoch_end` 从 `trainer.tloss` 取训练集 loss。**ultralytics 8.3+ 里 `tloss` / `loss_items` 是 `{loss名: Tensor}` 的 dict**（老版是 Tensor 列表），按 Tensor 处理会静默失败 → `train_*_loss` 恒为 NULL、前端 Loss 曲线只剩 Val。
@@ -317,7 +339,9 @@ PUT  /api/projects/{id}/images/batch-class    cls 批量打分类标签
 ## 数据库
 
 ```
-SQLite 本地文件：<STORAGE_ROOT>/app.db（默认 storage/app.db，首次启动自动建表）
+SQLite 本地文件：默认 <STORAGE_ROOT>/app.db；本机 `.env` 用 DATABASE_URL 指到 SSD
+（`/data/ssd/youlobe/db/app.db`），并由 `server/services/db_backup.py` 定期备份到
+`<ARCHIVE_DIR>/db_backups/`
 ```
 
 - WAL 模式 + busy_timeout=30s：训练线程写 epoch 日志不阻塞 API 读。

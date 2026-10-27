@@ -1047,20 +1047,24 @@ def list_history(project_id: int = Query(default=0), page: int = Query(default=1
 
 def _url_to_disk(url: str) -> Path | None:
     """
-    把 /static/storage/... URL 反解成磁盘路径，并强制约束在 STORAGE_ROOT 内。
-    URL 通常来自 DB 中我们自己写入的值，但加一层 resolve + is_relative_to
+    把 /static/storage/... URL 反解成磁盘路径。
+
+    `/static/storage` 挂载的是 RUNS_DIR 的父目录（推理图在 <RUNS>/inference/），
+    同时兼容 STORAGE_ROOT 下的相对路径；两个根都做 resolve + is_relative_to 校验，
     防止 DB 被篡改时通过路径穿越触发任意文件删除。
     """
-    root = Path(settings.STORAGE_ROOT).resolve()
     rel = url.replace("/static/storage/", "", 1).lstrip("/\\")
     if not rel:
         return None
-    target = (root / rel).resolve()
-    try:
-        target.relative_to(root)
-    except ValueError:
-        return None
-    return target
+    roots = [Path(settings.runs_path).resolve().parent, Path(settings.STORAGE_ROOT).resolve()]
+    for root in roots:
+        target = (root / rel).resolve()
+        try:
+            target.relative_to(root)
+        except ValueError:
+            continue
+        return target
+    return None
 
 
 @router.delete("/history/{rid}")

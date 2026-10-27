@@ -23,6 +23,9 @@ storage/exports/*
 storage/app.db
 storage/app.db-shm
 storage/app.db-wal
+# 存储迁移后留下的一次性副本（确认无误后可删）
+storage.old-*/
+storage_old_*/
 
 # 运行时文件
 backend.pid

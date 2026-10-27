@@ -122,10 +122,23 @@ def monitor_status(db: Session = Depends(get_db)):
             })
 
     mem = psutil.virtual_memory()
-    try:
-        disk = psutil.disk_usage(str(settings.STORAGE_ROOT))
-    except Exception:  # noqa: BLE001
-        disk = None
+
+    def _disk_usage(path) -> dict | None:
+        try:
+            d = psutil.disk_usage(str(path))
+            return {
+                "free_gb": round(d.free / 1024 ** 3, 1),
+                "total_gb": round(d.total / 1024 ** 3, 1),
+                "used_gb": round(d.used / 1024 ** 3, 1),
+                "path": str(path),
+            }
+        except Exception:  # noqa: BLE001
+            return None
+
+    # 三块盘可能各自独立：原图/导出（storage）、训练工作区（runs）、训练归档（archive）
+    disk = _disk_usage(settings.STORAGE_ROOT)
+    disk_runs = _disk_usage(settings.runs_path)
+    disk_archive = _disk_usage(settings.archive_path)
 
     proc = psutil.Process(os.getpid())
     log = _log_path()
@@ -190,11 +203,9 @@ def monitor_status(db: Session = Depends(get_db)):
             "total_mb": round(mem.total / 1024 / 1024),
             "pct": mem.percent,
         },
-        "disk": (
-            {"free_gb": round(disk.free / 1024 ** 3, 1), "total_gb": round(disk.total / 1024 ** 3, 1)}
-            if disk
-            else None
-        ),
+        "disk": disk,
+        "disk_runs": disk_runs,
+        "disk_archive": disk_archive,
         "process": {
             "pid": proc.pid,
             "uptime_s": int(time.time() - proc.create_time()),

@@ -26,7 +26,10 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-STORAGE = ROOT / "storage"
+from server.config import settings  # noqa: E402  路径以后端配置为准（支持 runs 放在另一块盘）
+
+STORAGE = Path(settings.STORAGE_ROOT).resolve()
+RUNS = settings.runs_path
 
 
 def fmt_size(b: int) -> str:
@@ -47,7 +50,7 @@ def collect_targets():
     groups = []
 
     # 1. inference 缓存
-    inf_dir = STORAGE / "runs" / "inference"
+    inf_dir = RUNS / "inference"
     if inf_dir.exists():
         files = [f for f in inf_dir.iterdir() if f.is_file()]
         if files:
@@ -55,7 +58,7 @@ def collect_targets():
             groups.append(("推理缓存 (inference/*)", files, total))
 
     # 2. epoch checkpoints
-    runs_dir = STORAGE / "runs"
+    runs_dir = RUNS
     if runs_dir.exists():
         epoch_files = []
         for task_dir in sorted(runs_dir.iterdir()):

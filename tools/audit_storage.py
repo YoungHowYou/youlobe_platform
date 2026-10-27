@@ -91,7 +91,8 @@ def print_db_stats(db) -> None:
     print("磁盘：")
     for name, path in (("uploads", settings.upload_path), ("datasets", settings.dataset_path),
                        ("runs", settings.runs_path),
-                       ("exports", Path(settings.STORAGE_ROOT) / settings.EXPORT_DIR)):
+                       ("archive", settings.archive_path),
+                       ("exports", settings.export_path)):
         print(f"  {name:<9} {_human(_dir_size(path)):<10} {path}")
     print()
 
@@ -112,7 +113,8 @@ def audit(db) -> list:
 
         disk = _dir_size(settings.upload_path / str(proj.id))
         for t in tasks:
-            disk += _dir_size(settings.runs_path / f"task_{t.id}")
+            # 任务目录可能在 SSD 训练区，也可能已归档到机械盘
+            disk += _dir_size(Path(t.output_dir) if t.output_dir else settings.runs_path / f"task_{t.id}")
 
         rows.append({
             "project": proj,
@@ -221,7 +223,8 @@ def purge_orphan_files(db) -> None:
     """
     from server.services.artifact_cleanup import (
         DOWNLOAD_CACHE_DIR, remove_tree,
-        runs_root, sweep_orphan_task_dirs, sweep_orphan_upload_dirs, uploads_root,
+        runs_root, sweep_orphan_archive_dirs, sweep_orphan_task_dirs,
+        sweep_orphan_upload_dirs, uploads_root,
     )
 
     alive_tasks = [row[0] for row in db.query(TrainTask.id).all()]
@@ -230,6 +233,8 @@ def purge_orphan_files(db) -> None:
     freed = 0.0
     for name in sweep_orphan_task_dirs(alive_tasks):
         print(f"  [已删] runs/{name}")
+    for name in sweep_orphan_archive_dirs(alive_tasks):
+        print(f"  [已删] archive/{name}")
     for name in sweep_orphan_upload_dirs(alive_projects):
         print(f"  [已删] uploads/{name}")
 

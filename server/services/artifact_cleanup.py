@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import shutil
 import tempfile
+from datetime import datetime
 from pathlib import Path
 from typing import Iterable, Optional
 
@@ -40,11 +41,28 @@ def storage_root() -> Path:
 
 
 def runs_root() -> Path:
-    return (storage_root() / settings.RUNS_DIR).resolve()
+    """训练工作区根（可配置到 SSD，与 STORAGE_ROOT 不在同一块盘）。"""
+    return settings.runs_path
 
 
 def uploads_root() -> Path:
-    return (storage_root() / settings.UPLOAD_DIR).resolve()
+    return settings.upload_path
+
+
+def archive_root() -> Path:
+    """训练结果归档根（默认 <STORAGE_ROOT>/archive，通常放在机械盘）。"""
+    return settings.archive_path
+
+
+def known_roots() -> list[Path]:
+    """所有允许删除的产物根：训练工作区 / 归档区 / 存储区。"""
+    roots = [runs_root(), archive_root(), storage_root()]
+    # 去重（默认配置下 archive 在 STORAGE_ROOT 内，二者不相等，保留全部）
+    uniq: list[Path] = []
+    for r in roots:
+        if r not in uniq:
+            uniq.append(r)
+    return uniq
 
 
 def _inside(path: Path, root: Path) -> bool:
@@ -84,6 +102,27 @@ def remove_path(path: Optional[Path | str], root: Path) -> bool:
         return False
 
 
+def remove_any(path: Optional[Path | str]) -> bool:
+    """删除文件/目录，自动判定它属于哪个已知根（runs / archive / storage）。"""
+    if not path:
+        return False
+    p = Path(path)
+    for root in known_roots():
+        if _inside(p, root):
+            return remove_path(p, root)
+    return False
+
+
+def remove_tree_any(path: Optional[Path]) -> bool:
+    """删除目录，自动判定它属于哪个已知根。"""
+    if path is None:
+        return False
+    for root in known_roots():
+        if _inside(path, root):
+            return remove_tree(path, root)
+    return False
+
+
 def task_dir(task_id: int, output_dir: Optional[str] = None) -> Path:
     """任务的产物根目录：优先用记录里的 output_dir，否则回退 runs/task_<id>。"""
     if output_dir:
@@ -91,15 +130,90 @@ def task_dir(task_id: int, output_dir: Optional[str] = None) -> Path:
     return runs_root() / f"task_{task_id}"
 
 
+def archive_task(task_id: int, output_dir: Optional[str] = None) -> Optional[tuple[Path, Path]]:
+    """把任务目录整体搬到归档盘（跨盘 move）。
+
+    返回 (新目录, 原目录)；已在归档盘时两者相同；目录不存在/移动失败返回 None。
+    只搬文件，DB 里记录的绝对路径由调用方用 relocate_task_paths() 回写。
+    """
+    src = task_dir(task_id, output_dir)
+    root = archive_root()
+    if not src.is_dir():
+        return None
+    if _inside(src, root):
+        return src, src
+    dst = root / f"task_{task_id}"
+    if dst.exists():
+        # 同号目录已存在（例如重复归档）：加时间戳，绝不覆盖
+        dst = root / f"task_{task_id}_{datetime.now():%Y%m%d%H%M%S}"
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        shutil.move(str(src), str(dst))
+        return dst, src
+    except Exception:  # noqa: BLE001 - 跨盘/权限异常时退化为 复制 + 删除
+        try:
+            shutil.copytree(src, dst, dirs_exist_ok=True)
+            shutil.rmtree(src, ignore_errors=True)
+            return dst, src
+        except Exception:  # noqa: BLE001
+            return None
+
+
+def relocate_task_paths(db, task_id: int, old_root: Path, new_root: Path) -> list[str]:
+    """把训练任务相关记录中的绝对路径前缀 old_root 改写为 new_root。
+
+    覆盖 train_tasks.output_dir / best_model_path / last_model_path / export_path
+    与 exported_models.export_path；返回真正改动的字段名（便于日志）。
+    """
+    from ..models.exported_model import ExportedModel
+    from ..models.train_task import TrainTask
+
+    old = str(old_root).rstrip("/")
+    new = str(new_root).rstrip("/")
+    changed: list[str] = []
+
+    def _swap(value):
+        if isinstance(value, str) and value.startswith(old):
+            return new + value[len(old):]
+        return value
+
+    task = db.query(TrainTask).filter(TrainTask.id == task_id).first()
+    if task is not None:
+        for attr in ("output_dir", "best_model_path", "last_model_path", "export_path"):
+            cur = getattr(task, attr)
+            nxt = _swap(cur)
+            if nxt != cur:
+                setattr(task, attr, nxt)
+                changed.append(f"train_tasks.{attr}")
+    for rec in db.query(ExportedModel).filter(ExportedModel.task_id == task_id).all():
+        nxt = _swap(rec.export_path)
+        if nxt != rec.export_path:
+            rec.export_path = nxt
+            changed.append(f"exported_models#{rec.id}.export_path")
+    if changed:
+        db.commit()
+    return changed
+
+
 def url_to_disk(url: str) -> Optional[Path]:
-    """把 /static/storage/... 反解成磁盘路径（限制在 STORAGE_ROOT 内）。"""
+    """把 /static/storage/... 反解成磁盘路径。
+
+    `/static/storage` 挂载的是 RUNS_DIR 的父目录（推理可视化图在 <RUNS>/inference/），
+    但历史记录里也可能出现 STORAGE_ROOT 下的相对路径，两个根都尝试一遍。
+    """
     if not url:
         return None
     rel = url.replace(_STATIC_PREFIX, "", 1).lstrip("/\\")
     if not rel:
         return None
-    target = (storage_root() / rel).resolve()
-    return target if _inside(target, storage_root()) else None
+    for root in (runs_root().parent, storage_root()):
+        try:
+            target = (root / rel).resolve()
+        except Exception:  # noqa: BLE001
+            continue
+        if _inside(target, root):
+            return target
+    return None
 
 
 def remove_download_zip_cache(record_ids: Iterable[int]) -> int:
@@ -154,6 +268,29 @@ def sweep_orphan_task_dirs(valid_task_ids: Iterable[int]) -> list[str]:
             tid = int(child.name[len("task_"):])
         except ValueError:
             continue                      # task_xxx 之类的非数字目录不动
+        if tid in valid:
+            continue
+        if remove_tree(child, root):
+            removed.append(child.name)
+    return removed
+
+
+def sweep_orphan_archive_dirs(valid_task_ids: Iterable[int]) -> list[str]:
+    """删掉归档盘上 DB 里已不存在的 task_<n> 目录（含 _yyyymmddHHMMSS 后缀的重复归档）。"""
+    valid = {int(i) for i in valid_task_ids}
+    removed: list[str] = []
+    root = archive_root()
+    if not root.is_dir():
+        return removed
+    for child in sorted(root.iterdir()):
+        if not child.is_dir() or not child.name.startswith("task_"):
+            continue
+        tail = child.name[len("task_"):]
+        tid_text = tail.split("_", 1)[0]
+        try:
+            tid = int(tid_text)
+        except ValueError:
+            continue
         if tid in valid:
             continue
         if remove_tree(child, root):

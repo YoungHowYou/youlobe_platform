@@ -117,6 +117,38 @@ def _purge_intermediates_if_needed(db, task_id: int) -> None:
         )
 
 
+def _archive_task_if_needed(db, task_id: int) -> None:
+    """训练结束（completed / cancelled）后把任务目录搬到归档盘（机械盘），并回写 DB 路径。
+
+    - 只搬**已收尾**的任务：failed 留在 SSD 方便排查，pending/training 更不该动。
+    - 先清中间产物再搬，避免把几 GB 的 cropped/dataset 搬到慢盘。
+    - 搬完更新 train_tasks.output_dir / best_model_path / last_model_path /
+      export_path 与 exported_models.export_path，后续推理、导出、继承训练
+      仍按 DB 里的绝对路径读取。
+    - 开关：config/.env 里 TRAIN_AUTO_ARCHIVE=False 可关闭（任务目录留在 RUNS_DIR）。
+    """
+    from ..config import settings
+
+    if not getattr(settings, "TRAIN_AUTO_ARCHIVE", True):
+        return
+
+    task = db.query(TrainTask).filter(TrainTask.id == task_id).first()
+    if task is None or task.status not in ("completed", "cancelled"):
+        return
+
+    from ..services.artifact_cleanup import archive_task, relocate_task_paths
+
+    moved = archive_task(task_id, task.output_dir)
+    if moved is None:
+        print(f"[训练任务] Task#{task_id} 归档跳过（目录不存在或移动失败）")
+        return
+    new_dir, old_dir = moved
+    if str(new_dir) == str(old_dir):
+        return  # 已经在归档盘
+    changed = relocate_task_paths(db, task_id, old_dir, new_dir)
+    print(f"[训练任务] Task#{task_id} 已归档到 {new_dir}（更新 {len(changed)} 个路径字段）")
+
+
 def _release_training_resources() -> None:
     """训练宿主进程常驻，任务结束后显式回收内存缓存。"""
     import gc
@@ -629,6 +661,11 @@ def run_training_pipeline(task_id: int) -> dict:
             _purge_intermediates_if_needed(db, task_id)
         except Exception as exc:       # noqa: BLE001 - 清理失败不影响训练结果
             print(f"[训练任务] Task#{task_id} 中间产物清理失败: {exc}")
+        # 清理完再把任务目录整体归档到机械盘（SSD 只留正在跑的任务）
+        try:
+            _archive_task_if_needed(db, task_id)
+        except Exception as exc:       # noqa: BLE001 - 归档失败不影响训练结果
+            print(f"[训练任务] Task#{task_id} 归档失败: {exc}")
         try:
             db.close()
         finally:

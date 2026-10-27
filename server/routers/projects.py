@@ -216,12 +216,12 @@ def delete_project(project_id: int, db: Session = Depends(get_db)):
 
     # ---- 磁盘清理：统一走 artifact_cleanup（切图/日志/中间产物/导出/推理图/下载缓存）----
     from ..services.artifact_cleanup import (
+        remove_any,
         remove_download_zip_cache,
         remove_inference_files,
-        remove_path,
         remove_tree,
-        runs_root,
-        storage_root,
+        remove_tree_any,
+        sweep_orphan_archive_dirs,
         sweep_orphan_task_dirs,
         sweep_orphan_upload_dirs,
         uploads_root,
@@ -230,9 +230,10 @@ def delete_project(project_id: int, db: Session = Depends(get_db)):
     # 磁盘清理失败不回滚 DB —— DB 已经一致，文件残留下次再清比 DB 半残更可控
     remove_tree(upload_dir, uploads_root())
     for d in task_dirs:
-        remove_tree(d, runs_root())
+        # 任务目录可能还在 SSD 训练区，也可能已归档到 HDD
+        remove_tree_any(d)
     for ep_str in export_paths:
-        remove_path(ep_str, storage_root())
+        remove_any(ep_str)
     removed_infer = remove_inference_files(inference_paths)
     removed_zip = remove_download_zip_cache(export_ids)
 
@@ -241,10 +242,11 @@ def delete_project(project_id: int, db: Session = Depends(get_db)):
     alive_tasks = [row[0] for row in db.query(TrainTask.id).all()]
     alive_projects = [row[0] for row in db.query(Project.id).all()]
     orphan_tasks = sweep_orphan_task_dirs(alive_tasks)
+    orphan_archives = sweep_orphan_archive_dirs(alive_tasks)
     orphan_uploads = sweep_orphan_upload_dirs(alive_projects)
     log.info(
-        "delete_project %s: tasks=%s inference=%s zip_cache=%s orphan_tasks=%s orphan_uploads=%s",
-        project_id, len(task_ids), removed_infer, removed_zip, orphan_tasks, orphan_uploads,
+        "delete_project %s: tasks=%s inference=%s zip_cache=%s orphan_tasks=%s orphan_archives=%s orphan_uploads=%s",
+        project_id, len(task_ids), removed_infer, removed_zip, orphan_tasks, orphan_archives, orphan_uploads,
     )
 
 

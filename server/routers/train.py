@@ -316,7 +316,7 @@ def delete_train_task(task_id: int, db: Session = Depends(get_db)):
     if task.output_dir:
         run_dir = Path(task.output_dir)
     else:
-        run_dir = Path(settings.STORAGE_ROOT).resolve() / settings.RUNS_DIR / f"task_{task_id}"
+        run_dir = Path(settings.runs_path) / f"task_{task_id}"
 
     export_records = (
         db.query(ExportedModel).filter(ExportedModel.task_id == task_id).all()
@@ -336,17 +336,16 @@ def delete_train_task(task_id: int, db: Session = Depends(get_db)):
 
     # ---- 磁盘清理（统一走 artifact_cleanup，覆盖切图/日志/中间产物/导出/推理图）----
     from ..services.artifact_cleanup import (
+        remove_any,
         remove_download_zip_cache,
         remove_inference_files,
-        remove_path,
-        remove_tree,
-        runs_root,
-        storage_root,
+        remove_tree_any,
     )
 
-    removed_dir = remove_tree(run_dir, runs_root())
+    # run_dir 可能在 SSD 训练区，也可能已在归档盘（HDD）——由 remove_*_any 自动判定根
+    removed_dir = remove_tree_any(run_dir)
     for ep_str in export_paths:
-        remove_path(ep_str, storage_root())
+        remove_any(ep_str)
     removed_infer = remove_inference_files(inference_paths)
     removed_zip = remove_download_zip_cache(export_ids)
     log.info(

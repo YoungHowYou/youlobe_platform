@@ -17,11 +17,28 @@ class Settings(BaseSettings):
     DATABASE_URL: str = ""
 
     # ---- 文件存储 ----
+    # 每个 *_DIR 都可以写「相对 STORAGE_ROOT 的子目录」或「绝对路径」，
+    # 方便把不同产物放到不同磁盘（大盘存原图、SSD 跑训练）：
+    #   STORAGE_ROOT=/data/hdd/youlobe/storage    原图 / 数据集 / 导出（机械盘）
+    #   RUNS_DIR=/data/ssd/youlobe/runs           训练工作区（SSD，读写最频繁）
+    #   ARCHIVE_DIR=/data/hdd/youlobe/archive     训练结束后的结果归档（机械盘）
     STORAGE_ROOT: str = str(Path(__file__).parent.parent / "storage")
-    UPLOAD_DIR: str = "uploads"      # 相对于 STORAGE_ROOT
+    UPLOAD_DIR: str = "uploads"      # 相对于 STORAGE_ROOT（或绝对路径）
     DATASET_DIR: str = "datasets"
     RUNS_DIR: str = "runs"
     EXPORT_DIR: str = "exports"
+
+    # ---- 训练结果归档 ----
+    # 训练结束（completed / cancelled）后把任务目录整体移动到 ARCHIVE_DIR，
+    # 让 SSD 只保留正在跑的任务；关闭则任务目录留在 RUNS_DIR。
+    TRAIN_AUTO_ARCHIVE: bool = True
+    ARCHIVE_DIR: str = "archive"
+
+    # ---- 数据库备份 ----
+    # 定期把 app.db 备份到 <ARCHIVE_DIR>/db_backups（原图/标注在大盘之外时兜底）
+    DB_BACKUP_ENABLED: bool = True
+    DB_BACKUP_INTERVAL_H: float = 6.0
+    DB_BACKUP_KEEP: int = 14
 
     # ---- 服务 ----
     HOST: str = "0.0.0.0"
@@ -60,21 +77,31 @@ class Settings(BaseSettings):
 
     @property
     def upload_path(self) -> Path:
-        p = Path(self.STORAGE_ROOT).resolve() / self.UPLOAD_DIR
-        p.mkdir(parents=True, exist_ok=True)
-        return p
+        return self._resolve_dir(self.UPLOAD_DIR)
 
     @property
     def dataset_path(self) -> Path:
-        p = Path(self.STORAGE_ROOT).resolve() / self.DATASET_DIR
-        p.mkdir(parents=True, exist_ok=True)
-        return p
+        return self._resolve_dir(self.DATASET_DIR)
 
     @property
     def runs_path(self) -> Path:
-        p = Path(self.STORAGE_ROOT).resolve() / self.RUNS_DIR
+        return self._resolve_dir(self.RUNS_DIR)
+
+    @property
+    def export_path(self) -> Path:
+        return self._resolve_dir(self.EXPORT_DIR)
+
+    @property
+    def archive_path(self) -> Path:
+        return self._resolve_dir(self.ARCHIVE_DIR)
+
+    def _resolve_dir(self, value: str) -> Path:
+        """相对路径 → <STORAGE_ROOT>/value；绝对路径原样使用（并自动建目录）。"""
+        p = Path(value).expanduser()
+        if not p.is_absolute():
+            p = Path(self.STORAGE_ROOT).expanduser().resolve() / p
         p.mkdir(parents=True, exist_ok=True)
-        return p
+        return p.resolve()
 
 
 settings = Settings()

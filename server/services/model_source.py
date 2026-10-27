@@ -4,7 +4,8 @@
 只允许使用服务器上约定目录里的模型，避免通过 API 读取任意路径：
   - <repo>/weights/           （ultralytics 的 weights_dir）
   - <repo>/                   （直接下载常落在仓库根）
-  - <repo>/storage/models/    （可选的集中存放目录，不存在则忽略）
+  - <STORAGE_ROOT>/models/    （大盘上的集中存放目录）
+  - <repo>/storage/models/    （老布局兼容，不存在则忽略）
 """
 
 from __future__ import annotations
@@ -12,12 +13,21 @@ from __future__ import annotations
 from datetime import datetime
 from pathlib import Path
 
+from ..config import settings
+
 _ROOT = Path(__file__).resolve().parents[2]
-_MODEL_DIRS = (
-    _ROOT / "weights",
-    _ROOT,
-    _ROOT / "storage" / "models",
-)
+
+
+def _model_dirs() -> list[Path]:
+    """每次现算：STORAGE_ROOT 可能指向另一块盘，且模型目录可能后建。"""
+    dirs = [_ROOT / "weights", _ROOT]
+    try:
+        dirs.append(Path(settings.STORAGE_ROOT).expanduser().resolve() / "models")
+    except Exception:  # noqa: BLE001
+        pass
+    dirs.append(_ROOT / "storage" / "models")
+    return dirs
+
 
 # ultralytics 的 task 名称 → 平台 task_type
 TASK_ALIASES = {
@@ -29,7 +39,7 @@ TASK_ALIASES = {
 
 
 def allowed_dirs() -> list[Path]:
-    return [d for d in _MODEL_DIRS if d.is_dir()]
+    return [d for d in _model_dirs() if d.is_dir()]
 
 
 def resolve_local_model(path: str | Path) -> Path:
@@ -50,7 +60,7 @@ def resolve_local_model(path: str | Path) -> Path:
         raise ValueError(f"模型文件不存在: {p}")
 
     roots = []
-    for d in _MODEL_DIRS:
+    for d in _model_dirs():
         try:
             roots.append(d.resolve())
         except Exception:  # noqa: BLE001
