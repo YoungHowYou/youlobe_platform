@@ -172,9 +172,29 @@ async def lifespan(app: FastAPI):
     except Exception as _e:  # noqa: BLE001 - 备份失败不影响服务启动
         print(f"[WARN] 数据库备份未启动: {_e}")
 
-    # ---- 存储分布（方便确认挂载是否正常）----
-    print(f"  原图/导出: {settings.upload_path.parent}  |  训练工作区: {settings.runs_path}")
-    print(f"  训练归档: {settings.archive_path}")
+    # ---- 存储布局自检（路径全部来自配置，代码里不写死盘符）----
+    # STORAGE_REQUIRE_MOUNT=True 时，配置目录落在根分区（数据盘没挂上）会拒绝启动，
+    # 避免把原图/训练产物写进系统盘。
+    try:
+        from .services.storage_layout import problems, summary_lines
+
+        for _line in summary_lines():
+            print(f"  存储 {_line}")
+        _issues = problems(strict=bool(getattr(settings, "STORAGE_REQUIRE_MOUNT", False)))
+        if _issues:
+            for _issue in _issues:
+                print(f"  [存储告警] {_issue}")
+            if getattr(settings, "STORAGE_REQUIRE_MOUNT", False):
+                raise RuntimeError(
+                    "存储目录检查未通过（STORAGE_REQUIRE_MOUNT=True）："
+                    + "；".join(_issues)
+                    + "。请确认数据盘已挂载，或修正 .env 里的 STORAGE_ROOT / RUNS_DIR / ARCHIVE_DIR。"
+                )
+    except RuntimeError:
+        raise
+    except Exception as _e:  # noqa: BLE001 - 自检本身出错不影响启动
+        print(f"[WARN] 存储自检失败: {_e}")
+
     print("=" * 60)
     yield
     rotator.stop()

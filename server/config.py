@@ -34,6 +34,12 @@ class Settings(BaseSettings):
     TRAIN_AUTO_ARCHIVE: bool = True
     ARCHIVE_DIR: str = "archive"
 
+    # ---- 存储挂载校验 ----
+    # False（默认）= 只打印各目录所在的挂载点；True = 配置的目录落在根分区
+    # （说明数据盘没挂上）时拒绝启动，避免把数据写进系统盘。
+    # 多盘部署在 .env 里设 True；单盘 / Windows 部署保持 False。
+    STORAGE_REQUIRE_MOUNT: bool = False
+
     # ---- 数据库备份 ----
     # 定期把 app.db 备份到 <ARCHIVE_DIR>/db_backups（原图/标注在大盘之外时兜底）
     DB_BACKUP_ENABLED: bool = True

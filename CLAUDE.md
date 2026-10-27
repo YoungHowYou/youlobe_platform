@@ -225,7 +225,9 @@ PUT  /api/projects/{id}/images/batch-class    cls 批量打分类标签
 - **删除路径收口**：`artifact_cleanup.remove_any() / remove_tree_any()` 自动判定 runs / archive / storage 三个根，归档到机械盘的任务也能删干净；`sweep_orphan_archive_dirs()` 兜底清归档盘上的孤儿目录（`db_backups/` 不动）。
 - **磁盘监控**：`GET /api/monitor/status` 返回 `disk`（原图盘）、`disk_runs`（训练盘）、`disk_archive`（归档盘）。
 - **数据库自动备份**：`server/services/db_backup.py` 启动即备份一份，之后每 `DB_BACKUP_INTERVAL_H` 小时用 sqlite3 online backup API 写到 `<ARCHIVE_DIR>/db_backups/app-<时间>.db`，保留 `DB_BACKUP_KEEP` 份（默认 6h / 14 份）。
-- **挂载持久化**：`/etc/fstab` 两条 UUID（`nofail,x-systemd.device-timeout=10s`）；drop-in `/etc/systemd/system/labelyou-backend.service.d/storage.conf` 用 `RequiresMountsFor=/data/ssd /data/hdd`，盘没挂上就不起服务（避免把数据写进根分区）。
+- **路径全部来自配置**：`STORAGE_ROOT / RUNS_DIR / ARCHIVE_DIR / DATABASE_URL` 都写在 `.env`（`*_DIR` 支持相对或绝对路径），代码和 systemd 里**不写死盘符**。`server/services/storage_layout.py` 把配置目录映射到真实挂载点并自检，启动日志会打印 `存储 OK RUNS_DIR /data/ssd/youlobe/runs ← /data/ssd`。
+- **换设备（只改配置）**：改 `.env` 那 4 个路径 → `.venv/bin/python tools/setup_storage.py --apply --write-unit deploy/systemd/storage.conf`（建目录 + 写测试文件验证可写 + 生成 drop-in）→ `sudo install -D -m 644 deploy/systemd/storage.conf /etc/systemd/system/labelyou-backend.service.d/storage.conf` → `sudo systemctl daemon-reload && sudo systemctl restart labelyou-backend`。fstab 的 UUID 按工具打印的提示自行填写（工具不改 `/etc/fstab`）。
+- **挂载持久化 / 兜底**：`/etc/fstab` 用 UUID + `nofail,x-systemd.device-timeout=10s`；drop-in 的 `RequiresMountsFor` 由 `setup_storage.py` 按配置推导（当前 `/data/hdd /data/ssd`）。另 `.env` 里 `STORAGE_REQUIRE_MOUNT=True` 时，配置目录落在根分区（数据盘没挂上）会**拒绝启动**，防止数据写进系统盘。
 - **换盘/迁移步骤**：`systemctl stop labelyou-backend` → 挂新盘 → `uploads/` 拷到 `STORAGE_ROOT/uploads`、`task_*` 拷到 `ARCHIVE_DIR/task_*` → 用 `archive_task()`/`relocate_task_paths()`（或 SQL `replace()`）改 DB 绝对路径 → `systemctl start labelyou-backend`。
 - 迁移时的项目内副本（`storage.old-20261027/`，约 890M）已逐文件核对一致后删除，仓库根只剩空的 `storage/` 占位目录（默认配置回退用）。
 - 回归测试：`.venv/bin/python -m unittest tests.test_storage_layout -v`。
