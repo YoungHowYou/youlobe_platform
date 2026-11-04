@@ -172,6 +172,59 @@
               <el-tag type="info" size="small">自定义权重</el-tag>
               <span class="hint">{{ customModelInfo ? customModelInfo.name : '尚未选择本地模型' }}</span>
             </el-form-item>
+            <el-form-item v-if="taskType === 'seg'" label="实例分割损失">
+              <div style="width:100%">
+                <el-select v-model="c.seg_loss" style="width:100%">
+                  <el-option label="默认 · YOLO26 原版掩膜 BCE" value="default" />
+                  <el-option label="BCE + Dice" value="bce_dice" />
+                  <el-option label="Focal" value="focal" />
+                  <el-option label="Tversky" value="tversky" />
+                  <el-option label="Focal Tversky" value="focal_tversky" />
+                  <el-option label="边界加权 BCE（3×3 形态学边界）" value="boundary" />
+                </el-select>
+                <div class="hint" style="margin:6px 0 0;line-height:1.6">
+                  默认项完全保持原损失；其他选项只替换实例掩膜项，检测框 / 分类 / DFL 与标签分配不变。
+                </div>
+              </div>
+            </el-form-item>
+            <el-form-item v-if="taskType === 'seg' && c.seg_loss === 'bce_dice'" label="Dice 权重 λ">
+              <el-slider v-model="c.seg_loss_params.dice_weight" :min="0" :max="1" :step="0.05"
+                show-input :show-input-controls="false" />
+              <span class="hint">掩膜损失 = (1-λ)·BCE + λ·Dice，建议从 0.5 起步</span>
+            </el-form-item>
+            <template v-if="taskType === 'seg' && c.seg_loss === 'focal'">
+              <el-form-item label="Focal γ">
+                <el-slider v-model="c.seg_loss_params.focal_gamma" :min="0" :max="5" :step="0.5"
+                  show-input :show-input-controls="false" />
+                <span class="hint">γ 越大越聚焦难分像素；γ=0 退化为加权 BCE</span>
+              </el-form-item>
+              <el-form-item label="Focal α">
+                <el-slider v-model="c.seg_loss_params.focal_alpha" :min="0" :max="1" :step="0.05"
+                  show-input :show-input-controls="false" />
+                <span class="hint">正样本（缺陷像素）权重；缺陷极稀疏时上调到 0.75 更合理</span>
+              </el-form-item>
+            </template>
+            <template v-if="taskType === 'seg' && (c.seg_loss === 'tversky' || c.seg_loss === 'focal_tversky')">
+              <el-form-item label="误检权重 α (FP)">
+                <el-slider v-model="c.seg_loss_params.tversky_alpha" :min="0" :max="1" :step="0.05"
+                  show-input :show-input-controls="false" />
+              </el-form-item>
+              <el-form-item label="漏检权重 β (FN)">
+                <el-slider v-model="c.seg_loss_params.tversky_beta" :min="0" :max="1" :step="0.05"
+                  show-input :show-input-controls="false" />
+                <span class="hint">β &gt; α 时更惩罚漏检，但会扩大预测面积，需同时看面积误差</span>
+              </el-form-item>
+            </template>
+            <el-form-item v-if="taskType === 'seg' && c.seg_loss === 'focal_tversky'" label="Focal Tversky γ">
+              <el-slider v-model="c.seg_loss_params.focal_tversky_gamma" :min="0" :max="2" :step="0.05"
+                show-input :show-input-controls="false" />
+              <span class="hint">对难分割实例放大 (1-TI)^γ，γ&lt;1 会软化梯度</span>
+            </el-form-item>
+            <el-form-item v-if="taskType === 'seg' && c.seg_loss === 'boundary'" label="边界额外权重">
+              <el-slider v-model="c.seg_loss_params.boundary_weight" :min="0" :max="10" :step="0.5"
+                show-input :show-input-controls="false" />
+              <span class="hint">边界像素权重 = 1 + 该值；0 等价于原版 BCE</span>
+            </el-form-item>
             <el-form-item label="Epochs">
               <el-input-number v-model="c.epochs" :min="1" :max="2000" />
               <span class="hint">训练轮数，建议 150~300</span>
@@ -244,15 +297,55 @@
           <!-- 颜色增广 -->
           <el-card shadow="never" style="margin-bottom:20px">
             <template #header><span style="font-weight:600">颜色增广</span></template>
-            <el-form-item label="HSV-H (色调)">
-              <el-slider v-model="c.hsv_h" :min="0" :max="1" :step="0.005" show-input :show-input-controls="false" />
+            <el-form-item label="模式">
+              <el-radio-group v-model="c.color_aug_mode">
+                <el-radio label="hsv">HSV（默认）</el-radio>
+                <el-radio label="rgb">RGB 逐通道亮度</el-radio>
+                <el-radio label="off">关闭</el-radio>
+              </el-radio-group>
             </el-form-item>
-            <el-form-item label="HSV-S (饱和度)">
-              <el-slider v-model="c.hsv_s" :min="0" :max="1" :step="0.1" show-input :show-input-controls="false" />
-            </el-form-item>
-            <el-form-item label="HSV-V (亮度)">
-              <el-slider v-model="c.hsv_v" :min="0" :max="1" :step="0.1" show-input :show-input-controls="false" />
-            </el-form-item>
+            <template v-if="c.color_aug_mode === 'hsv'">
+              <el-form-item label="HSV-H (色调)">
+                <el-slider v-model="c.hsv_h" :min="0" :max="1" :step="0.005" show-input :show-input-controls="false" />
+              </el-form-item>
+              <el-form-item label="HSV-S (饱和度)">
+                <el-slider v-model="c.hsv_s" :min="0" :max="1" :step="0.1" show-input :show-input-controls="false" />
+              </el-form-item>
+              <el-form-item label="HSV-V (亮度)">
+                <el-slider v-model="c.hsv_v" :min="0" :max="1" :step="0.1" show-input :show-input-controls="false" />
+              </el-form-item>
+            </template>
+            <template v-else-if="c.color_aug_mode === 'rgb'">
+              <el-form-item label="生效概率">
+                <el-slider v-model="c.rgb_gain_p" :min="0" :max="1" :step="0.05"
+                  show-input :show-input-controls="false" />
+                <span class="hint">每个样本做逐通道增益的概率</span>
+              </el-form-item>
+              <el-form-item label="R 通道增益幅度">
+                <el-slider v-model="c.rgb_gain_max_r" :min="0" :max="1" :step="0.05"
+                  show-input :show-input-controls="false" />
+                <span class="hint">0.2 = 0.8~1.2 倍；0 = 该通道不增广</span>
+              </el-form-item>
+              <el-form-item label="G 通道增益幅度">
+                <el-slider v-model="c.rgb_gain_max_g" :min="0" :max="1" :step="0.05"
+                  show-input :show-input-controls="false" />
+              </el-form-item>
+              <el-form-item label="B 通道增益幅度">
+                <el-slider v-model="c.rgb_gain_max_b" :min="0" :max="1" :step="0.05"
+                  show-input :show-input-controls="false" />
+                <span class="hint">三通道各按自己的幅度独立采样，可只开某一个通道</span>
+              </el-form-item>
+              <el-alert type="info" :closable="false">
+                <div style="font-size:12px;line-height:1.6">
+                  每个样本的 R / G / B 各自按对应幅度独立采样亮度增益，互不影响；
+                  例如 R=0.3、G=B=0 就是只扰动红色通道。<br>
+                  只改亮度，不动色调与饱和度；仅作用于训练集，验证指标仍按原图计算；选此模式时 HSV 三项自动置 0。
+                </div>
+              </el-alert>
+            </template>
+            <div v-else style="color:#909399;font-size:13px;text-align:center;padding:8px 0">
+              颜色增广已关闭（HSV 与 RGB 均不生效）
+            </div>
           </el-card>
 
           <!-- 几何增广 -->
@@ -425,6 +518,43 @@ const customModelWarning = computed(() => {
   return ''
 })
 
+// ---- 实例分割掩膜损失的超参默认值 ----
+const DEFAULT_SEG_LOSS_PARAMS = {
+  dice_weight: 0.5,
+  focal_gamma: 2,
+  focal_alpha: 0.25,
+  tversky_alpha: 0.3,
+  tversky_beta: 0.7,
+  focal_tversky_gamma: 0.75,
+  boundary_weight: 2,
+}
+
+// 老缓存 / 老 JSON 可能没有 seg_loss_params，或只有部分键：统一补齐
+function normalizeSegLossParams(raw: any) {
+  const merged: Record<string, number> = { ...DEFAULT_SEG_LOSS_PARAMS }
+  if (raw && typeof raw === 'object') {
+    for (const key of Object.keys(DEFAULT_SEG_LOSS_PARAMS)) {
+      const value = Number(raw[key])
+      if (Number.isFinite(value)) merged[key] = value
+    }
+  }
+  return merged
+}
+
+// 老缓存 / 老 JSON 可能只有单值 rgb_gain_max：作为三通道统一默认
+function normalizeRgbParams(cfg: Record<string, any>) {
+  const legacy = Number(cfg.rgb_gain_max)
+  const fallback = Number.isFinite(legacy) ? legacy : 0.2
+  for (const key of ['rgb_gain_max_r', 'rgb_gain_max_g', 'rgb_gain_max_b']) {
+    const value = Number(cfg[key])
+    cfg[key] = Number.isFinite(value) ? value : fallback
+  }
+  const p = Number(cfg.rgb_gain_p)
+  cfg.rgb_gain_p = Number.isFinite(p) ? p : 0.5
+  delete cfg.rgb_gain_max
+  return cfg
+}
+
 // ---- 默认参数（按 task_type 分支生成）----
 function getBaseDefaults() {
   return {
@@ -434,11 +564,14 @@ function getBaseDefaults() {
     warmup_epochs: 3, warmup_momentum: 0.8,
     train_ratio: 0.8, oversample_factor: 5,
     hsv_h: 0.015, hsv_s: 0.7, hsv_v: 0.4,
+    color_aug_mode: 'hsv', rgb_gain_p: 0.5,
+    rgb_gain_max_r: 0.2, rgb_gain_max_g: 0.2, rgb_gain_max_b: 0.2,
     degrees: 180, translate: 0.1, scale: 0.5, shear: 0.0,
     flipud: 0.5, fliplr: 0.5,
     mosaic: 0.5, copy_paste: 0.5, mixup: 0.1, erasing: 0.1, close_mosaic: 30,
     use_morphology: true, dilate_kernel: 3, erode_kernel: 3, mask_dilate_kernel: 0,
-    crop_size: 640,
+    crop_size: 640, seg_loss: 'default',
+    seg_loss_params: normalizeSegLossParams(null),
   } as Record<string, any>
 }
 
@@ -511,6 +644,8 @@ function applyResumeTask(taskId: number | null) {
   }
   if (Object.keys(cfg).length > 0) {
     Object.assign(c.value, cfg)
+    c.value.seg_loss_params = normalizeSegLossParams(c.value.seg_loss_params)
+    normalizeRgbParams(c.value)
     ElMessage.info(`已加载「${task.task_name}」的训练参数`)
   }
   const rec = recommendModelType(task)
@@ -547,6 +682,8 @@ onMounted(async () => {
     if (proj.last_train_config && Object.keys(proj.last_train_config).length > 0) {
       // 用户点过"保存为默认"：缓存覆盖在默认之上
       Object.assign(c.value, defaults, proj.last_train_config)
+      c.value.seg_loss_params = normalizeSegLossParams(c.value.seg_loss_params)
+      normalizeRgbParams(c.value)
       // 旧缓存可能存了本机不存在的 GPU 编号（如 "1"）：回落 auto，避免训练启动即报错
       if (c.value.device !== 'cpu' && c.value.device !== 'auto'
           && !torchDevices.value.some(d => d.id === c.value.device)) {
@@ -633,6 +770,8 @@ async function importParamsJson(file: any) {
       cleaned.workers = Number.isFinite(workers) ? Math.min(16, Math.max(0, Math.trunc(workers))) : 4
     }
     Object.assign(c.value, cleaned)
+    c.value.seg_loss_params = normalizeSegLossParams(c.value.seg_loss_params)
+    normalizeRgbParams(c.value)
     const note = skipped > 0 ? `（跳过 ${skipped} 个项目级/特殊字段）` : ''
     ElMessage.success(`已导入 ${n} 个训练参数${note}`)
   } catch {

@@ -1,7 +1,18 @@
 # -*- coding: utf-8 -*-
 from datetime import datetime
-from typing import Optional
+from typing import Literal, Optional
 from pydantic import BaseModel, Field
+
+
+class SegLossParams(BaseModel):
+    """实例分割掩膜损失的超参（只有对应损失类型会用到其中一部分）。"""
+    dice_weight: float = Field(default=0.5, ge=0.0, le=1.0, description="bce_dice：Dice 占比")
+    focal_gamma: float = Field(default=2.0, ge=0.0, le=10.0, description="focal：难例聚焦强度")
+    focal_alpha: float = Field(default=0.25, ge=0.0, le=1.0, description="focal：正样本权重")
+    tversky_alpha: float = Field(default=0.3, ge=0.0, le=1.0, description="tversky：FP 惩罚权重")
+    tversky_beta: float = Field(default=0.7, ge=0.0, le=1.0, description="tversky：FN 惩罚权重")
+    focal_tversky_gamma: float = Field(default=0.75, ge=0.0, le=5.0, description="focal_tversky：难例放大指数")
+    boundary_weight: float = Field(default=2.0, ge=0.0, le=20.0, description="boundary：边界像素额外权重")
 
 
 class TrainConfig(BaseModel):
@@ -15,6 +26,14 @@ class TrainConfig(BaseModel):
     model_name: str = Field(default="yolo26s-seg", description="模型尺寸: yolo26n/s/m/l/x-seg")
     # 自定义预训练模型（train_mode='custom'）：服务器本地 .pt 路径
     model_path: Optional[str] = Field(default=None, description="自定义预训练权重路径（weights/ / 仓库根 / storage/models）")
+
+    # 实例分割掩膜损失；default 保持 Ultralytics 原版行为
+    seg_loss: Literal[
+        "default", "bce_dice", "focal", "tversky", "focal_tversky", "boundary"
+    ] = Field(default="default", description="seg 任务的实例掩膜损失选项")
+    seg_loss_params: SegLossParams = Field(
+        default_factory=SegLossParams, description="实例掩膜损失超参"
+    )
 
     # 数据划分
     # cls 闭集复核训练允许 1.0：同一批人工复核小图同时作为训练/验证集，
@@ -41,6 +60,13 @@ class TrainConfig(BaseModel):
     hsv_h: float = 0.015
     hsv_s: float = 0.7
     hsv_v: float = 0.4
+    # 颜色增广模式：hsv=原生 HSV 三强度；rgb=训练时对 R/G/B 分别独立做亮度增益（不改色调/饱和度）；
+    # off=关闭颜色增广（hsv_* 与 rgb_* 都不生效）
+    color_aug_mode: Literal["hsv", "rgb", "off"] = Field(default="hsv", description="颜色增广模式")
+    rgb_gain_p: float = Field(default=0.5, ge=0.0, le=1.0, description="rgb 模式：每个样本生效的概率")
+    rgb_gain_max_r: float = Field(default=0.2, ge=0.0, le=1.0, description="rgb 模式：R 通道最大增益幅度（0=该通道不增广）")
+    rgb_gain_max_g: float = Field(default=0.2, ge=0.0, le=1.0, description="rgb 模式：G 通道最大增益幅度（0=该通道不增广）")
+    rgb_gain_max_b: float = Field(default=0.2, ge=0.0, le=1.0, description="rgb 模式：B 通道最大增益幅度（0=该通道不增广）")
 
     # 几何增广
     degrees: float = 180.0

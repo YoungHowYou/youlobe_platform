@@ -513,9 +513,17 @@ def run_training_pipeline(task_id: int) -> dict:
             patience=config.get("patience", 0),
             device=config.get("device") or "auto",   # 默认 auto：有 CUDA 用 GPU，否则回落 CPU
             task_type=task_type,
+            seg_loss=config.get("seg_loss", "default"),
+            seg_loss_params=config.get("seg_loss_params"),
             augment_hsv_h=config.get("hsv_h", 0.015),
             augment_hsv_s=config.get("hsv_s", 0.7),
             augment_hsv_v=config.get("hsv_v", 0.4),
+            color_aug_mode=config.get("color_aug_mode", "hsv"),
+            rgb_gain_p=config.get("rgb_gain_p", 0.5),
+            # 兼容早期只有 rgb_gain_max 的配置：作为三通道的统一默认值
+            rgb_gain_max_r=config.get("rgb_gain_max_r", config.get("rgb_gain_max", 0.2)),
+            rgb_gain_max_g=config.get("rgb_gain_max_g", config.get("rgb_gain_max", 0.2)),
+            rgb_gain_max_b=config.get("rgb_gain_max_b", config.get("rgb_gain_max", 0.2)),
             augment_degrees=config.get("degrees", 10.0),
             augment_translate=config.get("translate", 0.1),
             augment_scale=config.get("scale", 0.5),

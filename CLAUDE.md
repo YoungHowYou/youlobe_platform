@@ -233,6 +233,28 @@ PUT  /api/projects/{id}/images/batch-class    cls 批量打分类标签
 - 回归测试：`.venv/bin/python -m unittest tests.test_storage_layout -v`。
 - 存储体检：`.venv/bin/python tools/audit_storage.py`（现在会把 archive 一起统计）。
 
+## 实例分割损失可选（2026-10-27）
+
+- 训练页「实例分割损失」下拉（**仅 seg**）：`default`（原版 YOLO26 掩膜 BCE）/ `bce_dice` / `focal` / `tversky` / `focal_tversky` / `boundary`，超参存 `config.seg_loss_params`。
+- 实现：`core/segmentation_loss.py` 继承 `v8SegmentationLoss`，**只覆写 `single_mask_loss`**；box/cls/DFL 与任务对齐标签分配保持原版；YOLO26 的 end2end 头用 `E2ELoss(model, loss_fn=partial(...))` 包装。
+- 注入时机：`core/train.py` 注册 `on_train_start`，对训练模型与 EMA 模型同时设置 criterion；`default` 完全不注入。
+- 归一化口径：`focal`/`boundary` 沿用原版按框面积归一；`bce_dice` 按框内像素均值（对齐两项量级）；`tversky`/`focal_tversky` 按实例区域累加。**不同损失之间 seg_loss 数值不可横向比较**，只比 mAP / Mask 指标。
+- `results.csv` 训练结束后追加 `seg_loss_type` 列（`on_train_end` 一次性重写；训练中途加列会让 ultralytics 的 append 行与表头错位）。
+- 小目标效果改用 `tools/eval_size_buckets.py`（按 GT 尺寸分桶统计召回 / 框IoU / 掩膜IoU / 误检）。**不要再往损失里叠加小实例权重**——原版 mask loss 已按框面积归一，小目标本来就被放大。
+
+---
+
+## 颜色增广模式（2026-11-04）
+
+- 训练页「颜色增广」三选一，存 `config.color_aug_mode`：
+  - `hsv`（默认）：Ultralytics 原生 `hsv_h/hsv_s/hsv_v`，行为与之前完全一致；
+  - `rgb`：训练时按样本、按 R/G/B **各自按自己的幅度**独立采样亮度增益 `1 ± rgb_gain_max_{r,g,b}`，以 `rgb_gain_p` 概率生效；某通道幅度设为 0 即该通道不增广；只改亮度，不动色调/饱和度；
+  - `off`：两种颜色增广都不做。
+- RGB 模式实现：`core/train.py::_install_rgb_channel_jitter` 在 `on_train_start` 包装 `trainer.preprocess_batch`，对已归一化到 0~1 的 `batch["img"]` 乘逐通道增益并 `clamp(0,1)`；**只作用于训练集**，验证指标仍按原图算。
+- `rgb` / `off` 模式下 `hsv_*` 由 `server/routers/train.py` 强制写 0，避免训练监控页/参数导出显示不生效的“假增广”。
+
+---
+
 ## 训练曲线（train_epoch_logs）
 
 - `core/train.py` 的 `on_fit_epoch_end` 从 `trainer.tloss` 取训练集 loss。**ultralytics 8.3+ 里 `tloss` / `loss_items` 是 `{loss名: Tensor}` 的 dict**（老版是 Tensor 列表），按 Tensor 处理会静默失败 → `train_*_loss` 恒为 NULL、前端 Loss 曲线只剩 Val。

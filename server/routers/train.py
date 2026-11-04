@@ -40,6 +40,8 @@ def create_train_task(
 
     # 将项目参数合并到训练配置中
     config = body.config.model_dump()
+    if project.task_type != "seg" and config.get("seg_loss", "default") != "default":
+        raise HTTPException(status_code=400, detail="自定义实例分割损失只适用于 seg 项目")
     # 不再写 resize_h / resize_w：2026-10-22 起 seg/det/obb 都按原图分辨率 +
     # crop_size/overlap 滑窗，这两个字段仅保留在 projects 表里做旧数据兼容。
     # （写进 config 会让训练监控页/参数导出里多出一对实际不生效的值）
@@ -47,6 +49,10 @@ def create_train_task(
     config.pop("resize_w", None)
     config["crop_size"] = project.crop_size
     config["overlap"] = project.overlap
+    # 颜色增广互斥：rgb / off 模式下 HSV 三强度不参与训练，写 0 让训练监控页与
+    # 参数导出显示的是实际生效值（否则会像当年的“假 Resize”一样误导）
+    if config.get("color_aug_mode", "hsv") != "hsv":
+        config["hsv_h"] = config["hsv_s"] = config["hsv_v"] = 0.0
 
     # 自定义预训练模型：创建时就校验并在 config 里固化真实架构/类别信息
     if config.get("train_mode") == "custom":

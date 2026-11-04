@@ -167,6 +167,70 @@ def plot_training_curves(results_csv: str, save_dir: str):
         plt.close()
 
 
+def _tag_results_csv_seg_loss(save_dir, seg_loss: str) -> None:
+    """训练结束后在 results.csv 追加 ``seg_loss_type`` 列，标明所用掩膜损失。
+
+    Ultralytics 训练期间按固定列头 append 写 CSV，中途加列会让后续行与表头错位，
+    所以这里只在 ``on_train_end`` 一次性重写整个文件（行数 = epoch 数，开销可忽略）。
+    数值仍按 ``%.6g`` 写回，与原文件精度一致。
+    """
+    if not save_dir or not seg_loss:
+        return
+
+    csv_path = Path(save_dir) / 'results.csv'
+    if not csv_path.exists():
+        return
+
+    try:
+        df = pd.read_csv(csv_path)
+        df.columns = df.columns.str.strip()
+        df['seg_loss_type'] = seg_loss
+        df.to_csv(csv_path, index=False, float_format='%.6g')
+        print(f"[seg loss] results.csv 已标记 seg_loss_type={seg_loss}")
+    except Exception as exc:
+        print(f"[seg loss] results.csv 标记失败: {exc}")
+
+
+def _install_rgb_channel_jitter(trainer, probability: float, max_gains) -> None:
+    """把「逐通道独立亮度增益」挂到 trainer.preprocess_batch 上（只影响训练集）。
+
+    Ultralytics 原生只有 HSV 增广；RGB 模式在已经归一化到 0~1 的训练 batch 张量上做
+    per-image、per-channel 的乘性增益：
+
+        gain_c = 1 + U(-max_gain_c, +max_gain_c),  c ∈ {R, G, B}
+
+    ``max_gains`` 是 (R, G, B) 三个通道各自的最大增益幅度：各通道独立采样、互不影响，
+    某一通道设为 0 即该通道不增广。整体以 probability 的概率生效。
+    验证集走 validator 自己的预处理，不会经过这里，因此指标仍反映原始图像分布。
+
+    只在 on_train_start 安装：此时 trainer 已建好，首个 batch 尚未前向。
+    """
+    import torch  # 本模块未在顶层导入 torch，闭包里要用到，必须在此绑定
+
+    base_preprocess = trainer.preprocess_batch
+
+    def _preprocess_with_rgb_jitter(batch):
+        batch = base_preprocess(batch)
+        img = batch.get("img") if isinstance(batch, dict) else None
+        if not isinstance(img, torch.Tensor) or img.ndim != 4 or img.shape[1] != 3:
+            return batch
+
+        batch_size = img.shape[0]
+        if batch_size == 0:
+            return batch
+
+        channel_scale = torch.tensor(max_gains, device=img.device, dtype=img.dtype).view(1, 3, 1, 1)
+        gains = 1.0 + (torch.rand(batch_size, 3, 1, 1, device=img.device) * 2.0 - 1.0) * channel_scale
+        if probability < 1.0:
+            apply_mask = torch.rand(batch_size, 1, 1, 1, device=img.device) < probability
+            gains = torch.where(apply_mask, gains, torch.ones_like(gains))
+
+        batch["img"] = (img * gains.to(dtype=img.dtype)).clamp_(0.0, 1.0)
+        return batch
+
+    trainer.preprocess_batch = _preprocess_with_rgb_jitter
+
+
 def resolve_device(requested: str) -> str:
     """
     归一化训练设备：
@@ -210,10 +274,19 @@ def run_train(
     patience: int = 0,
     device: str = "0",
     task_type: str = "seg",
+    seg_loss: str = "default",
+    seg_loss_params: Optional[Dict[str, Any]] = None,
     # ---- 数据增广参数 ----
     augment_hsv_h: float = 0.015,
     augment_hsv_s: float = 0.7,
     augment_hsv_v: float = 0.4,
+    # 颜色增广模式：hsv=Ultralytics 原生 HSV（默认）；rgb=训练时对 R/G/B 三通道
+    # 分别独立做亮度增益；off=关闭颜色增广（两种都不做）
+    color_aug_mode: str = "hsv",
+    rgb_gain_p: float = 0.5,
+    rgb_gain_max_r: float = 0.2,
+    rgb_gain_max_g: float = 0.2,
+    rgb_gain_max_b: float = 0.2,
     augment_degrees: float = 10.0,
     augment_translate: float = 0.1,
     augment_scale: float = 0.5,
@@ -280,6 +353,26 @@ def run_train(
     """
     import torch
     from ultralytics import YOLO
+
+    from .segmentation_loss import SEGMENTATION_LOSS_OPTIONS, normalize_seg_loss_params
+
+    if seg_loss not in SEGMENTATION_LOSS_OPTIONS:
+        raise ValueError(f"不支持的实例分割损失选项: {seg_loss}")
+    if task_type != "seg" and seg_loss != "default":
+        raise ValueError("自定义实例分割损失只适用于 seg 任务")
+    seg_loss_params = normalize_seg_loss_params(seg_loss_params)
+
+    color_aug_mode = str(color_aug_mode or "hsv").strip().lower()
+    if color_aug_mode not in ("hsv", "rgb", "off"):
+        raise ValueError(f"不支持的颜色增广模式: {color_aug_mode}")
+    if color_aug_mode != "hsv":
+        # 非 HSV 模式时 HSV 三个强度强制为 0，避免两组颜色增广叠加
+        augment_hsv_h = augment_hsv_s = augment_hsv_v = 0.0
+    rgb_gain_p = min(1.0, max(0.0, float(rgb_gain_p)))
+    rgb_gain_maxes = tuple(
+        min(1.0, max(0.0, float(v)))
+        for v in (rgb_gain_max_r, rgb_gain_max_g, rgb_gain_max_b)
+    )
 
     output_dir = Path(output_dir).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -358,6 +451,47 @@ def run_train(
 
     # ---- 加载预训练模型 ----
     model = YOLO(model_name)
+
+    if task_type == "seg":
+        if seg_loss != "default":
+            def _set_segmentation_criterion(trainer):
+                from ultralytics.utils.torch_utils import unwrap_model
+                from .segmentation_loss import build_segmentation_criterion
+
+                train_model = unwrap_model(trainer.model)
+                train_model.criterion = build_segmentation_criterion(
+                    train_model, seg_loss, seg_loss_params
+                )
+
+                ema_model = getattr(getattr(trainer, "ema", None), "ema", None)
+                if ema_model is not None:
+                    ema_model = unwrap_model(ema_model)
+                    ema_model.criterion = build_segmentation_criterion(
+                        ema_model, seg_loss, seg_loss_params
+                    )
+                print(f"[seg loss] 实例掩膜损失 = {seg_loss}，参数 = {seg_loss_params}")
+
+            model.add_callback("on_train_start", _set_segmentation_criterion)
+
+        # results.csv 只能在训练结束后重写：训练期间 ultralytics 按固定列头 append，
+        # 中途加列会让后续行与表头错位。
+        def _tag_seg_loss_column(trainer):
+            _tag_results_csv_seg_loss(getattr(trainer, "save_dir", None), seg_loss)
+
+        model.add_callback("on_train_end", _tag_seg_loss_column)
+
+    if color_aug_mode == "rgb" and rgb_gain_p > 0 and any(v > 0 for v in rgb_gain_maxes):
+        def _setup_rgb_jitter(trainer):
+            _install_rgb_channel_jitter(trainer, rgb_gain_p, rgb_gain_maxes)
+
+        model.add_callback("on_train_start", _setup_rgb_jitter)
+        r_max, g_max, b_max = rgb_gain_maxes
+        print(
+            f"[color aug] RGB 逐通道亮度增益：概率={rgb_gain_p}，"
+            f"R=±{r_max} G=±{g_max} B=±{b_max}"
+        )
+    elif color_aug_mode == "off":
+        print("[color aug] 颜色增广已关闭（HSV 与 RGB 均不生效）")
 
     # ---- 注册取消检查回调 ----
     # 在每个 epoch 开始前/结束后 + 每隔 N 个 batch 检查是否被外部取消
