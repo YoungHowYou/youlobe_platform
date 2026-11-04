@@ -310,8 +310,14 @@ if _dist.is_dir():
             raise HTTPException(status_code=404, detail="Not Found")
         f = (_dist / full_path).resolve()
         if full_path and f.is_file() and f.is_relative_to(_dist):
-            return FileResponse(str(f))                       # favicon.ico / vite.svg 等根文件
-        return FileResponse(str(_dist / "index.html"))        # SPA 入口（/login、/project/x 等前端路由）
+            # favicon.ico / vite.svg 等根文件：可短缓存
+            return FileResponse(str(f), headers={"Cache-Control": "public, max-age=3600"})
+        # SPA 入口：必须每次回源校验。若允许强缓存，重新构建后浏览器会拿着旧
+        # index.html 去请求已不存在的 hash 资源 → 白屏 / 页面打不开。
+        return FileResponse(
+            str(_dist / "index.html"),
+            headers={"Cache-Control": "no-cache, must-revalidate"},
+        )
 
 
 # ---- 启动入口 ----
