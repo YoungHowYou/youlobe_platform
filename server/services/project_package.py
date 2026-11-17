@@ -11,9 +11,16 @@ ZIP 结构:
     ├── images.json          图片元数据列表
     ├── annotations.json     标注数据列表
     ├── masks/               PNG 标注 mask（每图一张，与 images/ 按文件名配对）
-    │   └── {stem}.png       单通道灰度图，像素值 = class_index + 1（0 = 背景）
+    │   ├── {stem}.png       单通道灰度图，像素值 = class_index + 1（0 = 背景）
+    │   ├── labelmap.json    编码表：像素值 → class_index / 类别名 / 颜色
+    │   └── labelmap.txt     同上的人类可读版（tab 分隔）
     └── images/              原图文件
         └── {filename}
+
+注意：mask 的像素值比 annotations.json / project.json 里的 class_index **大 1**
+（避免第一个类别画成背景色）。这个偏移是 mask 的编码约定，必须随包交付——
+所以 masks/labelmap.json、masks/labelmap.txt 和 project.json 的 mask_encoding
+都会声明它，每个 PNG 内部也写入了 mask_encoding 的 tEXt 元数据。
 """
 
 import hashlib
@@ -39,7 +46,7 @@ from ..models.train_task import TrainTask, TrainEpochLog
 # 单个 ZIP 内文件解压后大小上限（防 zip bomb），200MB 远超任何真实工业图
 _MAX_ENTRY_SIZE = 200 * 1024 * 1024
 _MAX_WEIGHT_SIZE = 2 * 1024 * 1024 * 1024
-_VALID_TASK_TYPES = {"seg", "det", "cls", "obb"}
+_VALID_TASK_TYPES = {"seg", "det", "cls", "obb", "semseg"}
 _VALID_PROJECT_STATUSES = {"active", "archived"}
 _VALID_IMAGE_STATUSES = {"unlabeled", "labeling", "labeled", "reviewed"}
 _VALID_TASK_STATUSES = {"pending", "preparing", "training", "exporting", "completed", "failed", "cancelled"}
@@ -68,17 +75,84 @@ def _polygon_points(ann) -> list[tuple[float, float]]:
     return pts
 
 
+def _build_mask_labelmap(defect_classes: list) -> dict:
+    """构造 mask 编码表：像素值 = class_index + 1，0 = 背景。
+
+    这份表是 mask 的“编码说明”，导出包里必须带上，否则外部工具无法把
+    像素值还原成类别（class_index 是 0 基，直接解码会整体错位、第一类变背景）。
+    """
+    classes = []
+    for dc in defect_classes:
+        class_index = int(dc.class_index)
+        if class_index + 1 > 255:
+            # 8 位单通道 mask 存不下，继续导出会 uint8 溢出把该类画成背景
+            raise ValueError(
+                f"类别 {dc.name or class_index} 的 class_index={class_index} 超出 8 位 mask 可编码范围（最大 254）"
+            )
+        classes.append({
+            "pixel_value": class_index + 1,
+            "class_index": class_index,
+            "name": (dc.name or "").strip() or f"class_{class_index}",
+            "color": dc.color,
+        })
+    return {
+        "background": 0,
+        "encoding": "pixel_value = class_index + 1 (0 = background)",
+        "classes": classes,
+    }
+
+
+def _labelmap_txt(labelmap: dict) -> str:
+    """人类可读的编码表：每行 `像素值<TAB>类别名`，可用 `#` 注释行跳过。"""
+    lines = [
+        "# PNG mask 编码表：像素值 = class_index + 1，0 = 背景",
+        "# pixel_value\tclass_index\tclass_name",
+        "0\t-1\tbackground",
+    ]
+    for c in labelmap.get("classes", []):
+        lines.append(f"{c['pixel_value']}\t{c['class_index']}\t{c['name']}")
+    return "\n".join(lines) + "\n"
+
+
+def _attach_mask_encoding_meta(png_bytes: bytes, labelmap: dict | None) -> bytes:
+    """把编码表写进 PNG 自身的 tEXt 元数据块（像素值完全不变）。
+
+    这样即使 mask 被单独拷走、脱离 labelmap.json，也能从 PNG 里读回编码。
+    Pillow 不在时静默跳过（不影响灰度像素语义）。
+    """
+    if not labelmap:
+        return png_bytes
+    try:
+        from io import BytesIO
+
+        from PIL import Image, PngImagePlugin
+    except ImportError:  # pragma: no cover - Pillow 通常随 ultralytics 一起装
+        return png_bytes
+    try:
+        with Image.open(BytesIO(png_bytes)) as im:
+            im.load()
+            info = PngImagePlugin.PngInfo()
+            info.add_text("mask_encoding", json.dumps(labelmap, ensure_ascii=False))
+            out = BytesIO()
+            im.save(out, format="PNG", pnginfo=info, optimize=True)
+            return out.getvalue()
+    except Exception:  # pragma: no cover - 元数据写失败不该影响导出
+        return png_bytes
+
+
 def _render_mask_png(
     img_w: int,
     img_h: int,
     annotations: list,
     class_id_to_index: dict,
+    labelmap: dict | None = None,
 ) -> bytes | None:
     """把一张图的全部 polygon 标注栅格化为单通道 PNG mask。
 
     像素值 = class_index + 1（0 = 背景；平台 class_index 从 0 起，mask 值统一 +1
     避免首个类别画成背景色）。多标注按保存顺序绘制，后者覆盖重叠区。
     OK/无标注图得到全 0 mask（背景样本）。cls 项目图级标签不走 mask。
+    传入 labelmap 时，编码表会写入 PNG 的 tEXt 元数据。
     """
     import cv2
     import numpy as np
@@ -105,7 +179,9 @@ def _render_mask_png(
         cv2.fillPoly(mask, [px], int(ci) + 1)
 
     ok, buf = cv2.imencode(".png", mask)
-    return buf.tobytes() if ok else None
+    if not ok:
+        return None
+    return _attach_mask_encoding_meta(buf.tobytes(), labelmap)
 
 
 def export_project_to_zip(project_id: int, db: Session, out_path: Path) -> dict:
@@ -121,6 +197,7 @@ def export_project_to_zip(project_id: int, db: Session, out_path: Path) -> dict:
         .all()
     )
     class_id_to_index = {dc.id: dc.class_index for dc in defect_classes}
+    labelmap = _build_mask_labelmap(defect_classes)
 
     # 只导出已标注或已审核的图片
     images = (
@@ -141,6 +218,12 @@ def export_project_to_zip(project_id: int, db: Session, out_path: Path) -> dict:
             {"class_index": dc.class_index, "name": dc.name, "color": dc.color}
             for dc in defect_classes
         ],
+        # mask 编码约定：像素值 = class_index + 1，0 = 背景；完整映射见 masks/labelmap.json
+        "mask_encoding": {
+            "background": 0,
+            "pixel_value": "class_index + 1",
+            "labelmap": "masks/labelmap.json",
+        },
         "exported_at": datetime.now().isoformat(),
         "source_project_id": project_id,
     }
@@ -199,12 +282,20 @@ def export_project_to_zip(project_id: int, db: Session, out_path: Path) -> dict:
             if project.task_type != "cls":
                 mask_png = _render_mask_png(
                     img.width or 1, img.height or 1,
-                    img.annotations, class_id_to_index,
+                    img.annotations, class_id_to_index, labelmap,
                 )
                 if mask_png is not None:
                     stem = Path(zip_img_name).stem
                     zf.writestr(f"masks/{stem}.png", mask_png)
                     mask_count += 1
+
+        # mask 编码表随包交付（缺失时外部只能猜像素值含义）
+        if project.task_type != "cls":
+            zf.writestr(
+                "masks/labelmap.json",
+                json.dumps(labelmap, ensure_ascii=False, indent=2),
+            )
+            zf.writestr("masks/labelmap.txt", _labelmap_txt(labelmap))
 
         zf.writestr("project.json", json.dumps(project_data, ensure_ascii=False, indent=2))
         zf.writestr("images.json", json.dumps(images_data, ensure_ascii=False, indent=2))

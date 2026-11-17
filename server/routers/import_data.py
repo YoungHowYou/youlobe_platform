@@ -102,6 +102,9 @@ async def import_project(
     resize_w: int = Form(default=2048),
     crop_size: int = Form(default=640),
     overlap: float = Form(default=0.2),
+    # 'seg'=实例分割（每个缺陷一个实例多边形）/ 'semseg'=语义分割（同一份多边形，
+    # 训练时栅格化合并成二值或逐类 mask）
+    task_type: str = Form(default="seg"),
     class_mapping_json: str = Form(...),  # JSON: {"像素值": {"class_index": 0, "name": "崩边", "color": "#FF0000"}}
     images: List[UploadFile] = File(...),
     masks: List[UploadFile] = File(...),
@@ -110,6 +113,12 @@ async def import_project(
     """
     执行导入：创建项目 + 导入图片 + 转换标注
 
+    task_type:
+        - 'seg'：实例分割，mask 像素值→类别，每个连通域一个实例多边形
+        - 'semseg'：语义分割，**同一份多边形标注**（像素值→类别），训练时由
+          ``prepare_semantic_dataset`` 栅格化合并成 mask（二分类或逐类），
+          因此导入产物与 seg 完全一致，只差项目类型。
+
     class_mapping_json 格式:
     {
         "1": {"class_index": 0, "name": "崩边", "color": "#FF0000"},
@@ -117,6 +126,9 @@ async def import_project(
         ...
     }
     """
+    if task_type not in ("seg", "semseg"):
+        raise HTTPException(status_code=400, detail="task_type 必须是 seg 或 semseg")
+
     # 解析类别映射
     try:
         class_mapping_raw = json.loads(class_mapping_json)
@@ -138,7 +150,10 @@ async def import_project(
     # 1. 创建项目
     project = Project(
         name=project_name,
-        description=description or "导入项目",
+        description=description or (
+            "导入的语义分割项目" if task_type == "semseg" else "导入项目"
+        ),
+        task_type=task_type,
         resize_h=resize_h, resize_w=resize_w,
         crop_size=crop_size, overlap=overlap,
     )
@@ -249,6 +264,7 @@ async def import_project(
     return {
         "project_id": project.id,
         "project_name": project.name,
+        "task_type": project.task_type,
         "stats": stats,
     }
 

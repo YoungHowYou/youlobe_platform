@@ -231,14 +231,18 @@ def run_export(
                 import glob as _glob
                 _ds = _Path(dataset_path)
                 if _ds.is_dir():
-                    # 优先找名为 dataset.yaml 的文件
-                    _candidates = list(_ds.glob("dataset.yaml")) or list(_ds.glob("*.yaml"))
-                    if not _candidates:
-                        raise RuntimeError(
-                            f"在目录 {dataset_path} 中未找到 .yaml 文件\n"
-                            "请选择包含 dataset.yaml 的数据集目录"
-                        )
-                    dataset_yaml_path = str(_candidates[0])
+                    # 分类（ImageFolder）：ultralytics 期望数据集根目录，而不是 yaml
+                    if (_ds / "train").is_dir() and (_ds / "val").is_dir():
+                        dataset_yaml_path = str(_ds)
+                    else:
+                        # 优先找名为 dataset.yaml 的文件
+                        _candidates = list(_ds.glob("dataset.yaml")) or list(_ds.glob("*.yaml"))
+                        if not _candidates:
+                            raise RuntimeError(
+                                f"在目录 {dataset_path} 中未找到 .yaml 文件\n"
+                                "请选择包含 dataset.yaml 的数据集目录"
+                            )
+                        dataset_yaml_path = str(_candidates[0])
                 else:
                     dataset_yaml_path = str(_ds)  # 直接是 yaml 文件
 

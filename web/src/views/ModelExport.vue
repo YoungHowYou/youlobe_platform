@@ -86,14 +86,17 @@
             <el-radio label="fp32">FP32（默认）</el-radio>
             <el-radio label="fp16">FP16（模型减半，GPU 推理更快）</el-radio>
             <el-radio label="int8" :disabled="exportFormat !== 'openvino'">
-              INT8（CPU 最快，仅 OpenVINO，需 nncf）
+              INT8（CPU 最快，仅 OpenVINO）
             </el-radio>
           </el-radio-group>
         </el-form-item>
         <el-alert v-if="precision==='int8'" type="warning" :closable="false" style="margin-bottom:12px">
           <div style="font-size:12px">
-            INT8 量化需要校准数据集，会自动使用训练时的 dataset 目录。<br>
-            需安装 nncf: <code>pip install nncf</code>，导出时间较长（2~5 分钟）。
+            INT8 用 NNCF 后训练量化（PTQ），需要<b>真实缺陷样本</b>校准：<br>
+            · 检测/分割/旋转：自动使用训练时的 dataset 目录<br>
+            · 若训练中间产物已被清理：自动用训练收尾保留的校准集，或从项目原图 + 标注重建（老任务也能导）<br>
+            · 语义分割：自动从项目标注里按<b>缺陷中心</b>裁 patch 校准（全背景校准会让 Dice 崩掉）<br>
+            需安装 <code>nncf</code>，导出时间较长（2~5 分钟）。
           </div>
         </el-alert>
         <el-form-item v-if="isEnd2endModel && exportFormat !== 'tensorrt'" label="YOLO26 模式">

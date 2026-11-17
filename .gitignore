@@ -65,3 +65,27 @@ admin_private/
 # 本地虚拟环境 / 后端实例锁
 .venv/
 .backend.pid
+
+# 语义分割验证概率图（54 个 .npy ≈ 3.4GB，体量过大不入库；本地保留）
+weights/resunet34_512_e_best/val_probs/
+*.npy
+
+weights/resunet34_512_e_best/best_mIoU_iter_2000.pth
+weights/resunet34_512_e_best/e_best_512.onnx
+weights/resunet34_512_e_best/iter_500.pth
+weights/resunet34_512_e_best/iter_1000.pth
+weights/resunet34_512_e_best/iter_1500.pth
+weights/resunet34_512_e_best/iter_2000.pth
+weights/resunet34_512_e_best/iter_2500.pth
+weights/resunet34_512_e_best/iter_3000.pth
+weights/resunet34_512_e_best/iter_3500.pth
+weights/resunet34_512_e_best/iter_4000.pth
+weights/resunet34_512_e_best/iter_4500.pth
+weights/resunet34_512_e_best/iter_5000.pth
+weights/resunet34_512_e_best/iter_5500.pth
+weights/resunet34_512_e_best/iter_6000.pth
+weights/resunet34_512_e_best/iter_6500.pth
+weights/resunet34_512_e_best/iter_7000.pth
+weights/resunet34_512_e_best/iter_7500.pth
+weights/resunet34_512_e_best/iter_8000.pth
+weights/resunet34_512_e_best/last_checkpoint

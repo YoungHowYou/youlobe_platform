@@ -374,15 +374,16 @@ async def merge_package(
 @router.post("/{project_id}/convert-task-type")
 def convert_task_type(
     project_id: int,
-    target_type: str = Form(..., description="目标类型: seg / det"),
+    target_type: str = Form(..., description="目标类型: seg / det / obb / semseg"),
     mode: str = Form(default="copy", description="inplace=原地 / copy=复制为新项目"),
     new_name: str = Form(default="", description="复制模式下的新项目名"),
     db: Session = Depends(get_db),
 ):
     """
-    转换项目任务类型（seg ↔ det）。
-    标注数据本身不需要修改 —— 平台标注统一以 polygon 存储，
-    det 模式下是 4 点矩形，对 seg 训练同样合法。
+    转换项目任务类型（seg / det / obb / semseg）。
+    标注数据本身不需要修改 —— 平台标注统一以 polygon 存储：
+    det 模式下是 4 点矩形、semseg 训练时栅格化合并成二值前景 mask，
+    对 seg 训练同样合法。cls 项目是图级标签，不参与转换。
     """
     try:
         result = convert_project_task_type(

@@ -40,7 +40,7 @@
         <el-table-column label="最佳指标" width="150">
           <template #default="{row}">
             <span v-if="row.best_map50" style="font-weight:600;color:#67C23A">
-              {{ row.config?.task_type === 'cls' ? 'Top-1' : 'mAP50' }}
+              {{ row.config?.task_type === 'cls' ? 'Top-1' : (row.config?.task_type === 'semseg' ? 'Dice' : 'mAP50') }}
               {{ (row.best_map50*100).toFixed(1) }}%
             </span>
             <span v-else style="color:#999">-</span>
@@ -202,6 +202,18 @@
             <div ref="chartTop5" style="width:100%;height:280px"></div>
           </div>
         </div>
+        <!-- semseg：Dice / IoU / Pixel Recall -->
+        <div v-else-if="isSemsegTask" class="charts-grid">
+          <div class="chart-box">
+            <div ref="chartDice" style="width:100%;height:280px"></div>
+          </div>
+          <div class="chart-box">
+            <div ref="chartIou" style="width:100%;height:280px"></div>
+          </div>
+          <div class="chart-box">
+            <div ref="chartPixelRecall" style="width:100%;height:280px"></div>
+          </div>
+        </div>
         <!-- seg/det/obb：Precision / Recall / mAP@50 / mAP@50:95 -->
         <div v-else class="charts-grid">
           <div class="chart-box">
@@ -260,6 +272,8 @@ const selectedTask = computed(() => tasks.value.find(t => t.id === selectedTaskI
 
 // 是否分类任务（cls 的指标和 seg/det/obb 不同：单一 loss + Top1/Top5 准确率）
 const isClsTask = computed(() => (selectedTask.value?.config as any)?.task_type === 'cls')
+// 是否语义分割（半 seg：Dice/IoU/Pixel Recall，不画 mAP）
+const isSemsegTask = computed(() => (selectedTask.value?.config as any)?.task_type === 'semseg')
 const selectedTiming = computed(() => getTiming(selectedTask.value || null))
 
 // ========== 训练参数展示 ==========
@@ -269,11 +283,13 @@ const cfg = computed<Record<string, any>>(() => (selectedTask.value?.config || {
 interface ParamItem { key: string; label: string; tip?: string; fmt?: 'pct' | 'fix2' | 'fix4' | 'json' }
 interface ParamGroup { title: string; items: ParamItem[]; note?: string }
 
-const paramGroups: ParamGroup[] = [
+const paramGroups = computed<ParamGroup[]>(() => {
+  const semseg = isSemsegTask.value
+  return [
   {
     title: '基本参数',
     items: [
-      { key: 'task_type',     label: '任务类型',  tip: 'seg=分割 / det=检测 / cls=分类 / obb=旋转检测' },
+      { key: 'task_type',     label: '任务类型',  tip: 'seg=分割 / semseg=语义分割 / det=检测 / cls=分类 / obb=旋转检测' },
       { key: 'model_name',    label: '模型',      tip: '权重文件名（如 yolo11s-obb.pt）' },
       { key: 'epochs',        label: 'Epochs',    tip: '训练总轮数' },
       { key: 'batch_size',    label: 'Batch Size',tip: '一次梯度更新的图片数' },
@@ -287,7 +303,12 @@ const paramGroups: ParamGroup[] = [
   },
   {
     title: '学习率',
-    items: [
+    items: semseg ? [
+      { key: 'lr',              label: '初始学习率 lr', tip: 'AdamW；编码器使用 lr × encoder_lr_mult' },
+      { key: 'encoder_lr_mult', label: '编码器 lr 倍率' },
+      { key: 'weight_decay',    label: 'Weight Decay' },
+      { key: 'warmup_iters',    label: '预热 Iter' },
+    ] : [
       { key: 'lr0',             label: '初始学习率 lr0' },
       { key: 'lrf',             label: '终末学习率 lrf', tip: '相对 lr0 的倍数；最终 lr = lr0 × lrf' },
       { key: 'momentum',        label: 'Momentum' },
@@ -335,17 +356,33 @@ const paramGroups: ParamGroup[] = [
     ],
   },
   {
-    title: '数据集预处理',
+    title: semseg ? '语义分割采样' : '数据集预处理',
     // 2026-10-22 起 seg/det/obb 不再统一缩放：直接按原图分辨率 + crop_size/overlap 滑窗，
     // projects.resize_h/w 只保留字段兼容，所以这里不再展示（老任务配置里可能还残留）
-    note: '图像不缩放：按原图分辨率 + 切割尺寸/重叠率滑窗（旧的 Resize H/W 已废弃、不参与训练）',
-    items: [
+    note: semseg
+      ? '不预切图：每个 patch 以缺陷像素为中心随机裁剪；1 epoch = 图数 × patches_per_image'
+      : '图像不缩放：按原图分辨率 + 切割尺寸/重叠率滑窗（旧的 Resize H/W 已废弃、不参与训练）',
+    items: semseg ? [
+      { key: 'semseg_mode',         label: '分割模式', tip: 'binary=缺陷/背景；multiclass=背景+项目每个类别（像素值 = class_index + 1）' },
+      { key: 'semseg_num_classes',  label: '输出类别数', tip: '多分类：背景 + N 个类别' },
+      { key: 'semseg_fg_class_weight', label: '前景类别权重', tip: 'CE class_weight = [1, w, w, ...]；仅多分类生效' },
+      { key: 'semseg_halo',       label: 'Halo 上下文', tip: 'px；输入 = patch_size + 2×halo，loss/指标只看中心有效区' },
+      { key: 'semseg_input_size', label: '网络输入边长', tip: 'patch_size + 2×halo（训练/推理一致）' },
+      { key: 'semseg_stride_ratio', label: '推理步长比例', tip: '滑窗步长 = patch_size × 该值' },
+      { key: 'patch_size',       label: 'Patch 尺寸（有效区）' },
+      { key: 'patches_per_image', label: '每图 Patch 数' },
+      { key: 'accum_steps',      label: '梯度累积步数' },
+      { key: 'pos_weight',       label: 'pos_weight' },
+      { key: 'cldice_weight',    label: 'clDice 权重' },
+      { key: 'semseg_threshold', label: '推理阈值' },
+      { key: 'semseg_min_area',  label: '最小连通域面积' },
+    ] : [
       { key: 'crop_size',         label: '切割尺寸' },
       { key: 'overlap',           label: '滑窗重叠率' },
       { key: 'oversample_factor', label: '过采样倍数' },
     ],
   },
-]
+] })
 
 function hasValue(k: string): boolean {
   if (k === 'workers') return true
@@ -407,6 +444,10 @@ const chartMap5095 = ref<HTMLElement>()
 // cls 专用
 const chartTop1 = ref<HTMLElement>()
 const chartTop5 = ref<HTMLElement>()
+// semseg 专用
+const chartDice = ref<HTMLElement>()
+const chartIou = ref<HTMLElement>()
+const chartPixelRecall = ref<HTMLElement>()
 const chartLr = ref<HTMLElement>()
 
 let charts: echarts.ECharts[] = []
@@ -550,6 +591,18 @@ function renderCharts() {
       ep.map(e => e.train_cls_loss), ep.map(e => e.val_cls_loss))
     renderMetricChart(chartTop1.value, 'Top-1 Accuracy', x, ep.map(e => e.top1_acc), '#67C23A')
     renderMetricChart(chartTop5.value, 'Top-5 Accuracy', x, ep.map(e => e.top5_acc), '#409EFF')
+  } else if (isSemsegTask.value) {
+    // ---- 语义分割：Seg Loss + Dice / IoU / Pixel Recall ----
+    const raw = ep as any[]
+    for (const def of lossDefs.value) {
+      renderLossChart(lossChartEls[def.key], def.title, x,
+        raw.map(e => e[`train_${def.key}_loss`]), raw.map(e => e[`val_${def.key}_loss`]))
+    }
+    renderMetricChart(chartDice.value, 'Dice（合并二分类）', x, raw.map(e => e.val_dice), '#67C23A',
+      { name: 'mDice', data: raw.map(e => e.val_mdice), color: '#909399' })
+    renderMetricChart(chartIou.value, 'IoU（合并二分类）', x, raw.map(e => e.val_iou), '#409EFF',
+      { name: 'mIoU', data: raw.map(e => e.val_miou), color: '#F56C6C' })
+    renderMetricChart(chartPixelRecall.value, 'Pixel Recall', x, raw.map(e => e.val_recall), '#E6A23C')
   } else {
     // ---- 检测/分割/旋转：Loss 按实际数据动态出图 + 4 张 Metric ----
     const raw = ep as any[]
@@ -599,7 +652,8 @@ function renderLossChart(el: HTMLElement | undefined, title: string, x: number[]
   }, true)
 }
 
-function renderMetricChart(el: HTMLElement | undefined, title: string, x: number[], data: (number|null)[], color: string) {
+function renderMetricChart(el: HTMLElement | undefined, title: string, x: number[], data: (number|null)[], color: string,
+                           extra?: { name: string; data: (number|null)[]; color: string }) {
   const chart = makeChart(el)
   if (!chart) return
 
@@ -633,7 +687,11 @@ function renderMetricChart(el: HTMLElement | undefined, title: string, x: number
         label: { formatter: (p: any) => Number(p.value).toFixed(4) },
         symbolSize: 40,
       } : undefined,
-    }],
+    }, ...(extra && extra.data.some(v => v != null) ? [{
+      name: extra.name, type: 'line', data: extra.data, smooth: true, connectNulls: true,
+      lineStyle: { width: 2, color: extra.color }, itemStyle: { color: extra.color }, symbol: 'none',
+    }] : []),
+    ],
   }, true)
 }
 

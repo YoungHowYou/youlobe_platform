@@ -320,7 +320,8 @@ def sweep_orphan_upload_dirs(valid_project_ids: Iterable[int]) -> list[str]:
 
 
 # 训练后才需要、训练结束就能删的中间产物（都能由 DB 标注 + uploads 重新生成）
-TRANSIENT_DIRS = ("raw", "preprocessed", "cropped", "dataset")
+# semseg_dataset 里只有 manifest.json（train/val/mask 路径），mask/points 在 raw/ 下
+TRANSIENT_DIRS = ("raw", "preprocessed", "cropped", "dataset", "semseg_dataset")
 TRANSIENT_FILES = ("dataset.yaml",)
 
 

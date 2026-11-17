@@ -51,7 +51,8 @@
               </el-tag>
               <span>
                 <el-icon><Picture /></el-icon>
-                原图 → {{ p.crop_size }} 滑窗 · 重叠 {{ Math.round((p.overlap ?? 0) * 100) }}%
+                <template v-if="p.task_type === 'semseg'">缺陷中心 {{ p.crop_size }} patch（不预切图）</template>
+                <template v-else>原图 → {{ p.crop_size }} 滑窗 · 重叠 {{ Math.round((p.overlap ?? 0) * 100) }}%</template>
               </span>
               <span>
                 <el-icon><Collection /></el-icon>
@@ -117,12 +118,14 @@
         <el-form-item label="任务类型" required>
           <el-radio-group v-model="form.task_type" class="radio-cards">
             <el-radio-button label="seg">实例分割（Seg）</el-radio-button>
+            <el-radio-button label="semseg">语义分割（SemSeg）</el-radio-button>
             <el-radio-button label="det">目标检测（Det）</el-radio-button>
             <el-radio-button label="obb">旋转检测（OBB）</el-radio-button>
             <el-radio-button label="cls">图像分类（Cls）</el-radio-button>
           </el-radio-group>
           <div class="hint" style="margin-top:4px">
             <span v-if="form.task_type === 'seg'">分割：标注多边形区域，输出像素级 Mask</span>
+            <span v-else-if="form.task_type === 'semseg'">语义分割：标注多边形，训练 ResUNet34 输出二值缺陷 mask（不区分实例/类别）</span>
             <span v-else-if="form.task_type === 'det'">检测：标注矩形框，仅输出水平 bbox（适合小图、规整目标）</span>
             <span v-else-if="form.task_type === 'obb'">旋转检测：标注多边形（≥4 点），输出旋转矩形（适合航拍/遥感/有方向的密集目标）</span>
             <span v-else>分类：图级标签（每张图一个类别），适合小图缺陷分类</span>
@@ -137,10 +140,15 @@
           v-if="form.task_type !== 'cls'"
           type="info" :closable="false" show-icon
           style="margin-bottom:12px"
-          title="不再统一缩放：原图直接按滑窗切片"
+          :title="form.task_type === 'semseg' ? '语义分割不预切图：训练时按缺陷中心实时裁剪' : '不再统一缩放：原图直接按滑窗切片'"
         >
           <div style="font-size:12px;line-height:1.7">
-            训练时不再把图缩放到固定尺寸，而是按原图分辨率 → 以「切割尺寸」为窗口、按「重叠率」滑窗后送入模型（seg / det / obb 一致）。
+            <template v-if="form.task_type === 'semseg'">
+              缺陷仅占约 0.0036%，随机裁剪几乎采不到正样本，训练时改为<b>以缺陷像素为中心的 patch 随机采样</b>；「切割尺寸」就是 patch 尺寸（实验最优 512）。
+            </template>
+            <template v-else>
+              训练时不再把图缩放到固定尺寸，而是按原图分辨率 → 以「切割尺寸」为窗口、按「重叠率」滑窗后送入模型（seg / det / obb 一致）。
+            </template>
           </div>
         </el-alert>
         <el-row :gutter="16" v-if="form.task_type !== 'cls'">
@@ -153,7 +161,7 @@
               />
             </el-form-item>
           </el-col>
-          <el-col :span="12" v-if="form.task_type === 'seg'">
+          <el-col :span="12" v-if="form.task_type === 'seg' || form.task_type === 'det' || form.task_type === 'obb'">
             <el-form-item label="重叠率">
               <el-input-number v-model="form.overlap" :min="0" :max="0.5" :step="0.05" :precision="2" style="width:100%" />
             </el-form-item>
@@ -192,21 +200,22 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed, onMounted } from 'vue'
+import { ref, computed, onMounted, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { projectApi, type Project, type ProjectCreate, type DefectClass } from '../api/project'
 
 function taskTypeLabel(t: string | undefined) {
-  return ({ seg: '实例分割', det: '目标检测', cls: '图像分类', obb: '旋转检测' } as any)[t || 'seg'] || '实例分割'
+  return ({ seg: '实例分割', semseg: '语义分割', det: '目标检测', cls: '图像分类', obb: '旋转检测' } as any)[t || 'seg'] || '实例分割'
 }
 function taskTypeTag(t: string | undefined) {
-  return ({ seg: 'success', det: 'warning', cls: 'primary', obb: 'danger' } as any)[t || 'seg'] || 'success'
+  return ({ seg: 'success', semseg: 'info', det: 'warning', cls: 'primary', obb: 'danger' } as any)[t || 'seg'] || 'success'
 }
 
-// 项目分组顺序：seg → cls → obb → det，组内按 created_at 倒序
+// 项目分组顺序：seg → semseg → cls → obb → det，组内按 created_at 倒序
 const GROUP_ORDER: Array<{ type: string; label: string }> = [
   { type: 'seg', label: '实例分割' },
+  { type: 'semseg', label: '语义分割' },
   { type: 'cls', label: '图像分类' },
   { type: 'obb', label: '旋转检测' },
   { type: 'det', label: '目标检测' },
@@ -258,7 +267,15 @@ const form = ref<ProjectCreate & { class_names: DefectClass[] }>({
 const cropSizeLabel = computed(() => {
   const t = form.value.task_type
   if (t === 'cls') return '训练图尺寸'
+  if (t === 'semseg') return 'Patch 尺寸'
   return '切割尺寸'
+})
+
+// 语义分割默认 patch=512（实验最优），避免沿用 seg 的 640
+watch(() => form.value.task_type, (t) => {
+  if (t === 'semseg' && (!form.value.crop_size || form.value.crop_size === 640)) {
+    form.value.crop_size = 512
+  }
 })
 
 function addClass() {

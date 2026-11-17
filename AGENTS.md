@@ -44,18 +44,107 @@ uvicorn 没开 `--reload`，必须手动 kill PID + 重启。重启会把未跑�
 
 ---
 
-## 4 种任务类型
+## 5 种任务类型
 
 `projects.task_type` 决定整个流水线行为：
 
 | type | 含义 | 训练数据集 | 模型默认 | 切片 |
 |---|---|---|---|---|
 | `seg` | 实例分割 | YOLO polygon txt | yolo26s-seg.pt | **原图 → 按 crop_size/overlap 滑窗（不缩放）** |
+| `semseg` | 语义分割（二值缺陷 mask） | polygon 栅格化 → mask + 缺陷点索引 | resunet34_cldice | **不预切图**，训练时按缺陷中心随机 patch |
 | `det` | 目标检测 | YOLO bbox txt | yolo26s.pt | **原图 → 按 crop_size/overlap 滑窗（不缩放）** |
 | `cls` | 图像分类 | ImageFolder `dataset/<class>/` | yolo11s-cls.pt | **不切片**，整图 letterbox 到 imgsz |
 | `obb` | 旋转目标检测 | YOLO 4 角点 txt（8 归一化坐标） | yolo11s-obb.pt | **原图 → 按 crop_size/overlap 滑窗（不缩放）** |
 
 cls 标签存 `images.class_id`（图级），其他 task 标签存 `annotations.polygon`（实例级）。
+
+### 任务类型互转（`server/services/project_convert.py`）
+
+「标注转换」页支持 **seg ↔ det ↔ obb ↔ semseg** 互转（`POST /api/projects/{id}/convert-task-type`，
+`mode=copy` 复制新项目 / `mode=inplace` 原地改类型），**标注一律不改**：
+
+| 目标 | 训练端怎么理解同一份 polygon |
+|---|---|
+| `seg` | 多边形 → 实例 mask |
+| `det` | 多边形外接水平矩形 → bbox |
+| `obb` | 多边形 → 最小外接旋转矩形（推荐 seg→obb） |
+| `semseg` | 把该图所有实例、所有类别**合并成一张二值前景 mask**（0=背景 / 1=缺陷），按缺陷中心采样 patch，不预切图、不用 crop_size/overlap |
+
+- 「实例分割 → 语义分割」只是改 `projects.task_type`：`prepare_semantic_dataset` 自己会
+  栅格化合并，类别索引仍写进 `masks_ids`（当前 `num_classes=1`，只训前景）。
+- 转换接口额外返回 `warnings`（例：semseg 会合并类别、有标注的图不足 2 张无法开训），
+  前端在结果弹窗里展示。
+- `cls`（图级标签）没有多边形，不参与任何转换（后端直接 400）。
+- copy 模式会把类别、图片文件、`shape`/`shape_params`（矩形/圆保持参数化）、`content_hash` 一起复制。
+
+### semseg（2026-11-09 新增）
+
+- 架构固定 **ResUNet34 + FCNHead**（31.9M），Loss = BCE(pos_weight=5)+Dice+clDice，
+  阈值 **0.6**，512 patch 缺陷中心采样。实验 test Dice 0.729。
+- 纯 PyTorch 复刻在 `core/semseg/`，**不依赖 mmseg/mmcv/mmengine**；
+  checkpoint 兼容 MMSeg 的 `state_dict`（模块命名逐键一致）。
+- 数据集：`prepare_semantic_dataset` 把 polygon 栅格化成 `masks_binary`（0/255）与
+  `masks_ids`（类别索引），并预存缺陷点 `points/*.npy`；**不滑窗切图**。
+- 训练：`core/semseg/trainer.py`（AdamW 1e-4、编码器 ×0.1、梯度累积 4、AMP、
+  LinearLR 500 + PolyLR 0.9）；产物 `runs/best.pt` / `runs/last.pt` 为平台格式
+  `{'model': state_dict, 'meta': ...}`，不是 ultralytics 模型。
+- 推理/导出：`server/routers/inference.py::_run_semseg_inference`、
+  `core/semseg/export.py`（ONNX opset17 + OpenVINO FP16 / **INT8**）。
+- INT8（2026-11-16）：NNCF PTQ 量化，校准数据由 `collect_semseg_calibration_patches()`
+  从项目标注按**缺陷像素中心**裁真实 patch（全背景/随机校准会把缺陷概率区间压掉，实测 Dice 0.7→0.01）。
+  实测（task18 真实模型，640 patch / 6 类，P100 机器 CPU 推理）：260 ms → 161 ms（**1.62×**）；
+  256 patch 的对照模型 41.7 ms → 20.1 ms（2.08×）；权重 98.5 MB → 24.7 MB。
+  精度：真实模型 FP32 vs INT8 概率 MAE <0.0001、前景 IoU 0.983、argmax 一致率 0.9999。
+  产物命名 `semseg_{imgsz}_int8.xml/.bin`（FP16 是 `_fp16`，FP32 保持 `semseg_{imgsz}.xml`），
+  四者共存不互相覆盖；`metadata.yaml` 的 `model_file` 指向当前精度对应的模型文件。
+  依赖：`pip install nncf`（ONNX INT8 还需 onnxruntime），requirements.txt 里列为可选注释项。
+- 监控：`train_epoch_logs.val_dice / val_iou / val_recall`，前端按 Dice/IoU/Recall 出图。
+
+#### 多分类语义分割（2026-11-16 新增）
+
+- 训练页「分割模式」二选一，存 `config.semseg_mode`：`binary`（默认，缺陷/背景）或
+  `multiclass`（背景 + 项目每个类别各成一类）。
+- 口径：`num_classes = 背景 + N`，mask 像素值 = `class_index + 1`（与 `masks_ids` 完全一致），
+  数据集直接读 `masks_ids` 返回 long 类别图；**标注/几何不用改**。
+- Loss = `CEDiceLoss`：CE 的 `class_weight = [1, w, w, ...]`（`semseg_fg_class_weight`，默认 20，
+  背景固定 1）+ 前景逐类 soft-Dice 平均。不要给背景加权重，缺陷只占 ~0.004%。
+- 指标：`val_dice / val_iou / val_recall` 是**合并二分类**口径（阈值作用在 `1-P(bg)` 上，
+  多分类下曲线仍与二分类可比）；`val_miou / val_mdice` 是逐类平均（不含背景），
+  per-class dice 写进 checkpoint meta 的 `class_dice`。
+- 推理：`predict_class_map` 出类别图（0=背景，1..N），按类别出连通域与检测框，
+  类别名取项目 `defect_classes.name`；`<rid>_mask.png` 存**彩色类别图**（Mask 页可肉眼分辨）。
+- 导出：ONNX/OpenVINO 输出 `(1,N,H,W)` softmax 概率，`metadata.yaml` 记 `mode/num_classes/class_names`。
+- 继承：父模型类别数与当前不同（二值⇄多分类、类别数变动）时 `load_weights(skip_mismatch=True)`
+  只迁就骨干、分类头重初始化，`config.head_reinit=True` 留痕。
+- 依据：`MMSegmentation_young/scratch_seg/多分类对照实验报告.md`（同数据同网络：
+  test Dice 0.700 vs 二值 0.712，Recall 0.772 vs 0.771，类间混淆 <10% → 多分类不牺牲检出）。
+
+#### Halo 上下文分块（2026-11-16 新增）
+
+- 训练页「Halo 上下文」`config.semseg_halo`：网络输入 = `patch_size + 2×halo`，
+  **loss/指标/滑窗只算中心 `patch_size` 有效区**。`DefectPatchDataset(halo=...)` 返回
+  `(3, in, in)` 图像 + `(valid)` 标签；训练器用 `_crop_logits_center()` 把 stride-2 logits
+  裁回有效区（halo 强制偶数）。
+- 推理：`window = patch + 2×halo`，图像先四周补 halo，再滑窗，**只累加中心有效区**
+  （`core/semseg/infer._sliding_window_map(valid_size=...)`，窗口起点强制贴边保证无缝）；
+  步长 = `patch_size × config.semseg_stride_ratio`（默认 0.75，越小越稳越慢）。
+- 口径随权重走：checkpoint meta 记 `patch_size / halo / input_size`，推理端优先按 meta
+  （老模型没有这些字段 → halo=0，行为与之前完全一致）；导出 `metadata.yaml` 记
+  `valid / halo / window / stride`，INT8 校准 patch 也用输入边长。
+- 成本：输入面积按 `(1 + 2·halo/patch)²` 增加——halo=32/patch=512 → 576 输入 = 1.27 倍算力。
+- **自动关闭**：`图像最大边 ≤ 有效区`（整图就是一个 patch、不切块）时 halo 拿不到真实邻居
+  上下文，`DefectPatchDataset` 与训练任务都会把它降为 0（打印原因）；`config.semseg_halo` 记生效值，
+  `semseg_halo_requested` / `semseg_halo_note` 保留原始请求与原因，推理/导出/监控都跟着生效值走。
+  `prepare_semantic_dataset` 写 manifest 时带上 `width/height`，判断不必再读图（老 manifest 回退读文件头）。
+- MMSeg 侧对应实现：`DefectPatchDataset(patch_size=输入, crop_size=有效区)` +
+  `HaloFCNHead`（算 loss/预测前把 logits 与 gt 裁回有效区）+ `tools/evaluate.py --valid`。
+  ⚠ 2026-11-16 前 `scratch_seg` 的 dataset 把 **img 也裁回了 crop_size**，halo 实际没进网络，
+  那批「Halo 实验」结论等价于噪声；已修复，旧结果需重跑。
+
+
+> **semseg 训练参数与 seg 不同**：用 `lr/encoder_lr_mult/pos_weight/cldice_weight/
+> patch_size/patches_per_image/accum_steps/semseg_threshold`，`lr0/momentum/lrf` 不生效；
+> 增广沿用平台字段但默认关 `mosaic/mixup/copy_paste`、`degrees=0`、`scale=0.1`。
 
 > **seg/det/obb 从 2026-10-22 起不再统一缩放**：数据集准备直接读原图（需要形态学时在整图做三通道），
 > 再按 `crop_size` / `overlap` 滑窗。`projects.resize_h/w` 仅保留字段兼容，**不再参与训练**，
@@ -88,6 +177,10 @@ cls 标签存 `images.class_id`（图级），其他 task 标签存 `annotations
   旧版 `zoomFit()` 和「空格+拖拽」平移是直接改 `canvas.viewportTransform[4]/[5]` 的，
   结果「适应窗口 / 平移画布」之后所有标注区域都点不中、拖不动（表现为“标注完的 region 不能平移”）。
   以后任何改变视口的代码都必须经 `setViewportTransform()`（它会顺带刷新每个对象的 `setCoords`）。
+- **操控点跟随窗口、不跟随图像**：顶点白点、旋转绿点、矩形的角点、圆的圆心/半径手柄尺寸全部按**屏幕像素**定义
+  （`MANUAL_HANDLE_R / VERTEX_HANDLE_R / ROT_HANDLE_R / ROT_HANDLE_GAP`），绘制时用 `pxToScene()` 除以当前缩放，
+  缩放变化后由 `refreshHandles()`（rAF 合并）重建。**新增任何手柄都必须走 `pxToScene()`**，
+  否则放大图像时手柄会跟着一起变大（半径 4px 的点在 5 倍缩放下变成 20px 的大圆，遮住缺陷）。
 
 ---
 
@@ -96,6 +189,7 @@ cls 标签存 `images.class_id`（图级），其他 task 标签存 `annotations
 ```
 core/
   train.py             — Ultralytics 训练入口，task_type 分支 + cancel_check 回调
+  semseg/              — 语义分割（ResUNet34+clDice）：model/losses/dataset/trainer/infer/export
   inference.py         — 滑窗推理（seg/det）
   preprocess.py        — 形态学（B=原图 G=膨胀 R=腐蚀 三通道）；训练链已改 resize=False
   sliding_window.py    — 滑窗切割
@@ -117,8 +211,8 @@ web/src/views/
   ProjectDetail.vue    — 项目详情 + 编辑弹窗
   Annotator.vue        — 通用标注器（seg/det/obb 用）
   ClsAnnotator.vue     — cls 6×6 网格批量打标
-  AnnotationConvert.vue — seg ⇆ det/obb 标注转换
-  ImportProject.vue    — 多种导入入口（VOC/cls 文件夹）
+  AnnotationConvert.vue — seg ⇆ det/obb/semseg 标注转换
+  ImportProject.vue    — 导入入口（Mask→seg/semseg、VOC→det/obb、cls 文件夹/XML）
   TrainConfig.vue      — 训练配置（参数缓存 + 继承训练自动加载）
   TrainMonitor.vue     — 训练监控（epoch 曲线 + 完整参数展示）
   InferenceView.vue    — 在线推断（队列 + 推理训练图 + 网格 + 切割小图）
@@ -171,6 +265,9 @@ PUT  /api/projects/{id}/images/batch-class    cls 批量打分类标签
 - `annotations.shape`：`polygon`（默认）/ `rect` / `circle`；`annotations.shape_params` 存参数（rect: `{x1,y1,x2,y2}` 归一化；circle: `{cx,cy}` 归一化 + `r` **像素**半径）。
 - **`polygon` 仍是几何唯一真相**：矩形的 4 角点、圆的 48 点采样都写进 `polygon`，训练/推理/统计/项目导出全部只认 polygon，不需要认识形状类型；`shape_params` 只用于标注器参数化编辑，保存时由 polygon 反推（不维护第二份数据，平移/旋转/剪贴板/撤销无需特殊处理）。
 - 标注器编辑：矩形给 4 个角点手柄（对角固定、轴对齐），圆形给「圆心（平移，半径不变）+ 半径手柄」；**不再给顶点手柄**（不会退化成拖一堆顶点）。
+- **尺寸参数化（2026-11-09）**：选中矩形/圆后，右侧「形状参数（原图像素）」面板可直接输入精确尺寸——**矩形给两条边长（宽/高）、圆给直径**；**中心固定**，越界时矩形中心自动内推、圆按到边界的最近距离收窄。改完仍由 `polygon` 反推 `shape_params`（polygon 是唯一真相），入 undo、自动保存。
+  - 尺寸一律按**原图**像素口径显示与回填：视图旋转 90/270° 时显示坐标的宽高与原图互换，代码里先 `dispToOrig()` 换回原图再算/再写，所以旋转后「宽/高」不会反着显示。
+  - 标注列表里的尺寸摘要也走同一口径：`矩形 200×100px` / `圆 ⌀170px`（多边形仍显示 `N点`）。
 - 圆形工具有两种画法：「圆心+半径」和「**3点共圆**」（三点外接圆，共线时报错提示）。
 - 矩形/圆形不支持旋转（`rotateSelectedBy` 直接提示），需要斜置矩形请用多边形工具。
 - 老库迁移：`server/database.py::_ensure_columns()` 启动时用 `PRAGMA table_info` 比对并 `ALTER TABLE ... ADD COLUMN`（幂等），新增字段往这个清单里追加即可；新列必须可空或带默认值。
@@ -208,6 +305,11 @@ PUT  /api/projects/{id}/images/batch-class    cls 批量打分类标签
 - `failed` 任务不自动清（方便排查切片/标签问题），可手动清：
   训练监控页每行「清理中间产物」，或 `POST /api/train/tasks/{id}/purge-intermediates`。
 - 实现：`server/services/artifact_cleanup.py::purge_task_intermediates`。
+- **INT8 校准集**（2026-11-16）：清理 `dataset/` 之前会抽样 64 张（连标签）存到 `<task>/calib/`
+  （分类任务是 ImageFolder 的 `train/<cls>` + `val/<cls>`），`calib/` 不在清理清单里，归档时随任务目录一起搬。
+  导出 OpenVINO INT8 时按「`<task>/dataset` → `<task>/calib` → 用项目原图 + 标注重建 `<task>/calib`」
+  三级解析（`server/services/calib_dataset.py`），所以**归档后 / 中间产物已清理的老任务也能量化**；
+  解析失败在提交导出时直接 400，不再等后台线程报 `…/dataset does not exist`。
 
 ## 存储分层（Linux 多盘部署，2026-10-27）
 

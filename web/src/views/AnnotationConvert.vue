@@ -3,7 +3,7 @@
     <div class="page-header">
       <div style="display:flex;align-items:center;gap:12px">
         <h1>标注转换</h1>
-        <el-tag size="small" type="info">seg ⇆ det ⇆ obb</el-tag>
+        <el-tag size="small" type="info">seg ⇆ det ⇆ obb ⇆ semseg</el-tag>
       </div>
       <el-button class="hbtn hbtn--cyan" @click="loadProjects" :loading="loading">
         <el-icon><Refresh /></el-icon> 刷新
@@ -19,7 +19,8 @@
         - <b>分割 → 检测</b>：多边形取外接水平矩形（损失边界信息）<br>
         - <b>检测 → 分割</b>：4 点矩形对 seg 同样合法（mask 是规整矩形）<br>
         - <b>分割 → 旋转检测（推荐）</b>：多边形取最小外接<b>旋转</b>矩形（保留角度，对斜目标如太阳能板效果最好）<br>
-        - <b>检测 → 旋转检测</b>：源是水平框，转后所有 OBB 都是 0°，效果等同检测（不推荐）
+        - <b>检测 → 旋转检测</b>：源是水平框，转后所有 OBB 都是 0°，效果等同检测（不推荐）<br>
+        - <b>实例分割 → 语义分割</b>：标注不用改；训练时把每张图的所有实例<b>合并成一张二值前景 mask</b>（0=背景 / 1=缺陷），按缺陷中心采样 patch，不预切图
       </div>
     </el-alert>
 
@@ -31,6 +32,7 @@
           <el-radio-group v-model="filterType" size="small">
             <el-radio-button label="all">全部</el-radio-button>
             <el-radio-button label="seg">仅分割</el-radio-button>
+            <el-radio-button label="semseg">仅语义</el-radio-button>
             <el-radio-button label="det">仅检测</el-radio-button>
             <el-radio-button label="obb">仅旋转</el-radio-button>
           </el-radio-group>
@@ -100,6 +102,9 @@
             <el-radio-button label="seg" :disabled="(selectedProject.task_type || 'seg') === 'seg'">
               分割（Seg）
             </el-radio-button>
+            <el-radio-button label="semseg" :disabled="(selectedProject.task_type || 'seg') === 'semseg'">
+              语义分割（SemSeg）
+            </el-radio-button>
             <el-radio-button label="det" :disabled="(selectedProject.task_type || 'seg') === 'det'">
               检测（Det）
             </el-radio-button>
@@ -108,7 +113,13 @@
             </el-radio-button>
           </el-radio-group>
           <div class="hint" style="margin-top:6px">
-            <template v-if="(selectedProject.task_type || 'seg') === 'seg' && targetType === 'obb'">
+            <template v-if="targetType === 'semseg'">
+              ✅ 实例多边形直接复用：训练时把该图所有实例、所有类别<b>合并为一张二值缺陷 mask</b>（0=背景 / 1=缺陷），按缺陷中心采样 patch（默认 512），不预切图、不用 crop_size/overlap
+            </template>
+            <template v-else-if="(selectedProject.task_type || 'seg') === 'semseg'">
+              语义分割项目的标注同样是实例多边形，可直接用于 {{ taskTypeLabel(targetType) }} 训练
+            </template>
+            <template v-else-if="(selectedProject.task_type || 'seg') === 'seg' && targetType === 'obb'">
               ✅ 多边形 → 最小外接旋转矩形（保留角度信息，效果最好）
             </template>
             <template v-else-if="(selectedProject.task_type || 'seg') === 'det' && targetType === 'obb'">
@@ -181,6 +192,15 @@
             <div>· 图片数量：<b>{{ result.image_count }}</b> 张</div>
             <div>· 标注数量：<b>{{ result.annotation_count }}</b> 个</div>
           </div>
+          <el-alert
+            v-if="result.warnings?.length"
+            type="warning"
+            :closable="false"
+            style="margin-bottom:16px;text-align:left"
+          >
+            <template #title><span style="font-size:12px">转换后注意事项</span></template>
+            <div v-for="(w, i) in result.warnings" :key="i" style="font-size:12px;line-height:1.7">· {{ w }}</div>
+          </el-alert>
           <el-button type="primary" @click="goToProject">进入新项目</el-button>
           <el-button @click="resultVisible = false; resetSelection(); loadProjects()">继续转换</el-button>
         </template>
@@ -200,15 +220,15 @@ const router = useRouter()
 
 const projects = ref<Project[]>([])
 const loading = ref(false)
-const filterType = ref<'all' | 'seg' | 'det' | 'obb'>('all')
+const filterType = ref<'all' | 'seg' | 'semseg' | 'det' | 'obb'>('all')
 const selectedId = ref<number | null>(null)
-const targetType = ref<'seg' | 'det' | 'obb'>('seg')
+const targetType = ref<'seg' | 'semseg' | 'det' | 'obb'>('seg')
 
 function taskTypeLabel(t: string | undefined): string {
-  return ({ seg: '分割', det: '检测', obb: '旋转检测', cls: '分类' } as any)[t || 'seg'] || '分割'
+  return ({ seg: '分割', semseg: '语义分割', det: '检测', obb: '旋转检测', cls: '分类' } as any)[t || 'seg'] || '分割'
 }
 function taskTagType(t: string | undefined): string {
-  return ({ seg: 'success', det: 'warning', obb: 'danger', cls: 'primary' } as any)[t || 'seg'] || 'success'
+  return ({ seg: 'success', semseg: 'info', det: 'warning', obb: 'danger', cls: 'primary' } as any)[t || 'seg'] || 'success'
 }
 const mode = ref<'copy' | 'inplace'>('copy')
 const newName = ref('')
@@ -239,10 +259,11 @@ function rowClassName({ row }: any) {
 
 function selectProject(row: Project) {
   selectedId.value = row.id
-  // 智能默认目标类型：seg → obb（最有价值的转换）；det/obb → seg
-  const srcType = (row.task_type || 'seg') as 'seg' | 'det' | 'obb' | 'cls'
-  const defaults: Record<string, 'seg' | 'det' | 'obb'> = {
+  // 智能默认目标类型：seg → obb（最有价值的转换）；det/obb/semseg → seg
+  const srcType = (row.task_type || 'seg') as 'seg' | 'semseg' | 'det' | 'obb' | 'cls'
+  const defaults: Record<string, 'seg' | 'semseg' | 'det' | 'obb'> = {
     seg: 'obb',
+    semseg: 'seg',
     det: 'seg',
     obb: 'seg',
     cls: 'seg',  // cls 不会出现在转换列表里，兜底

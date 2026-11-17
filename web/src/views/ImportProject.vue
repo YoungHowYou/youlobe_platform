@@ -12,12 +12,15 @@
       <el-form-item label="任务类型" label-width="100px" style="margin-bottom:0">
         <el-radio-group v-model="taskType" class="radio-cards">
           <el-radio-button label="seg">实例分割（Mask + XML）</el-radio-button>
+          <el-radio-button label="semseg">语义分割（Mask + XML）</el-radio-button>
           <el-radio-button label="det">目标检测（图片 + XML）</el-radio-button>
           <el-radio-button label="obb">旋转检测（图片 + XML）</el-radio-button>
           <el-radio-button label="cls">图像分类</el-radio-button>
         </el-radio-group>
         <div style="font-size:12px;color:#909399;margin-top:4px">
           <span v-if="taskType === 'seg'">分割：上传原图 + Mask PNG + (可选) XML，按像素值映射类别</span>
+          <span v-else-if="taskType === 'semseg'">语义分割：同样上传原图 + Mask PNG（像素值=类别），标注按实例多边形存储，
+            训练时栅格化为二值或逐类 mask（不预切图，按缺陷中心采 patch）</span>
           <span v-else-if="taskType === 'det'">检测：上传原图 + Pascal VOC XML 标注，按类别名映射</span>
           <span v-else-if="taskType === 'obb'">旋转检测：与检测共用 VOC XML 格式；训练时配合 degrees=180 增强自动学到角度（适合航拍/密集斜目标）</span>
           <span v-else>分类：图级标签（每张图一个类别），支持 EasyLabel XML 或按文件夹归类</span>
@@ -51,11 +54,17 @@
         <el-form-item label="描述">
           <el-input v-model="description" type="textarea" :rows="2" />
         </el-form-item>
-        <template v-if="taskType === 'seg'">
+        <template v-if="isMaskBased">
           <el-form-item label="图像尺寸">
             <div class="hint" style="line-height:1.6">
-              分割项目不再做 Resize：训练直接按<b>原图分辨率</b> + 重叠滑窗切割。
-              滑窗窗口（切割尺寸）与重叠率在项目详情里调，默认 640 / 0.2。
+              <template v-if="taskType === 'seg'">
+                分割项目不再做 Resize：训练直接按<b>原图分辨率</b> + 重叠滑窗切割。
+                滑窗窗口（切割尺寸）与重叠率在项目详情里调，默认 640 / 0.2。
+              </template>
+              <template v-else>
+                语义分割不预切图、不滑窗：训练时以<b>缺陷像素为中心</b>随机裁 patch，
+                patch 尺寸在训练页调（默认 512），项目里的切割尺寸/重叠率不参与训练。
+              </template>
             </div>
           </el-form-item>
         </template>
@@ -79,8 +88,8 @@
 
     <!-- Step 1: 类别配置 -->
     <el-card v-if="step===1" shadow="never">
-      <!-- 分割模式：像素值 → 类别 -->
-      <template v-if="taskType === 'seg'">
+      <!-- 分割 / 语义分割模式：像素值 → 类别 -->
+      <template v-if="isMaskBased">
         <div style="margin-bottom:16px">
           <b>配置像素值 → 类别映射</b>
           <p style="font-size:13px;color:#909399;margin-top:4px">
@@ -186,7 +195,7 @@
       <div style="margin-top:20px;display:flex;gap:10px">
         <el-button @click="step=0">上一步</el-button>
         <el-button type="primary" @click="step=2"
-          :disabled="taskType==='seg' ? classMappings.length===0 : detClasses.length===0">
+          :disabled="isMaskBased ? classMappings.length===0 : detClasses.length===0">
           下一步
         </el-button>
       </div>
@@ -220,8 +229,8 @@
         </div>
       </div>
 
-      <!-- 分割：图片 + Mask -->
-      <el-row :gutter="24" v-else-if="taskType === 'seg'">
+      <!-- 分割 / 语义分割：图片 + Mask -->
+      <el-row :gutter="24" v-else-if="isMaskBased">
         <el-col :span="12">
           <div style="font-weight:600;margin-bottom:8px">原图（{{ imgFiles.length }} 张）</div>
           <el-upload drag :auto-upload="false" :show-file-list="false" multiple
@@ -270,10 +279,10 @@
 
       <el-alert
         v-if="taskType !== 'cls' || clsImportMode === 'xml'"
-        v-show="imgFiles.length>0 && (taskType==='seg' ? maskFiles.length>0 : xmlFiles.length>0)"
+        v-show="imgFiles.length>0 && (isMaskBased ? maskFiles.length>0 : xmlFiles.length>0)"
         type="info" :closable="false" style="margin-top:16px">
         <div style="font-size:12px">
-          原图 {{ imgFiles.length }} 张，{{ taskType==='seg' ? `Mask ${maskFiles.length} 张` : `XML ${xmlFiles.length} 个` }}。
+          原图 {{ imgFiles.length }} 张，{{ isMaskBased ? `Mask ${maskFiles.length} 张` : `XML ${xmlFiles.length} 个` }}。
           按文件名匹配（同名不同后缀）。
         </div>
       </el-alert>
@@ -291,10 +300,13 @@
     <el-card v-if="step===3" shadow="never" style="text-align:center;padding:40px 0">
       <el-icon style="font-size:48px;color:#67C23A"><SuccessFilled /></el-icon>
       <h2 style="margin:16px 0 8px">导入完成！</h2>
-      <div style="color:#606266;margin-bottom:24px" v-if="taskType==='seg'">
+      <div style="color:#606266;margin-bottom:24px" v-if="isMaskBased">
         共导入 <b>{{ result.stats?.total || 0 }}</b> 张图片，
         <b>{{ result.stats?.with_ann || 0 }}</b> 张有标注，
         <b>{{ result.stats?.total_polygons || 0 }}</b> 个缺陷多边形
+        <div v-if="taskType === 'semseg'" style="margin-top:8px;font-size:12px;color:#909399">
+          项目类型：语义分割（训练时多边形会栅格化合并成 mask）
+        </div>
       </div>
       <div style="color:#606266;margin-bottom:24px" v-else-if="taskType==='det' || taskType==='obb'">
         共导入 <b>{{ result.stats?.total || 0 }}</b> 张图片，
@@ -335,7 +347,10 @@ const router = useRouter()
 const step = ref(0)
 
 // 任务类型
-const taskType = ref<'seg' | 'det' | 'cls' | 'obb'>('seg')
+const taskType = ref<'seg' | 'semseg' | 'det' | 'cls' | 'obb'>('seg')
+// 走 mask 导入流程的类型（两者产物完全相同：像素值→类别→实例多边形；
+// 差异只在创建项目的 task_type 与训练端如何消费标注）
+const isMaskBased = computed(() => taskType.value === 'seg' || taskType.value === 'semseg')
 // 分类导入子模式
 const clsImportMode = ref<'folder' | 'xml'>('folder')
 // 分类文件夹模式：选目录后保留所有文件（含相对路径）
@@ -505,7 +520,7 @@ const canImport = computed(() => {
     return clsFolderFiles.value.length > 0
   }
   if (imgFiles.value.length === 0) return false
-  if (taskType.value === 'seg') return maskFiles.value.length > 0
+  if (isMaskBased.value) return maskFiles.value.length > 0
   return xmlFiles.value.length > 0
 })
 
@@ -565,12 +580,14 @@ async function doImport() {
       return
     }
 
-    if (taskType.value === 'seg') {
-      // 分割：原有逻辑
+    if (isMaskBased.value) {
+      // 分割 / 语义分割：同一套导入（Mask 像素值 → 类别 → 实例多边形），
+      // 只把任务类型传给后端决定新建项目的 task_type
       const mapping: Record<string, any> = {}
       for (const c of classMappings.value) {
         mapping[String(c.pixelVal)] = { class_index: c.classIndex, name: c.name, color: c.color }
       }
+      fd.append('task_type', taskType.value)   // 'seg' 或 'semseg'
       fd.append('resize_h', String(resizeH.value))
       fd.append('resize_w', String(resizeW.value))
       fd.append('class_mapping_json', JSON.stringify(mapping))

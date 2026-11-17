@@ -40,8 +40,9 @@
               <el-radio-group v-model="trainMode">
                 <el-radio label="scratch">从头训练</el-radio>
                 <el-radio label="finetune" :disabled="completedTasks.length===0">继承训练</el-radio>
-                <el-radio label="custom">自定义预训练模型</el-radio>
+                <el-radio label="custom" :disabled="taskType==='semseg'">自定义预训练模型</el-radio>
               </el-radio-group>
+              <span v-if="taskType==='semseg'" class="hint">语义分割仅支持「从头训练 / 继承训练」</span>
             </el-form-item>
             <template v-if="trainMode==='finetune'">
               <el-form-item label="继承模型">
@@ -119,7 +120,11 @@
             <el-form-item label="任务名称">
               <el-input v-model="taskName" />
             </el-form-item>
-            <el-form-item v-if="trainMode === 'scratch'" label="模型尺寸">
+            <el-form-item v-if="taskType === 'semseg'" label="模型架构">
+              <el-tag type="success" size="small">ResUNet34 + FCNHead</el-tag>
+              <span class="hint">固定架构（约 31.9M 参数）· BCE(pos_weight)+Dice+clDice</span>
+            </el-form-item>
+            <el-form-item v-if="trainMode === 'scratch' && taskType !== 'semseg'" label="模型尺寸">
               <el-select v-model="c.model_name" style="width:100%">
                 <template v-if="taskType === 'cls'">
                   <el-option label="yolo11n-cls.pt · Nano — 最快，~1.5M 参数（推荐小数据）" value="yolo11n-cls.pt" />
@@ -254,8 +259,98 @@
             </el-form-item>
           </el-card>
 
+          <!-- 语义分割专用参数 -->
+          <el-card v-if="taskType === 'semseg'" shadow="never" style="margin-bottom:20px">
+            <template #header>
+              <span style="font-weight:600">语义分割参数</span>
+              <span class="hint" style="margin-left:8px">ResUNet34 · 缺陷中心 patch · AdamW</span>
+            </template>
+            <el-alert type="info" :closable="false" style="margin-bottom:12px">
+              <div style="font-size:12px;line-height:1.7">
+                不预切图：每个 patch 以<b>缺陷像素</b>为中心随机裁剪（缺陷仅占 0.0036%，随机裁剪采不到正样本）。<br>
+                默认值来自玻璃缺陷对照实验的最优组合（test Dice 0.729）。
+              </div>
+            </el-alert>
+            <el-form-item label="分割模式">
+              <el-radio-group v-model="c.semseg_mode">
+                <el-radio-button label="binary">二分类（缺陷 / 背景）</el-radio-button>
+                <el-radio-button label="multiclass">多分类（背景 + 各缺陷类）</el-radio-button>
+              </el-radio-group>
+              <span class="hint" style="display:block;margin-top:4px">
+                多分类：输出通道 = 项目类别数 + 1（背景），像素值 = class_index + 1，与 masks_ids 同口径；
+                训练时逐类输、推理时能给出缺陷类别。对照实验：合并检出 Recall 0.772、类间混淆 &lt;10%
+              </span>
+            </el-form-item>
+            <el-form-item v-if="c.semseg_mode === 'multiclass'" label="前景类别权重">
+              <el-input-number v-model="c.semseg_fg_class_weight" :min="1" :max="100" :step="1" />
+              <span class="hint">CE 的 class_weight = [1, w, w, ...]；缺陷占比极低，背景固定 1，实验用 20</span>
+            </el-form-item>
+            <el-form-item label="Patch 尺寸">
+              <el-input-number v-model="c.patch_size" :min="128" :max="2048" :step="64" />
+              <span class="hint">中心<b>有效区</b>边长（loss/指标只看这块）；实验最优 512</span>
+            </el-form-item>
+            <el-form-item label="Halo 上下文">
+              <el-input-number v-model="c.semseg_halo" :min="0" :max="256" :step="8" />
+              <span class="hint">
+                px，四周各扩多少像素送进网络（输入 = {{ c.patch_size }} + 2×{{ c.semseg_halo }} =
+                <b>{{ Number(c.patch_size || 0) + 2 * Number(c.semseg_halo || 0) }}</b>）；
+                0 = 关闭。缺陷靠近边界/大图拼接时可减少边界断裂，代价是推理按面积变慢
+              </span>
+              <div class="hint" style="display:block;margin-top:2px;line-height:1.6">
+                图像最大边 ≤ Patch 尺寸（整图即一个 patch）时<b>自动关闭</b>：此时扩出来的只是黑边，没有真实邻居上下文
+              </div>
+            </el-form-item>
+            <el-form-item label="推理步长比例">
+              <el-slider v-model="c.semseg_stride_ratio" :min="0.25" :max="1" :step="0.05" show-input :show-input-controls="false" />
+              <div class="hint" style="line-height:1.6">
+                滑窗步长 = 有效区 {{ c.patch_size }} × {{ c.semseg_stride_ratio }} =
+                <b>{{ Math.max(1, Math.round(Number(c.patch_size || 0) * Number(c.semseg_stride_ratio || 0.75))) }}</b> px；
+                越小越稳（重叠更多）但越慢，1.0 无重叠
+              </div>
+            </el-form-item>
+            <el-form-item label="每图 Patch 数">
+              <el-input-number v-model="c.patches_per_image" :min="1" :max="32" />
+              <span class="hint">1 epoch = 图数 × 该值 个 patch</span>
+            </el-form-item>
+            <el-form-item label="梯度累积步数">
+              <el-input-number v-model="c.accum_steps" :min="1" :max="32" />
+              <span class="hint">显存不够时用累积代替大 batch</span>
+            </el-form-item>
+            <el-form-item label="初始学习率">
+              <el-input-number v-model="c.lr" :min="0.000001" :max="0.01" :step="0.00005" :precision="6" />
+              <span class="hint">AdamW，默认 1e-4</span>
+            </el-form-item>
+            <el-form-item label="编码器学习率倍率">
+              <el-input-number v-model="c.encoder_lr_mult" :min="0.01" :max="1" :step="0.05" :precision="2" />
+              <span class="hint">ResNet34 预训练层 0.1×</span>
+            </el-form-item>
+            <el-form-item label="正样本权重 pos_weight">
+              <el-input-number v-model="c.pos_weight" :min="1" :max="50" :step="1" />
+              <span class="hint">实验关键：20→5 是 Dice 从 0.558 涨到 0.699 的主因；调大召回↑精度↓</span>
+            </el-form-item>
+            <el-form-item label="clDice 权重">
+              <el-input-number v-model="c.cldice_weight" :min="0" :max="3" :step="0.1" :precision="2" />
+              <span class="hint">只能做辅助项，×3 会概率双峰化（已验证失败）</span>
+            </el-form-item>
+            <el-form-item label="预热 Iter">
+              <el-input-number v-model="c.warmup_iters" :min="0" :max="5000" :step="100" />
+            </el-form-item>
+            <el-form-item label="推理阈值">
+              <el-slider v-model="c.semseg_threshold" :min="0.1" :max="0.9" :step="0.05" show-input :show-input-controls="false" />
+              <span class="hint">实验扫描最优 0.6（默认 0.5 不是最优点）</span>
+            </el-form-item>
+            <el-form-item label="默认最小连通域面积">
+              <el-input-number v-model="c.semseg_min_area" :min="0" :max="1000" :step="1" />
+              <span class="hint">抑制细碎误检（0=不过滤）</span>
+            </el-form-item>
+            <el-form-item label="加入无缺陷图">
+              <el-switch v-model="c.semseg_include_ok" active-text="加入训练" inactive-text="不使用" />
+              <span class="hint">实验剔除了无标注图；显式标 OK 的项目可打开以降低误检</span>
+            </el-form-item>
+          </el-card>
+
           <!-- 学习率 -->
-          <el-card shadow="never" style="margin-bottom:20px">
+          <el-card v-if="taskType !== 'semseg'" shadow="never" style="margin-bottom:20px">
             <template #header><span style="font-weight:600">学习率</span></template>
             <el-form-item label="初始学习率 (lr0)">
               <el-input-number v-model="c.lr0" :min="0.0001" :max="0.1" :step="0.001" :precision="4" />
@@ -285,7 +380,7 @@
             <el-form-item label="训练集比例">
               <el-slider v-model="c.train_ratio" :min="0.5" :max="0.95" :step="0.05" show-input />
             </el-form-item>
-            <el-form-item label="稀有类过采样倍数">
+            <el-form-item v-if="taskType !== 'semseg'" label="稀有类过采样倍数">
               <el-input-number v-model="c.oversample_factor" :min="1" :max="20" />
               <span class="hint">小数据集建议 5~10</span>
             </el-form-item>
@@ -373,7 +468,7 @@
           </el-card>
 
           <!-- 高级增广 -->
-          <el-card shadow="never" style="margin-bottom:20px">
+          <el-card v-if="taskType !== 'semseg'" shadow="never" style="margin-bottom:20px">
             <template #header>
               <span style="font-weight:600">高级增广</span>
               <span class="hint" style="margin-left:8px">对小数据集效果显著</span>
@@ -401,7 +496,7 @@
           </el-card>
 
           <!-- 形态学预处理 -->
-          <el-card shadow="never" style="margin-bottom:20px">
+          <el-card v-if="taskType !== 'semseg'" shadow="never" style="margin-bottom:20px">
             <template #header>
               <div style="display:flex;justify-content:space-between;align-items:center">
                 <span style="font-weight:600">形态学预处理</span>
@@ -437,7 +532,18 @@
     </el-form>
 
     <!-- 预设说明 -->
-    <el-alert type="info" :closable="false" style="margin-top:12px">
+    <el-alert v-if="taskType === 'semseg'" type="info" :closable="false" style="margin-top:12px">
+      <template #title>语义分割默认参数说明（与玻璃缺陷实验最优组合一致）</template>
+      <div style="font-size:13px;line-height:1.8;margin-top:4px">
+        <b>缺陷中心采样</b>：512 patch 以缺陷像素为中心随机裁剪，每图 4 个<br>
+        <b>pos_weight=5</b>：实验证明从 20 降到 5 才是 Dice 提升的主因<br>
+        <b>clDice 权重 1.0</b>：只做辅助项，放大到 3 倍会概率双峰化<br>
+        <b>阈值 0.6</b>：阈值扫描最优点（不是 0.5）<br>
+        <b>AdamW 1e-4</b>：编码器 lr×0.1，batch=1 + 累积 4<br>
+        <b>不预切图</b>：节省磁盘，正样本率高；不适用 Mosaic / Copy-Paste / Mixup
+      </div>
+    </el-alert>
+    <el-alert v-else type="info" :closable="false" style="margin-top:12px">
       <template #title>当前默认参数说明（针对硅片缺陷检测优化）</template>
       <div style="font-size:13px;line-height:1.8;margin-top:4px">
         <b>旋转 180°</b>：缺陷无固定方向，全角度旋转增强数据多样性<br>
@@ -470,7 +576,7 @@ const resumeTaskId = ref<number|null>(null)
 const resumeModelType = ref('best')
 const completedTasks = ref<any[]>([])
 const currentClassCount = ref(0)
-const taskType = ref<'seg'|'det'|'cls'|'obb'>('seg')
+const taskType = ref<'seg'|'det'|'cls'|'obb'|'semseg'>('seg')
 
 // ---- 自定义预训练模型（服务器本地 .pt）----
 interface LocalModel { path: string; name: string; size_mb: number; mtime: string }
@@ -590,6 +696,23 @@ function defaultsForTaskType(tt: string): Record<string, any> {
     // OBB 受益于任意旋转
     Object.assign(d, { model_name: 'yolo11s-obb.pt', use_morphology: false, train_ratio: 0.85,
       degrees: 180, mosaic: 0.3, copy_paste: 0, mixup: 0 })
+  } else if (tt === 'semseg') {
+    // 语义分割：ResUNet34 + BCE(pos_weight=5)+Dice+clDice，512 缺陷中心 patch
+    // 不适用 Mosaic/Copy-Paste/Mixup；不预切图，所以 oversample 无效
+    Object.assign(d, {
+      model_name: 'resunet34_cldice', use_morphology: false, train_ratio: 0.8,
+      crop_size: 512, patch_size: 512, patches_per_image: 4, accum_steps: 4,
+      epochs: 12, batch_size: 1, patience: 0, workers: 2,
+      lr: 0.0001, encoder_lr_mult: 0.1, weight_decay: 0.0001,
+      pos_weight: 5, cldice_weight: 1.0, warmup_iters: 500,
+      semseg_mode: 'binary', semseg_fg_class_weight: 20,
+      semseg_halo: 0, semseg_stride_ratio: 0.75,
+      semseg_threshold: 0.6, semseg_include_ok: false, semseg_min_area: 0,
+      degrees: 0, translate: 0, scale: 0.1, shear: 0,
+      flipud: 0.5, fliplr: 0.5,
+      hsv_h: 0, hsv_s: 0, hsv_v: 0.4,
+      mosaic: 0, copy_paste: 0, mixup: 0, erasing: 0, close_mosaic: 0,
+    })
   }
   return d
 }
@@ -677,7 +800,7 @@ onMounted(async () => {
   try {
     const { data: proj } = await api.get(`/projects/${props.id}`)
     currentClassCount.value = proj.defect_classes?.length || 0
-    taskType.value = (proj.task_type || 'seg') as 'seg' | 'det' | 'cls' | 'obb'
+    taskType.value = (proj.task_type || 'seg') as 'seg' | 'det' | 'cls' | 'obb' | 'semseg'
     const defaults = defaultsForTaskType(taskType.value)
     if (proj.last_train_config && Object.keys(proj.last_train_config).length > 0) {
       // 用户点过"保存为默认"：缓存覆盖在默认之上

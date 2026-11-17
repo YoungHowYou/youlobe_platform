@@ -389,6 +389,223 @@ def _resolve_model_path(model_path: str, task_id: int, db: Session) -> str:
     return mp
 
 
+def _get_semseg_model(model_path: str, device: str | None = None):
+    """加载平台自训练的语义分割 checkpoint（``{'model': state_dict, 'meta': ...}``）。
+
+    不能用 ultralytics 的 ``YOLO()`` 打开：那是纯 PyTorch resunet34 权重，
+    不是 YOLO 图模型。类别数从 checkpoint meta 读（二值=1，多分类=N+1），
+    按 (path, device) 缓存，最多 4 个。
+    """
+    from core.semseg import build_model, load_weights
+    from core.semseg.checkpoint import read_checkpoint_meta
+    from core.semseg.infer import resolve_device
+
+    dev = resolve_device(device or "auto")
+    cache_key = f"semseg|{model_path}|{dev}"
+    if cache_key in _model_cache:
+        _model_cache[cache_key] = _model_cache.pop(cache_key)
+        return _model_cache[cache_key]
+
+    num_classes = 1
+    meta: dict = {}
+    try:
+        meta = read_checkpoint_meta(model_path) or {}
+        num_classes = int(meta.get("num_classes") or 1)
+    except Exception as exc:
+        print(f"[semseg 推理] 读取 checkpoint meta 失败，按二值模型加载：{exc}")
+    model = build_model(num_classes=max(1, num_classes), pretrained=False)
+    load_weights(model, model_path, strict=False, verbose=False, skip_mismatch=True)
+    model.to(dev)
+    model.eval()
+    # 训练时的 patch/halo/步长口径跟权重一起走，推理不用重新猜
+    model._semseg_meta = meta
+    _model_cache[cache_key] = model
+    if len(_model_cache) > 4:
+        _model_cache.pop(next(iter(_model_cache)))
+    return model
+
+
+def _semseg_class_palette(project_id: int, db, num_classes: int) -> dict[int, tuple]:
+    """(pixel_value → BGR) 配色：优先用项目类别色，不足时用固定调色板兜底。"""
+    palette = [(0, 0, 255), (0, 200, 255), (255, 128, 0), (128, 0, 255),
+               (255, 0, 200), (0, 255, 0), (200, 255, 0), (0, 128, 255)]
+    colors: dict[int, tuple] = {}
+    if project_id and project_id > 0:
+        try:
+            for dc in db.query(DefectClass).filter(
+                    DefectClass.project_id == project_id).all():
+                hexc = str(dc.color or "").lstrip("#")
+                if len(hexc) == 6:
+                    r, g, b = (int(hexc[i:i + 2], 16) for i in (0, 2, 4))
+                    colors[int(dc.class_index) + 1] = (b, g, r)
+        except Exception:
+            pass
+    for value in range(1, int(num_classes)):
+        colors.setdefault(value, palette[(value - 1) % len(palette)])
+    return colors
+
+
+def _run_semseg_inference(model, img_array, filename, project_id, task_id,
+                          device, db, config: dict | None = None) -> dict:
+    """语义分割推理：滑窗 → 概率图 → 阈值 mask → 连通域统计。
+
+    与训练/实验口径一致：灰度输入、window=crop_size、stride=75%、阈值默认 0.6。
+    """
+    import time
+
+    import numpy as np
+    from core.semseg.infer import connected_components, predict_prob
+
+    config = config or {}
+    meta = getattr(model, "_semseg_meta", {}) or {}
+    # 有效区（loss/指标看到的尺寸）→ 网络输入 = 有效区 + 2×halo；步长按有效区算
+    valid = int(meta.get("patch_size") or 0) or int(
+        config.get("patch_size") or config.get("crop_size") or 512)
+    halo = int(meta.get("halo", config.get("semseg_halo", 0)) or 0)
+    window = max(valid, valid + 2 * halo)
+    ratio = float(config.get("semseg_stride_ratio", 0.75) or 0.75)
+    stride = max(1, int(round(valid * ratio)))
+    threshold = float(config.get("semseg_threshold", 0.6))
+
+    if img_array is None:
+        raise HTTPException(status_code=400, detail="图像为空")
+    gray = cv2.cvtColor(img_array, cv2.COLOR_BGR2GRAY) if img_array.ndim == 3 else img_array
+
+    num_classes = int(getattr(model, "num_classes", 1) or 1)
+    multiclass = num_classes > 1
+    min_area = int(config.get("semseg_min_area", 1))
+
+    t0 = time.time()
+    if multiclass:
+        # ---- 多分类：softmax 概率 → 类别图（0=背景，1..N=各类）→ 逐类连通域 ----
+        from core.semseg.infer import (connected_components_by_class,
+                                       predict_class_map)
+
+        class_map, fg_prob = predict_class_map(
+            model, gray, num_classes=num_classes, window=window, stride=stride,
+            threshold=threshold, device=device, valid_size=valid,
+        )
+        elapsed = time.time() - t0
+
+        name_by_index: dict[int, str] = {}
+        if project_id and project_id > 0:
+            try:
+                name_by_index = {
+                    int(dc.class_index): (dc.name or f"class_{dc.class_index}")
+                    for dc in db.query(DefectClass)
+                    .filter(DefectClass.project_id == project_id).all()
+                }
+            except Exception:
+                name_by_index = {}
+        fallback_names = list(config.get("class_names") or [])
+
+        detections = []
+        for comp in connected_components_by_class(class_map, min_area=min_area):
+            x, y, w, h = comp["bbox"]
+            ci = int(comp["class_index"])
+            region = class_map[y:y + h, x:x + w] == comp["pixel_value"]
+            conf = float(fg_prob[y:y + h, x:x + w][region].mean()) if region.any() else 0.0
+            name = name_by_index.get(ci)
+            if not name and 0 <= ci < len(fallback_names):
+                name = str(fallback_names[ci])
+            detections.append({
+                "class_id": ci,
+                "class_name": name or f"class_{ci}",
+                "confidence": round(conf, 4),
+                "bbox": {"x1": x, "y1": y, "x2": x + w, "y2": y + h},
+                "area": comp["area"],
+                "centroid": comp["centroid"],
+            })
+        detections.sort(key=lambda d: -d["area"])
+
+        # mask.png 存**彩色类别图**（Mask 页可肉眼分辨类别）；编码图（1..N）用于训练/导出
+        colors = _semseg_class_palette(project_id, db, num_classes)
+        mask = np.zeros((class_map.shape[0], class_map.shape[1], 3), np.uint8)
+        for value, color in colors.items():
+            mask[class_map == value] = color
+
+        overlay = img_array.copy()
+        if overlay.ndim == 2:
+            overlay = cv2.cvtColor(overlay, cv2.COLOR_GRAY2BGR)
+        if (class_map > 0).any():
+            tint = overlay.copy()
+            for value, color in colors.items():
+                tint[class_map == value] = color
+            overlay = cv2.addWeighted(tint, 0.35, overlay, 0.65, 0)
+            for value, color in colors.items():
+                contours, _ = cv2.findContours(
+                    (class_map == value).astype(np.uint8),
+                    cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                cv2.drawContours(overlay, contours, -1, color, 1)
+    else:
+        prob = predict_prob(model, gray, window=window, stride=stride,
+                            device=device, valid_size=valid)
+        elapsed = time.time() - t0
+        mask = (prob > threshold).astype(np.uint8) * 255
+
+        comps = connected_components(mask, min_area=min_area)
+        detections = [{
+            "class_id": 0,
+            "class_name": (config.get("class_names") or ["defect"])[0],
+            "confidence": round(float(prob[comp["bbox"][1]:comp["bbox"][1] + comp["bbox"][3],
+                                           comp["bbox"][0]:comp["bbox"][0] + comp["bbox"][2]].max()), 4),
+            "bbox": {"x1": comp["bbox"][0], "y1": comp["bbox"][1],
+                     "x2": comp["bbox"][0] + comp["bbox"][2],
+                     "y2": comp["bbox"][1] + comp["bbox"][3]},
+            "area": comp["area"],
+            "centroid": comp["centroid"],
+        } for comp in comps]
+
+        # ---- overlay：半透明红色 mask + 轮廓 ----
+        overlay = img_array.copy()
+        if overlay.ndim == 2:
+            overlay = cv2.cvtColor(overlay, cv2.COLOR_GRAY2BGR)
+        if mask.any():
+            tint = overlay.copy()
+            tint[mask > 0] = (0, 0, 255)
+            overlay = cv2.addWeighted(tint, 0.35, overlay, 0.65, 0)
+            contours, _ = cv2.findContours((mask > 0).astype(np.uint8),
+                                           cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            cv2.drawContours(overlay, contours, -1, (0, 0, 255), 1)
+
+    infer_dir = settings.runs_path / "inference"
+    infer_dir.mkdir(parents=True, exist_ok=True)
+    rid = uuid.uuid4().hex[:12]
+    cv2.imwrite(str(infer_dir / f"{rid}_original.png"), img_array)
+    cv2.imwrite(str(infer_dir / f"{rid}_overlay.png"), overlay)
+    cv2.imwrite(str(infer_dir / f"{rid}_mask.png"), mask)
+    url_pfx = "/static/storage/runs/inference"
+
+    record = InferenceResult(
+        project_id=project_id, task_id=task_id,
+        filename=filename or "unknown", device=device,
+        conf_thresh=threshold, iou_thresh=0.0, resize_size=window,
+        num_detections=len(detections),
+        inference_time=round(elapsed, 3),
+        detections=detections,
+        original_path=f"{url_pfx}/{rid}_original.png",
+        overlay_path=f"{url_pfx}/{rid}_overlay.png",
+        mask_path=f"{url_pfx}/{rid}_mask.png",
+    )
+    db.add(record)
+    db.commit()
+    db.refresh(record)
+
+    return {
+        "id": record.id,
+        "task_type": "semseg",
+        "num_detections": record.num_detections,
+        "inference_time": record.inference_time,
+        "detections": detections,
+        "filename": record.filename,
+        "device": record.device,
+        "threshold": threshold,
+        "original_url": record.original_path,
+        "overlay_url": record.overlay_path,
+        "mask_url": record.mask_path,
+    }
+
+
 def _run_inference_core(
     img_array, content: bytes, filename: str,
     project_id: int, task_id: int, mp: str,
@@ -396,7 +613,7 @@ def _run_inference_core(
     db: Session,
 ) -> dict:
     """
-    共用推理核心：根据 TrainTask.config.task_type 路由到 cls / obb / seg-det。
+    共用推理核心：根据 TrainTask.config.task_type 路由到 cls / obb / semseg / seg-det。
     /run 和 /run-by-image-id 共有的逻辑（任务配置 → 路由 → 持久化）抽出来。
     """
     # ---- 通道归一化 ----
@@ -435,6 +652,29 @@ def _run_inference_core(
         proj = db.query(Project).filter(Project.id == project_id).first()
         if proj and proj.task_type:
             task_type = proj.task_type
+
+    # 语义分割：平台自训练 ResUNet34 checkpoint，不能用 ultralytics 加载
+    if task_type == "semseg":
+        semseg_config = {}
+        if task_id > 0:
+            t = db.query(TrainTask).filter(TrainTask.id == task_id).first()
+            semseg_config = dict(t.config or {}) if t else {}
+        elif project_id > 0:
+            proj = db.query(Project).filter(Project.id == project_id).first()
+            semseg_config = dict((proj.last_train_config or {}) if proj else {})
+        # 窗口尺寸优先用训练时的 patch_size；直接选模型推理时回落项目 crop_size / 512
+        if "patch_size" not in semseg_config and "crop_size" not in semseg_config:
+            proj_crop = None
+            if project_id > 0:
+                proj = db.query(Project).filter(Project.id == project_id).first()
+                proj_crop = proj.crop_size if proj else None
+            semseg_config["crop_size"] = proj_crop or 512
+        semseg_model = _get_semseg_model(mp, device=device)
+        return _run_semseg_inference(
+            model=semseg_model, img_array=img_array, filename=filename,
+            project_id=project_id, task_id=task_id, device=device, db=db,
+            config=semseg_config,
+        )
 
     model = _get_model(mp, task_type=task_type, device=device)
 
@@ -712,6 +952,8 @@ def infer_annotation_current(body: dict = Body(...), db: Session = Depends(get_d
     project, task, task_type, mp = _annotation_model_context(project_id, task_id, model_path, db)
     if task_type == "cls":
         raise HTTPException(400, "分类项目请使用批量推理标注")
+    if task_type == "semseg":
+        raise HTTPException(400, "语义分割模型暂不支持自动预标注，请在推理页查看 mask 结果")
 
     h, w = img_array.shape[:2]
     maps = _class_maps(project_id, db)

@@ -104,9 +104,12 @@ def list_exportable_tasks(project_id: int = 0, db: Session = Depends(get_db)):
             continue
 
         cfg = t.config or {}
-        # cls 项目固定 224；其它项目优先用 config.imgsz，没有则 640
+        # cls 项目固定 224；semseg 用 patch_size；其它项目优先用 config.imgsz，没有则 640
         if proj_task_type == "cls":
             cfg_imgsz = 224
+        elif proj_task_type == "semseg":
+            cfg_imgsz = (cfg.get("patch_size") or cfg.get("crop_size") or 512
+                         if isinstance(cfg, dict) else 512)
         else:
             cfg_imgsz = cfg.get("imgsz") if isinstance(cfg, dict) else None
             if not cfg_imgsz:
@@ -200,6 +203,26 @@ def run_export(req: ExportRequest, db: Session = Depends(get_db)):
     if existing:
         raise HTTPException(status_code=409, detail="该组合（格式/精度/NMS/head模式）已导出，无需重复导出")
 
+    # INT8 校准数据：训练中间产物（dataset/）会被自动清理，所以按
+    # 「训练数据集 → 收尾保留的 calib/ → 从项目原图重建」三级回退解析。
+    # 这里同步解析并在建记录前报错，避免后台线程失败后才看到结果。
+    dataset_path = None
+    calib_note = ""
+    if req.int8 and str(req.export_format).lower() == "openvino":
+        from ..services.calib_dataset import ensure_calib_dataset
+
+        dataset_path, calib_note = ensure_calib_dataset(task, proj, db)
+        if not dataset_path:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"INT8 量化需要校准数据，但{calib_note}。\n"
+                    "可选：1) 先导出 FP16/FP32（无需校准集）；"
+                    "2) 在该项目里补标注后再导出；3) 重新训练一次（训练收尾会自动保 64 张校准集）。"
+                ),
+            )
+        print(f"[导出] INT8 校准集：{calib_note} → {dataset_path}")
+
     # 创建记录（half: 0=FP32, 1=FP16, 2=INT8）
     record = ExportedModel(
         task_id=req.task_id,
@@ -218,12 +241,6 @@ def run_export(req: ExportRequest, db: Session = Depends(get_db)):
 
     # 后台线程执行导出
     export_id = record.id
-    # INT8 量化需要数据集路径
-    dataset_path = None
-    if req.int8:
-        task = db.query(TrainTask).filter(TrainTask.id == req.task_id).first()
-        if task and task.output_dir:
-            dataset_path = str(Path(task.output_dir) / "dataset")
     threading.Thread(
         target=_do_export,
         args=(export_id, src_path, req.export_format, req.imgsz, req.half, req.int8, req.nms, req.head_mode, dataset_path, display_class_names),
@@ -254,18 +271,60 @@ def _do_export(
 
         from core.export import run_export
         output_dir = str(Path(src_path).parent / "exports")
-        result = run_export(
-            model_path=src_path,
-            output_dir=output_dir,
-            export_format=fmt,
-            imgsz=imgsz,
-            half=half,
-            int8=int8,
-            nms=nms,
-            head_mode=head_mode,
-            dataset_path=dataset_path,
-            display_class_names=display_class_names,
-        )
+
+        # 语义分割走纯 PyTorch 导出（不是 ultralytics 图模型）
+        task = db.query(TrainTask).filter(TrainTask.id == record.task_id).first()
+        proj = (db.query(Project).filter(Project.id == task.project_id).first()
+                if task else None)
+        if proj is not None and proj.task_type == "semseg":
+            from core.semseg.export import export_semseg
+
+            cfg = dict(task.config or {}) if task else {}
+            # 有效区 / Halo：输入 = 有效区 + 2×halo；滑窗步长按**有效区**算
+            semseg_valid = int(cfg.get("patch_size") or cfg.get("crop_size") or imgsz or 512)
+            semseg_halo = max(0, int(cfg.get("semseg_halo", 0) or 0))
+            semseg_imgsz = semseg_valid + 2 * semseg_halo
+            stride_ratio = float(cfg.get("semseg_stride_ratio", 0.75) or 0.75)
+            semseg_stride = max(1, int(round(semseg_valid * stride_ratio)))
+            # INT8（NNCF PTQ）必须用真实缺陷 patch 校准：从项目标注里按缺陷中心裁，
+            # 尺寸取**网络输入边长**（含 halo），与量化后的推理输入保持一致
+            calibration_patches = None
+            if int8:
+                from ..services.dataset_service import collect_semseg_calibration_patches
+
+                calibration_patches = collect_semseg_calibration_patches(
+                    project_id=task.project_id, db=db,
+                    patch_size=semseg_imgsz, limit=64,
+                )
+            result = export_semseg(
+                model_path=src_path,
+                output_dir=output_dir,
+                export_format=fmt,
+                imgsz=semseg_imgsz,
+                half=half,
+                int8=int8,
+                window=semseg_imgsz,
+                stride=semseg_stride,
+                valid_size=semseg_valid,
+                threshold=float(cfg.get("semseg_threshold", 0.6)),
+                # 多分类：类别数以 checkpoint meta / 训练配置为准（导出函数内部还会再兜底读 meta）
+                num_classes=int(cfg.get("semseg_num_classes", 1) or 1),
+                class_names=cfg.get("class_names") or [],
+                calibration_patches=calibration_patches,
+            )
+        else:
+            result = run_export(
+                model_path=src_path,
+                output_dir=output_dir,
+                export_format=fmt,
+                imgsz=imgsz,
+                half=half,
+                int8=int8,
+                nms=nms,
+                head_mode=head_mode,
+                dataset_path=dataset_path,
+                display_class_names=display_class_names,
+            )
 
         if result.get("error"):
             record.status = "failed"

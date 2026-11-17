@@ -122,6 +122,13 @@ def _ensure_columns() -> None:
             ("shape", "VARCHAR(16) NOT NULL DEFAULT 'polygon'"),
             ("shape_params", "JSON"),
         ],
+        "train_epoch_logs": [
+            ("val_dice", "FLOAT"),
+            ("val_iou", "FLOAT"),
+            ("val_recall", "FLOAT"),
+            ("val_miou", "FLOAT"),
+            ("val_mdice", "FLOAT"),
+        ],
     }
 
     with engine.begin() as conn:

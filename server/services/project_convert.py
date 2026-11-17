@@ -2,7 +2,7 @@
 """
 项目任务类型转换
 ================
-把现有项目的 task_type 在 seg / det / obb 之间互转：
+把现有项目的 task_type 在 seg / det / obb / semseg 之间互转：
   - mode='inplace': 原地修改（保留同一个项目，只改 task_type）
   - mode='copy':    复制为新项目（保留原项目）
 
@@ -11,9 +11,13 @@
   - seg 训练：用 polygon 生成 mask
   - det 训练：取 polygon 外接水平矩形作 bbox
   - obb 训练：取 polygon 最小外接旋转矩形作为 4 角点 OBB（cv2.minAreaRect）
+  - semseg 训练：polygon 栅格化后**把所有类别实例合并成一张二值前景 mask**
+    （见 ``dataset_service.prepare_semantic_dataset``），所以实例多边形是唯一的输入，
+    转换时同样不需要改标注。
 
   注：seg ↔ obb 转换最有价值（多边形→旋转矩形保留角度信息）；
       det → obb 因为原本只有水平框，转后 OBB 全是 0°，等同 det。
+      cls（图级标签）没有多边形，不参与任何转换。
 """
 
 import shutil
@@ -30,6 +34,43 @@ from ..models.defect_class import DefectClass
 from ..models.image import Image
 from ..models.project import Project
 from ..models.train_task import TrainTask
+
+# 参与类型转换的任务类型（cls 是图级标签，没有多边形，不在此列）
+POLYGON_TASK_TYPES = ("seg", "det", "obb", "semseg")
+
+
+def _semseg_warnings(src: Project, db: Session) -> list[str]:
+    """切换到 semseg 后的注意事项（不阻断转换，只提示）。
+
+    语义分割与实例分割共用同一份实例多边形标注，差别全在训练端：
+    ``prepare_semantic_dataset`` 把每图的全部实例栅格化后合并成一张二值前景 mask，
+    类别索引只保留在 masks_ids 里（当前 num_classes=1，所有类别合并为“缺陷”）。
+    """
+    warnings = [
+        "语义分割训练会把每张图的所有类别实例合并成一张二值前景 mask（0=背景 / 1=缺陷），"
+        "不再区分实例和类别；标注数据本身不变，class_index 仍保留在 masks_ids 中供以后扩展。",
+        "训练按缺陷中心采样 patch（默认 512），不预切图，也不使用项目里的 crop_size/overlap 滑窗参数。",
+    ]
+    labeled = (
+        db.query(Image.id)
+        .join(Annotation, Annotation.image_id == Image.id)
+        .filter(Image.project_id == src.id)
+        .distinct()
+        .count()
+    )
+    if labeled == 0:
+        warnings.append("当前项目还没有任何多边形标注，语义分割需要先标注缺陷（至少 2 张图才能开训）。")
+    elif labeled < 2:
+        warnings.append(f"当前只有 {labeled} 张图有缺陷标注，语义分割至少要 2 张才能开始训练。")
+    return warnings
+
+
+def _semseg_source_warnings(src: Project) -> list[str]:
+    """从 semseg 转出时的提示：标注仍是实例多边形，可直接复用。"""
+    return [
+        "语义分割项目的标注同样是实例多边形（与 seg 完全一致），"
+        "转回实例分割 / 检测 / OBB 不需要重新标注。",
+    ]
 
 
 def _resolve_project_name(db: Session, base_name: str) -> str:
@@ -55,11 +96,11 @@ def convert_project_task_type(
     new_name: Optional[str] = None,
 ) -> dict:
     """
-    转换项目任务类型（seg ↔ det）。
+    转换项目任务类型（seg / det / obb / semseg）。
 
     Args:
         project_id: 源项目 ID
-        target_type: 目标类型，'seg' 或 'det'
+        target_type: 目标类型，'seg' / 'det' / 'obb' / 'semseg'
         mode: 'inplace' 或 'copy'
         db: SQLAlchemy Session
         new_name: copy 模式下的新项目名（可选，重名自动加后缀）
@@ -73,10 +114,13 @@ def convert_project_task_type(
             "task_type": str,
             "image_count": int,
             "annotation_count": int,
+            "warnings": list[str],   # 转换后的注意事项（如 semseg 会合并类别）
         }
     """
-    if target_type not in ("seg", "det", "obb"):
-        raise ValueError(f"target_type 必须是 seg/det/obb，got: {target_type}")
+    if target_type not in POLYGON_TASK_TYPES:
+        raise ValueError(
+            f"target_type 必须是 {'/'.join(POLYGON_TASK_TYPES)}，got: {target_type}"
+        )
     if mode not in ("inplace", "copy"):
         raise ValueError(f"mode 必须是 inplace 或 copy，got: {mode}")
 
@@ -85,6 +129,11 @@ def convert_project_task_type(
         raise ValueError(f"项目 {project_id} 不存在")
 
     src_type = (src.task_type or "seg")
+    if src_type == "cls":
+        raise ValueError(
+            "cls（图像分类）项目用的是图级标签 images.class_id，没有多边形标注，无法转换为 "
+            f"{target_type}"
+        )
     if src_type == target_type:
         raise ValueError(f"项目已经是 {target_type} 类型，无需转换")
 
@@ -109,6 +158,7 @@ def convert_project_task_type(
 
 def _convert_inplace(src: Project, target_type: str, db: Session) -> dict:
     """原地修改 task_type。标注数据不动。"""
+    src_type_before = (src.task_type or "seg")
     src.task_type = target_type
     # 检测项目通常 crop_size = 原图（不滑窗）；分割项目通常需要预处理
     # 这里不动其他字段，让用户自己在前端调整
@@ -129,6 +179,11 @@ def _convert_inplace(src: Project, target_type: str, db: Session) -> dict:
         "task_type": target_type,
         "image_count": img_count,
         "annotation_count": ann_count,
+        "warnings": (
+            _semseg_warnings(src, db) if target_type == "semseg"
+            else _semseg_source_warnings(src) if src_type_before == "semseg"
+            else []
+        ),
     }
 
 
@@ -136,6 +191,7 @@ def _convert_copy(
     src: Project, target_type: str, new_name: Optional[str], db: Session
 ) -> dict:
     """复制项目为新 task_type。复制图片文件、类别、标注。"""
+    src_type_before = (src.task_type or "seg")
     base_name = (new_name or "").strip() or f"{src.name}_{target_type}"
     final_name = _resolve_project_name(db, base_name)
 
@@ -202,10 +258,13 @@ def _convert_copy(
         new_img = Image(
             project_id=new_project.id,
             filename=img.filename,
+            source_relative_path=img.source_relative_path,
             file_path=f"{new_project.id}/{new_basename}",
             width=img.width,
             height=img.height,
             file_size=img.file_size,
+            # 文件是逐字节 copy2，内容哈希与原图一致，可直接沿用
+            content_hash=img.content_hash,
             status=img.status,
             annotator=img.annotator,
             reviewer=img.reviewer,
@@ -231,6 +290,9 @@ def _convert_copy(
             image_id=new_image_id,
             class_id=new_class_id,
             polygon=ann.polygon,
+            # 矩形/圆形保持参数化（polygon 仍是几何真相，shape 只是编辑提示）
+            shape=ann.shape or "polygon",
+            shape_params=ann.shape_params,
             area=ann.area,
             bbox=ann.bbox,
             created_by=ann.created_by,
@@ -248,4 +310,9 @@ def _convert_copy(
         "task_type": target_type,
         "image_count": img_count,
         "annotation_count": ann_count,
+        "warnings": (
+            _semseg_warnings(new_project, db) if target_type == "semseg"
+            else _semseg_source_warnings(src) if src_type_before == "semseg"
+            else []
+        ),
     }

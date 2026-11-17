@@ -14,12 +14,13 @@ class Project(Base):
     name: Mapped[str] = mapped_column(String(200), nullable=False)
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
 
-    # 任务类型: seg=实例分割, det=目标检测, cls=图像分类, obb=旋转目标检测
+    # 任务类型: seg=实例分割, det=目标检测, cls=图像分类, obb=旋转目标检测,
+    #          semseg=语义分割（ResUNet34 + clDice，二值缺陷 mask）
     task_type: Mapped[str] = mapped_column(
-        Enum("seg", "det", "cls", "obb", name="project_task_type"),
+        Enum("seg", "det", "cls", "obb", "semseg", name="project_task_type"),
         default="seg",
         server_default="seg",
-        comment="任务类型: seg=实例分割, det=目标检测, cls=图像分类, obb=旋转目标检测",
+        comment="任务类型: seg=实例分割, det=目标检测, cls=图像分类, obb=旋转目标检测, semseg=语义分割",
     )
 
     # 预处理参数

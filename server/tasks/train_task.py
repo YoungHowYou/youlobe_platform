@@ -27,7 +27,7 @@ from ..models.train_task import TrainTask, TrainEpochLog
 from ..models.project import Project
 from ..services.dataset_service import (
     prepare_full_dataset, prepare_detection_dataset, prepare_classification_dataset,
-    prepare_obb_dataset,
+    prepare_obb_dataset, prepare_semantic_dataset,
 )
 from ..config import settings
 
@@ -106,6 +106,16 @@ def _purge_intermediates_if_needed(db, task_id: int) -> None:
     task = db.query(TrainTask).filter(TrainTask.id == task_id).first()
     if task is None or task.status not in ("completed", "cancelled"):
         return
+
+    # 删 dataset/ 之前先抽样一份 mini 校准集到 <task>/calib：OpenVINO INT8 导出
+    # 需要 data=<dataset.yaml> 做 PTQ，而 dataset 属于可回收中间产物，
+    # 不清就会占几 GB、清了 INT8 就再也导不出来。
+    try:
+        from ..services.calib_dataset import keep_calib_for_task
+
+        keep_calib_for_task(task, db)
+    except Exception as exc:       # noqa: BLE001 - 校准集失败不影响主流程
+        print(f"[训练任务] Task#{task_id} 保留 INT8 校准集失败: {exc}")
 
     from ..services.artifact_cleanup import purge_task_intermediates
 
@@ -264,6 +274,19 @@ def run_training_pipeline(task_id: int) -> dict:
                 crop_size=config.get("crop_size", 640),
                 overlap=config.get("overlap", 0.2),
             )
+        elif task_type == "semseg":
+            dataset_result = prepare_semantic_dataset(
+                project_id=project_id,
+                task_output_dir=str(task_dir),
+                db=db,
+                train_ratio=config.get("train_ratio", 0.8),
+                patch_size=config.get("patch_size") or config.get("crop_size", 512),
+                mask_dilate_kernel=config.get("mask_dilate_kernel", 0),
+                min_area=config.get("semseg_min_area", 0),
+                include_ok=config.get("semseg_include_ok", False),
+                # 多分类：polygon 栅格化成 masks_ids（像素值 = class_index + 1）
+                multiclass=(config.get("semseg_mode") == "multiclass"),
+            )
         else:
             dataset_result = prepare_full_dataset(
                 project_id=project_id,
@@ -287,6 +310,31 @@ def run_training_pipeline(task_id: int) -> dict:
 
         # 保存类别信息到 config（供后续继承训练时校验）
         config["class_names"] = class_names
+        if task_type == "semseg":
+            # 分割模式/类别数/Halo 落库：推理/导出/继承训练都以 config 为准
+            config["semseg_mode"] = dataset_result.get("semseg_mode", "binary")
+            config["semseg_num_classes"] = int(dataset_result.get("num_classes", 1) or 1)
+            semseg_patch = int(config.get("patch_size")
+                               or dataset_result.get("patch_size") or 512)
+            semseg_halo = max(0, int(config.get("semseg_halo", 0) or 0))
+            if semseg_halo:
+                # 整图即一个 patch（图像最大边 ≤ 有效区）时 halo 拿不到真实邻居上下文，
+                # 自动关闭；实际生效的 halo 写回 config，推理/导出/监控三处跟着权重走
+                from core.semseg.dataset import resolve_halo_for_manifest
+                semseg_halo, halo_note = resolve_halo_for_manifest(
+                    dataset_result["manifest_path"], semseg_patch, semseg_halo)
+                if halo_note:
+                    print(f"[semseg] {halo_note}")
+                    config["semseg_halo_requested"] = int(config.get("semseg_halo", 0) or 0)
+                    config["semseg_halo_note"] = halo_note
+            config["semseg_halo"] = semseg_halo
+            config["semseg_input_size"] = semseg_patch + 2 * semseg_halo
+            if config["semseg_mode"] == "multiclass":
+                print(f"[semseg] 多分类模式：num_classes={config['semseg_num_classes']} "
+                      f"class_names={class_names}")
+            if semseg_halo:
+                print(f"[semseg] Halo={semseg_halo}：输入 {config['semseg_input_size']}，"
+                      f"有效区 {semseg_patch}")
         if task_type == "cls":
             config["classification_class_mapping"] = dataset_result.get("class_mapping", [])
             config["classification_dataset_folders"] = dataset_result.get("class_folder_names", [])
@@ -297,6 +345,9 @@ def run_training_pipeline(task_id: int) -> dict:
         if task_type == "cls":
             # 分类：data 参数直接传 dataset 目录（YOLO 自动按子目录扫描类别）
             dataset_yaml = dataset_dir
+        elif task_type == "semseg":
+            # 语义分割：传 manifest.json（含 train/val 图像与 mask 路径）
+            dataset_yaml = dataset_result["manifest_path"]
         else:
             from core.train import generate_dataset_yaml
             dataset_yaml = str(task_dir / "dataset.yaml")
@@ -308,58 +359,98 @@ def run_training_pipeline(task_id: int) -> dict:
 
         # ---- 阶段 4: 模型训练 ----
         task.status = "training"
-        task.epochs = config.get("epochs", 150)
+        task.epochs = config.get("epochs", 12 if task_type == "semseg" else 150)
         db.commit()
 
         # 确定模型来源（从头训练 or 继承训练）
-        model_name = config.get("model_name", "yolo26s-seg")  # 用户选择的模型尺寸
+        semseg_base_checkpoint = None
         train_mode = config.get("train_mode", "scratch")
-        if train_mode == "finetune":
-            resume_task_id = config.get("resume_from_task_id")
-            resume_model_type = config.get("resume_model_type", "best")
-            if resume_task_id:
-                prev_task = db.query(TrainTask).filter(TrainTask.id == resume_task_id).first()
-                if prev_task:
-                    prev_path = prev_task.best_model_path if resume_model_type == "best" else prev_task.last_model_path
-                    if prev_path and Path(prev_path).exists():
-                        model_name = prev_path
-                        print(f"[继承训练] 从 Task#{resume_task_id} {resume_model_type}.pt 继续: {prev_path}")
-                        # 记录真实来源与父模型架构：导出页靠 model_name 判断是否 end2end，
-                        # 继承时用户选的模型尺寸无效，应以父模型的架构为准。
-                        config["inherited_from_task_id"] = resume_task_id
-                        config["base_model_path"] = prev_path
-                        parent_model = (prev_task.config or {}).get("model_name")
-                        if parent_model:
-                            config["model_name"] = parent_model
+        if task_type == "semseg":
+            # 语义分割没有 Ultralytics 的模型尺寸概念，架构固定 ResUNet34+clDice
+            model_name = "resunet34_cldice"
+            config["model_name"] = model_name
+            config.setdefault("arch", "resunet34_cldice")
+            if train_mode == "finetune":
+                resume_task_id = config.get("resume_from_task_id")
+                resume_model_type = config.get("resume_model_type", "best")
+                if resume_task_id:
+                    prev_task = db.query(TrainTask).filter(TrainTask.id == resume_task_id).first()
+                    if prev_task:
+                        prev_path = (prev_task.best_model_path
+                                     if resume_model_type == "best"
+                                     else prev_task.last_model_path)
+                        if prev_path and Path(prev_path).exists():
+                            semseg_base_checkpoint = prev_path
+                            config["inherited_from_task_id"] = resume_task_id
+                            config["base_model_path"] = prev_path
+                            print(f"[semseg 继承] 从 Task#{resume_task_id} 继续: {prev_path}")
+                            # 二值 ⇄ 多分类（或类别数变了）时分类头形状不一致，只迁就骨干
+                            try:
+                                from core.semseg.checkpoint import read_checkpoint_meta
+                                pnc = int(read_checkpoint_meta(prev_path).get("num_classes") or 1)
+                                cnc = int(config.get("semseg_num_classes", 1) or 1)
+                                if pnc != cnc:
+                                    print(f"[semseg 继承] 父模型类别数 {pnc} ≠ 当前 {cnc}，"
+                                          f"分类头将重新初始化（只继承骨干）")
+                                    config["head_reinit"] = True
+                            except Exception as exc:
+                                print(f"[semseg 继承] 读取父模型 meta 失败（忽略）：{exc}")
+                        else:
+                            print("[semseg 继承] 父模型不存在，回退为 ImageNet 预训练编码器")
                     else:
-                        print(f"[警告] 继承模型不存在，回退为从头训练")
-                else:
-                    print(f"[警告] 找不到 Task#{resume_task_id}，回退为从头训练")
-        elif train_mode == "custom":
-            # 自定义预训练模型：用户在服务器 weights/ 等目录里放自己的 .pt
-            custom_path = config.get("model_path") or config.get("base_model_path")
-            try:
-                from ..services.model_source import inspect_local_model
-
-                info = inspect_local_model(custom_path)
-            except Exception as exc:  # noqa: BLE001
-                raise ValueError(f"自定义预训练模型不可用：{exc}") from exc
-
-            expected = {"seg": "segment", "det": "detect", "obb": "obb", "cls": "classify"}.get(task_type)
-            if expected and info["task"] != expected:
+                        print(f"[semseg 继承] 找不到 Task#{resume_task_id}，回退为 ImageNet 预训练")
+            elif train_mode == "custom":
                 raise ValueError(
-                    f"自定义模型的 task={info['task']} 与项目类型 {task_type} 不匹配"
+                    "语义分割暂不支持自定义 .pt 预训练权重，请改用「继承训练」或从头训练"
                 )
+        else:
+            model_name = config.get("model_name", "yolo26s-seg")  # 用户选择的模型尺寸
+            if train_mode == "finetune":
+                resume_task_id = config.get("resume_from_task_id")
+                resume_model_type = config.get("resume_model_type", "best")
+                if resume_task_id:
+                    prev_task = db.query(TrainTask).filter(TrainTask.id == resume_task_id).first()
+                    if prev_task:
+                        prev_path = prev_task.best_model_path if resume_model_type == "best" else prev_task.last_model_path
+                        if prev_path and Path(prev_path).exists():
+                            model_name = prev_path
+                            print(f"[继承训练] 从 Task#{resume_task_id} {resume_model_type}.pt 继续: {prev_path}")
+                            # 记录真实来源与父模型架构：导出页靠 model_name 判断是否 end2end，
+                            # 继承时用户选的模型尺寸无效，应以父模型的架构为准。
+                            config["inherited_from_task_id"] = resume_task_id
+                            config["base_model_path"] = prev_path
+                            parent_model = (prev_task.config or {}).get("model_name")
+                            if parent_model:
+                                config["model_name"] = parent_model
+                        else:
+                            print(f"[警告] 继承模型不存在，回退为从头训练")
+                    else:
+                        print(f"[警告] 找不到 Task#{resume_task_id}，回退为从头训练")
+            elif train_mode == "custom":
+                # 自定义预训练模型：用户在服务器 weights/ 等目录里放自己的 .pt
+                custom_path = config.get("model_path") or config.get("base_model_path")
+                try:
+                    from ..services.model_source import inspect_local_model
 
-            model_name = info["path"]
-            config["base_model_path"] = info["path"]
-            config["model_name"] = info["stem"]
-            config["is_end2end"] = info["end2end"]
-            config["base_model_nc"] = info["nc"]
-            print(
-                f"[自定义预训练] 使用 {info['path']} "
-                f"(task={info['task']}, nc={info['nc']}, end2end={info['end2end']})"
-            )
+                    info = inspect_local_model(custom_path)
+                except Exception as exc:  # noqa: BLE001
+                    raise ValueError(f"自定义预训练模型不可用：{exc}") from exc
+
+                expected = {"seg": "segment", "det": "detect", "obb": "obb", "cls": "classify"}.get(task_type)
+                if expected and info["task"] != expected:
+                    raise ValueError(
+                        f"自定义模型的 task={info['task']} 与项目类型 {task_type} 不匹配"
+                    )
+
+                model_name = info["path"]
+                config["base_model_path"] = info["path"]
+                config["model_name"] = info["stem"]
+                config["is_end2end"] = info["end2end"]
+                config["base_model_nc"] = info["nc"]
+                print(
+                    f"[自定义预训练] 使用 {info['path']} "
+                    f"(task={info['task']}, nc={info['nc']}, end2end={info['end2end']})"
+                )
 
         def cancel_check() -> bool:
             """
@@ -437,6 +528,11 @@ def run_training_pipeline(task_id: int) -> dict:
                     val_seg_loss=data.get("val_seg_loss"),
                     val_cls_loss=data.get("val_cls_loss"),
                     val_dfl_loss=data.get("val_dfl_loss"),
+                    val_dice=data.get("val_dice"),
+                    val_iou=data.get("val_iou"),
+                    val_recall=data.get("val_recall"),
+                    val_miou=data.get("val_miou"),
+                    val_mdice=data.get("val_mdice"),
                     precision_b=data.get("precision_B"),
                     recall_b=data.get("recall_B"),
                     map50_b=data.get("mAP50_B"),
@@ -501,50 +597,94 @@ def run_training_pipeline(task_id: int) -> dict:
                 db.rollback()
                 print(f"[epoch_callback error] {e}")
 
-        # 调用现有 core/train.py
-        from core.train import run_train
-        train_result = run_train(
-            dataset_yaml=dataset_yaml,
-            output_dir=str(task_dir / "runs"),
-            model_name=model_name,
-            imgsz=config.get("crop_size", 640),
-            epochs=config.get("epochs", 150),
-            batch_size=config.get("batch_size", 16),
-            patience=config.get("patience", 0),
-            device=config.get("device") or "auto",   # 默认 auto：有 CUDA 用 GPU，否则回落 CPU
-            task_type=task_type,
-            seg_loss=config.get("seg_loss", "default"),
-            seg_loss_params=config.get("seg_loss_params"),
-            augment_hsv_h=config.get("hsv_h", 0.015),
-            augment_hsv_s=config.get("hsv_s", 0.7),
-            augment_hsv_v=config.get("hsv_v", 0.4),
-            color_aug_mode=config.get("color_aug_mode", "hsv"),
-            rgb_gain_p=config.get("rgb_gain_p", 0.5),
-            # 兼容早期只有 rgb_gain_max 的配置：作为三通道的统一默认值
-            rgb_gain_max_r=config.get("rgb_gain_max_r", config.get("rgb_gain_max", 0.2)),
-            rgb_gain_max_g=config.get("rgb_gain_max_g", config.get("rgb_gain_max", 0.2)),
-            rgb_gain_max_b=config.get("rgb_gain_max_b", config.get("rgb_gain_max", 0.2)),
-            augment_degrees=config.get("degrees", 10.0),
-            augment_translate=config.get("translate", 0.1),
-            augment_scale=config.get("scale", 0.5),
-            augment_shear=config.get("shear", 5.0),
-            augment_flipud=config.get("flipud", 0.5),
-            augment_fliplr=config.get("fliplr", 0.5),
-            augment_mosaic=config.get("mosaic", 0.3),
-            augment_mixup=config.get("mixup", 0.1),
-            augment_copy_paste=config.get("copy_paste", 0.5),
-            augment_erasing=config.get("erasing", 0.0),
-            close_mosaic=config.get("close_mosaic", 30),
-            lr0=config.get("lr0", 0.01),
-            lrf=config.get("lrf", 0.01),
-            momentum=config.get("momentum", 0.937),
-            weight_decay=config.get("weight_decay", 0.0005),
-            warmup_epochs=config.get("warmup_epochs", 3.0),
-            warmup_momentum=config.get("warmup_momentum", 0.8),
-            workers=config.get("workers", 4),
-            epoch_callback=epoch_callback,
-            cancel_check=cancel_check,
-        )
+        # ---- 调用训练器（按任务类型分支）----
+        if task_type == "semseg":
+            from core.semseg.trainer import run_semseg_train
+
+            train_result = run_semseg_train(
+                manifest_path=dataset_yaml,
+                output_dir=str(task_dir / "runs"),
+                epochs=config.get("epochs", 12),
+                patch_size=config.get("patch_size") or config.get("crop_size", 512),
+                patches_per_image=config.get("patches_per_image", 4),
+                batch_size=config.get("batch_size", 1),
+                accum_steps=config.get("accum_steps", 4),
+                lr=config.get("lr", 1e-4),
+                encoder_lr_mult=config.get("encoder_lr_mult", 0.1),
+                weight_decay=config.get("weight_decay", 1e-4),
+                pos_weight=config.get("pos_weight", 5.0),
+                cldice_weight=config.get("cldice_weight", 1.0),
+                warmup_iters=config.get("warmup_iters", 500),
+                workers=config.get("workers", 2),
+                device=config.get("device") or "auto",
+                threshold=config.get("semseg_threshold", 0.5),
+                patience=config.get("patience", 0),
+                # 增广沿用平台字段；语义分割默认关闭 mosaic/mixup/copy_paste
+                flipud=config.get("flipud", 0.5),
+                fliplr=config.get("fliplr", 0.5),
+                color_aug_mode=config.get("color_aug_mode", "hsv"),
+                hsv_v=config.get("hsv_v", 0.4),
+                rgb_gain_p=config.get("rgb_gain_p", 0.0),
+                rgb_gain_max=config.get("rgb_gain_max", 0.0),
+                degrees=config.get("degrees", 0.0),
+                scale=config.get("scale", 0.1),
+                translate=config.get("translate", 0.0),
+                pretrained=config.get("pretrained", True),
+                base_checkpoint=semseg_base_checkpoint,
+                # 多分类：0=背景，1..N=各类（与 masks_ids 同口径）
+                num_classes=int(config.get("semseg_num_classes", 1) or 1),
+                fg_class_weight=float(config.get("semseg_fg_class_weight", 20.0)),
+                class_names=config.get("class_names") or [],
+                # Halo：输入 = patch_size + 2×halo，loss/指标只看中心有效区
+                halo=int(config.get("semseg_halo", 0) or 0),
+                epoch_callback=epoch_callback,
+                cancel_check=cancel_check,
+            )
+        else:
+            # 调用现有 core/train.py
+            from core.train import run_train
+            train_result = run_train(
+                dataset_yaml=dataset_yaml,
+                output_dir=str(task_dir / "runs"),
+                model_name=model_name,
+                imgsz=config.get("crop_size", 640),
+                epochs=config.get("epochs", 150),
+                batch_size=config.get("batch_size", 16),
+                patience=config.get("patience", 0),
+                device=config.get("device") or "auto",   # 默认 auto：有 CUDA 用 GPU，否则回落 CPU
+                task_type=task_type,
+                seg_loss=config.get("seg_loss", "default"),
+                seg_loss_params=config.get("seg_loss_params"),
+                augment_hsv_h=config.get("hsv_h", 0.015),
+                augment_hsv_s=config.get("hsv_s", 0.7),
+                augment_hsv_v=config.get("hsv_v", 0.4),
+                color_aug_mode=config.get("color_aug_mode", "hsv"),
+                rgb_gain_p=config.get("rgb_gain_p", 0.5),
+                # 兼容早期只有 rgb_gain_max 的配置：作为三通道的统一默认值
+                rgb_gain_max_r=config.get("rgb_gain_max_r", config.get("rgb_gain_max", 0.2)),
+                rgb_gain_max_g=config.get("rgb_gain_max_g", config.get("rgb_gain_max", 0.2)),
+                rgb_gain_max_b=config.get("rgb_gain_max_b", config.get("rgb_gain_max", 0.2)),
+                augment_degrees=config.get("degrees", 10.0),
+                augment_translate=config.get("translate", 0.1),
+                augment_scale=config.get("scale", 0.5),
+                augment_shear=config.get("shear", 5.0),
+                augment_flipud=config.get("flipud", 0.5),
+                augment_fliplr=config.get("fliplr", 0.5),
+                augment_mosaic=config.get("mosaic", 0.3),
+                augment_mixup=config.get("mixup", 0.1),
+                augment_copy_paste=config.get("copy_paste", 0.5),
+                augment_erasing=config.get("erasing", 0.0),
+                close_mosaic=config.get("close_mosaic", 30),
+                lr0=config.get("lr0", 0.01),
+                lrf=config.get("lrf", 0.01),
+                momentum=config.get("momentum", 0.937),
+                weight_decay=config.get("weight_decay", 0.0005),
+                warmup_epochs=config.get("warmup_epochs", 3.0),
+                warmup_momentum=config.get("warmup_momentum", 0.8),
+                workers=config.get("workers", 4),
+                epoch_callback=epoch_callback,
+                cancel_check=cancel_check,
+            )
 
         # ImageFolder 使用的 0000/0001 目录仅用于锁定标签 index。权重落盘后
         # 立即写回中文显示名，确保后续继承、在线推理和 OpenVINO 导出一致。

@@ -1355,3 +1355,329 @@ def _sliding_window_with_yolo_labels(
 
     print(f"[数据集] seg 滑窗完成：{len(img_files)} 张图 → {total_crops} 个子图")
     return total_crops
+
+
+def prepare_semantic_dataset(
+    project_id: int,
+    task_output_dir: str,
+    db: Session,
+    train_ratio: float = 0.8,
+    patch_size: int = 512,
+    mask_dilate_kernel: int = 0,
+    min_area: int = 0,
+    include_ok: bool = False,
+    multiclass: bool = False,
+    seed: int = 20261023,
+    progress_callback=None,
+) -> dict:
+    """语义分割数据集：polygon → 二值 mask + 缺陷点索引 + 按图划分。
+
+    与 seg/det/obb 的「滑窗切图」不同，语义分割**不预切图**：训练时按缺陷像素
+    为中心实时裁剪（见 ``core/semseg/dataset.py``），这样正样本率高、磁盘占用小。
+
+    输出::
+
+        <task_dir>/raw/
+            images/000001.png        # build_dataset_from_db 产出（后缀可能是 .png）
+            labels/000001.txt        # YOLO polygon
+            masks_binary/000001.png  # 0/255 二值 mask（训练标签）
+            masks_ids/000001.png     # 类别索引 mask（1..N，保留给多类扩展）
+            points/000001.npy        # 缺陷像素坐标 (N,2)=[y,x]，加速采样
+        <task_dir>/semseg_dataset/manifest.json
+
+    Args:
+        patch_size: 记录进 manifest 的 patch 尺寸（训练器以此为准）
+        mask_dilate_kernel: >0 时对二值 mask 做膨胀（扩大正样本）
+        min_area: >0 时丢弃小于该面积的连通域（去标注噪点）
+        include_ok: 是否把「无缺陷 / OK」图加入训练集。实验剔除了无标注图，
+            默认 False 与实验一致；平台里显式标 OK 的项目可打开以降低误检。
+    """
+    import json
+    import random
+
+    import cv2
+    import numpy as np
+
+    task_dir = Path(task_output_dir)
+    raw_dir = task_dir / "raw"
+    dataset_dir = task_dir / "semseg_dataset"
+
+    if progress_callback:
+        progress_callback(0, 3, "从数据库导出标注数据...")
+    export_stats = build_dataset_from_db(project_id, str(raw_dir), db)
+    class_names = export_stats.get("class_names") or []
+
+    # 多分类：mask 像素值 = class_index + 1，所以类别数 = max(class_index) + 2
+    # （背景占 0）。按项目实际的 class_index 算，这样类别索引有空洞也不会越界。
+    classes = (
+        db.query(DefectClass)
+        .filter(DefectClass.project_id == project_id)
+        .order_by(DefectClass.class_index)
+        .all()
+    )
+    if classes and multiclass:
+        num_classes = max(int(c.class_index) for c in classes) + 2
+        # 类别名按 class_index 对齐（空位用 class_<i> 占位，避免错位）
+        name_by_index = {int(c.class_index): (c.name or f"class_{c.class_index}")
+                         for c in classes}
+        class_names = [name_by_index.get(i, f"class_{i}") for i in range(num_classes - 1)]
+    else:
+        num_classes = 1
+
+    img_dir = raw_dir / "images"
+    lbl_dir = raw_dir / "labels"
+    mask_dir = raw_dir / "masks_binary"
+    mask_ids_dir = raw_dir / "masks_ids"
+    points_dir = raw_dir / "points"
+    for d in (mask_dir, mask_ids_dir, points_dir, dataset_dir):
+        d.mkdir(parents=True, exist_ok=True)
+
+    if progress_callback:
+        progress_callback(1, 3, "polygon 栅格化为二值 mask...")
+
+    labeled, empty = [], []
+    total_instances = 0
+    size_by_stem: dict[str, tuple[int, int]] = {}
+    for lbl_path in sorted(lbl_dir.glob("*.txt")):
+        stem = lbl_path.stem
+        img_path = img_dir / f"{stem}.png"
+        if not img_path.exists():
+            candidates = list(img_dir.glob(f"{stem}.*"))
+            if not candidates:
+                continue
+            img_path = candidates[0]
+
+        img = cv2.imread(str(img_path), cv2.IMREAD_GRAYSCALE)
+        if img is None:
+            print(f"[semseg 数据集] 跳过无法读取的图像：{img_path}")
+            continue
+        h, w = img.shape[:2]
+        size_by_stem[stem] = (int(w), int(h))
+
+        mask_ids = np.zeros((h, w), dtype=np.uint8)
+        instance_count = 0
+        for line in lbl_path.read_text(encoding="utf-8", errors="ignore").splitlines():
+            parts = line.split()
+            if len(parts) < 7:
+                continue
+            try:
+                cls_id = int(float(parts[0])) + 1       # 背景 0，类别从 1 开始
+                coords = np.array(parts[1:], dtype=np.float32)
+            except ValueError:
+                continue
+            pts = coords.reshape(-1, 2)
+            pts[:, 0] = np.clip(pts[:, 0] * w, 0, w - 1)
+            pts[:, 1] = np.clip(pts[:, 1] * h, 0, h - 1)
+            if len(pts) < 3:
+                continue
+            cv2.fillPoly(mask_ids, [pts.astype(np.int32).reshape(-1, 1, 2)],
+                         int(min(cls_id, 255)))
+            instance_count += 1
+
+        binary = ((mask_ids > 0).astype(np.uint8)) * 255
+        if min_area > 0 and binary.any():
+            num, labels, stats, _ = cv2.connectedComponentsWithStats(
+                (binary > 0).astype(np.uint8), connectivity=8)
+            cleaned = np.zeros_like(binary)
+            for idx in range(1, num):
+                if stats[idx, cv2.CC_STAT_AREA] >= int(min_area):
+                    cleaned[labels == idx] = 255
+            binary = cleaned
+        if mask_dilate_kernel > 1:
+            kernel = np.ones((int(mask_dilate_kernel), int(mask_dilate_kernel)), np.uint8)
+            binary = cv2.dilate(binary, kernel, iterations=1)
+
+        cv2.imwrite(str(mask_dir / f"{stem}.png"), binary)
+        cv2.imwrite(str(mask_ids_dir / f"{stem}.png"), mask_ids)
+
+        ys, xs = np.where(binary > 0)
+        if len(xs) == 0:
+            empty.append(stem)
+            continue
+        pts = np.stack([ys, xs], axis=1).astype(np.int32)
+        if len(pts) > 50000:
+            keep = np.random.default_rng(seed).choice(len(pts), 50000, replace=False)
+            pts = pts[np.sort(keep)]
+        np.save(points_dir / f"{stem}.npy", pts)
+
+        labeled.append(stem)
+        total_instances += instance_count
+
+    if len(labeled) < 2:
+        raise ValueError(
+            f"语义分割至少需要 2 张有缺陷标注的图，当前只有 {len(labeled)} 张"
+        )
+
+    if progress_callback:
+        progress_callback(2, 3, "按图划分 train/val...")
+
+    rng = random.Random(seed)
+    shuffled = list(labeled)
+    rng.shuffle(shuffled)
+    val_count = max(1, int(round(len(shuffled) * (1.0 - float(train_ratio)))))
+    val_stems = sorted(shuffled[:val_count])
+    train_stems = sorted(shuffled[val_count:])
+    if not train_stems:                      # 极端比例兜底
+        train_stems = [val_stems.pop()]
+
+    def _item(stem: str) -> dict:
+        return {
+            "stem": stem,
+            "image": str(img_dir / f"{stem}.png"),
+            "mask": str(mask_dir / f"{stem}.png"),
+            "mask_ids": str(mask_ids_dir / f"{stem}.png"),
+            "points": str(points_dir / f"{stem}.npy"),
+            # 记录原图尺寸：训练端判断「整图即一个 patch → 关闭 Halo」时不必再读文件
+            "width": int(size_by_stem.get(stem, (0, 0))[0]),
+            "height": int(size_by_stem.get(stem, (0, 0))[1]),
+        }
+
+    train_items = [_item(s) for s in train_stems]
+    if include_ok:
+        for stem in empty:
+            train_items.append({
+                "stem": stem,
+                "image": str(img_dir / f"{stem}.png"),
+                "mask": str(mask_dir / f"{stem}.png"),
+                "mask_ids": str(mask_ids_dir / f"{stem}.png"),
+                "points": "",
+                "width": int(size_by_stem.get(stem, (0, 0))[0]),
+                "height": int(size_by_stem.get(stem, (0, 0))[1]),
+            })
+
+    manifest = {
+        "version": 1,
+        "task_type": "semseg",
+        "mode": "multiclass" if multiclass else "binary",
+        "patch_size": int(patch_size),
+        "class_names": class_names,
+        # 二值：0=背景 1=缺陷（所有类别合并）；多分类：0=背景，1..N=各类
+        "num_classes": int(num_classes),
+        "include_ok": bool(include_ok),
+        "train": train_items,
+        "val": [_item(s) for s in val_stems],
+        "stats": {
+            "labeled_images": len(labeled),
+            "empty_images": len(empty),
+            "train_images": len(train_stems),
+            "val_images": len(val_stems),
+            "instances": total_instances,
+        },
+    }
+    manifest_path = dataset_dir / "manifest.json"
+    manifest_path.write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+
+    if progress_callback:
+        progress_callback(3, 3, "语义分割数据集准备完成")
+
+    print(
+        f"[semseg 数据集] 有缺陷图 {len(labeled)} 张 / 空标注 {len(empty)} 张；"
+        f"train={len(train_stems)} val={len(val_stems)}；"
+        f"patch={patch_size} → {manifest_path}"
+    )
+
+    return {
+        "dataset_dir": str(dataset_dir),
+        "manifest_path": str(manifest_path),
+        "class_names": class_names,
+        "num_classes": int(num_classes),
+        "semseg_mode": "multiclass" if multiclass else "binary",
+        "export_stats": export_stats,
+        "split_stats": manifest["stats"],
+        "patch_size": int(patch_size),
+    }
+
+
+
+def collect_semseg_calibration_patches(
+    project_id: int,
+    db: Session,
+    patch_size: int = 512,
+    limit: int = 64,
+    seed: int = 0,
+) -> list:
+    """裁「缺陷中心 patch」给语义分割 INT8 校准用（NNCF PTQ）。
+
+    为什么不能用随机裁剪：缺陷只占整图约 0.004%，随机 patch 几乎全是背景，
+    NNCF 只会看到背景的概率分布，量化后缺陷区间被压掉（实测 Dice 0.7 → 0.01）。
+    这里与训练/`prepare_semantic_dataset` 的口径一致：
+    取标注多边形的顶点质心作为中心，裁 ``patch_size``，小图右下补 0。
+
+    Returns:
+        list[np.ndarray]：灰度 patch（H=W=patch_size 或原图更小时会补到 patch_size）
+    """
+    import random
+
+    import cv2
+    import numpy as np
+
+    patch = int(patch_size or 512)
+    limit = max(1, int(limit or 64))
+
+    # 只取有标注的图（按 id 顺序取，limit 控制成本；随机打散避免只覆盖前几张）
+    rows = (
+        db.query(Image.id, Image.file_path)
+        .join(Annotation, Annotation.image_id == Image.id)
+        .filter(Image.project_id == project_id)
+        .distinct()
+        .all()
+    )
+    if not rows:
+        return []
+    random.Random(seed).shuffle(rows)
+    rows = rows[: max(limit * 2, limit)]      # 多留余量，读图失败时继续
+
+    anns = (
+        db.query(Annotation.image_id, Annotation.polygon)
+        .join(Image, Annotation.image_id == Image.id)
+        .filter(Image.project_id == project_id)
+        .all()
+    )
+    centers: dict[int, list[tuple[float, float]]] = {}
+    for image_id, polygon in anns:
+        pts = []
+        for p in polygon or []:
+            if isinstance(p, dict):
+                pts.append((float(p.get("x", 0.0)), float(p.get("y", 0.0))))
+            elif isinstance(p, (list, tuple)) and len(p) >= 2:
+                pts.append((float(p[0]), float(p[1])))
+        if pts:
+            cx = sum(x for x, _ in pts) / len(pts)
+            cy = sum(y for _, y in pts) / len(pts)
+            centers.setdefault(int(image_id), []).append((cx, cy))
+
+    patches: list = []
+    for image_id, file_path in rows:
+        if len(patches) >= limit:
+            break
+        pts = centers.get(int(image_id)) or []
+        if not pts:
+            continue
+        img_path = Path(file_path)
+        if not img_path.is_absolute():
+            img_path = settings.upload_path / file_path
+        try:
+            data = np.fromfile(str(img_path), dtype=np.uint8)     # 兼容中文/特殊字符路径
+            img = cv2.imdecode(data, cv2.IMREAD_GRAYSCALE) if data.size else None
+        except Exception:
+            img = None
+        if img is None:
+            continue
+
+        h, w = img.shape[:2]
+        # 每张图取一个缺陷中心（第一个标注的质心），坐标归一化 → 像素
+        cx, cy = pts[0]
+        cx_px, cy_px = int(round(cx * w)), int(round(cy * h))
+        x0 = int(np.clip(cx_px - patch // 2, 0, max(0, w - patch)))
+        y0 = int(np.clip(cy_px - patch // 2, 0, max(0, h - patch)))
+        crop = img[y0:y0 + patch, x0:x0 + patch]
+        if crop.shape[0] != patch or crop.shape[1] != patch:
+            padded = np.zeros((patch, patch), dtype=img.dtype)
+            padded[: crop.shape[0], : crop.shape[1]] = crop
+            crop = padded
+        patches.append(np.ascontiguousarray(crop))
+
+    print(f"[semseg 校准] 收集到 {len(patches)} 张缺陷中心 patch（patch={patch}）")
+    return patches

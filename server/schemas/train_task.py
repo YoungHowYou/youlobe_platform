@@ -89,6 +89,36 @@ class TrainConfig(BaseModel):
     erode_kernel: int = Field(default=3, ge=1, le=15)
     mask_dilate_kernel: int = Field(default=0, ge=0, le=15)
 
+    # ---- 语义分割（task_type=semseg，ResUNet34 + clDice）----
+    patch_size: int = Field(default=512, ge=128, le=2048, description="semseg: 缺陷中心 patch 尺寸")
+    semseg_mode: Literal["binary", "multiclass"] = Field(
+        default="binary",
+        description="semseg: binary=缺陷/背景二值；multiclass=背景+项目每个类别各成一类",
+    )
+    semseg_fg_class_weight: float = Field(
+        default=20.0, ge=1.0, le=100.0,
+        description="semseg 多分类: 前景类的 CE 权重（背景固定 1）",
+    )
+    semseg_halo: int = Field(
+        default=0, ge=0, le=256,
+        description="semseg: Halo 上下文像素（输入 = patch_size + 2×halo，0=关闭；建议 8 的倍数）",
+    )
+    semseg_stride_ratio: float = Field(
+        default=0.75, ge=0.25, le=1.0,
+        description="semseg: 推理滑窗步长比例（步长 = patch_size × 该值）",
+    )
+    patches_per_image: int = Field(default=4, ge=1, le=64, description="semseg: 每图每 epoch 的 patch 数")
+    accum_steps: int = Field(default=4, ge=1, le=64, description="semseg: 梯度累积步数")
+    lr: float = Field(default=1e-4, gt=0, le=0.01, description="semseg: AdamW 初始学习率")
+    encoder_lr_mult: float = Field(default=0.1, gt=0, le=1, description="semseg: 编码器学习率倍率")
+    pos_weight: float = Field(default=5.0, ge=1.0, le=50.0, description="semseg: BCE 正样本权重")
+    cldice_weight: float = Field(default=1.0, ge=0.0, le=10.0, description="semseg: clDice 权重")
+    warmup_iters: int = Field(default=500, ge=0, le=100000, description="semseg: 线性预热 iter")
+    semseg_threshold: float = Field(default=0.6, ge=0.05, le=0.95, description="semseg: 推理阈值")
+    semseg_include_ok: bool = Field(default=False, description="semseg: 无缺陷图是否加入训练")
+    semseg_min_area: int = Field(default=0, ge=0, le=100000, description="semseg: 丢弃小于该面积的连通域")
+    pretrained: bool = Field(default=True, description="semseg: 编码器是否加载 ImageNet 预训练")
+
 
 class TrainTaskCreate(BaseModel):
     task_name: str = Field(max_length=200)
@@ -136,5 +166,10 @@ class EpochLogOut(BaseModel):
     map50_95_m: Optional[float]
     top1_acc: Optional[float] = None   # cls top1
     top5_acc: Optional[float] = None   # cls top5
+    val_dice: Optional[float] = None   # semseg Dice
+    val_iou: Optional[float] = None    # semseg IoU
+    val_recall: Optional[float] = None # semseg pixel recall
+    val_miou: Optional[float] = None   # semseg 多分类 mIoU
+    val_mdice: Optional[float] = None  # semseg 多分类 mDice
     lr: Optional[float]
     model_config = {"from_attributes": True}

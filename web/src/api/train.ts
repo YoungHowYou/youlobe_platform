@@ -37,6 +37,11 @@ export interface EpochLog {
   map50_95_m: number | null
   top1_acc: number | null   // cls 任务 top1 准确率
   top5_acc: number | null   // cls 任务 top5 准确率
+  val_dice: number | null   // semseg 任务验证 Dice
+  val_iou: number | null    // semseg 任务验证 IoU
+  val_recall: number | null // semseg 任务验证像素召回
+  val_miou: number | null   // semseg 多分类 mIoU（逐类平均，不含背景）
+  val_mdice: number | null  // semseg 多分类 mDice（逐类平均，不含背景）
   lr: number | null
 }
 

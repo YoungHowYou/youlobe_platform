@@ -107,6 +107,48 @@
             </div>
           </div>
         </div>
+        <!-- 固定形状（矩形/圆）参数化：直接输入边长 / 直径，中心固定 -->
+        <div v-if="selFixedShape" class="panel-section">
+          <div class="panel-title">形状参数（原图像素）</div>
+          <div class="geom-body">
+            <template v-if="selFixedShape.shape==='rect'">
+              <div class="geom-row">
+                <span class="geom-label">宽</span>
+                <el-input-number
+                  :model-value="selFixedShape.w"
+                  :min="1" :max="selFixedShape.maxW" :step="1" :controls="false"
+                  size="small" style="width:88px"
+                  @change="(v:number|null)=>applyRectSize(v,null)"
+                />
+                <span class="geom-unit">px</span>
+              </div>
+              <div class="geom-row">
+                <span class="geom-label">高</span>
+                <el-input-number
+                  :model-value="selFixedShape.h"
+                  :min="1" :max="selFixedShape.maxH" :step="1" :controls="false"
+                  size="small" style="width:88px"
+                  @change="(v:number|null)=>applyRectSize(null,v)"
+                />
+                <span class="geom-unit">px</span>
+              </div>
+              <div class="geom-tip">中心固定，输入两边长精确改尺寸（可撤销）</div>
+            </template>
+            <template v-else>
+              <div class="geom-row">
+                <span class="geom-label">直径</span>
+                <el-input-number
+                  :model-value="selFixedShape.d"
+                  :min="2" :max="selFixedShape.maxD" :step="1" :controls="false"
+                  size="small" style="width:88px"
+                  @change="(v:number|null)=>applyCircleDiameter(v)"
+                />
+                <span class="geom-unit">px</span>
+              </div>
+              <div class="geom-tip">圆心固定，输入直径精确改大小（可撤销）</div>
+            </template>
+          </div>
+        </div>
         <div class="panel-section" style="flex:1;overflow-y:auto">
           <div class="panel-title">标注列表 ({{ annotations.length }})</div>
           <div v-if="annotations.length===0" class="empty-hint">暂无标注</div>
@@ -123,7 +165,7 @@
             >
               <el-option v-for="dc in defectClasses" :key="dc.id" :label="dc.name" :value="dc.id!" />
             </el-select>
-            <span class="ann-points">{{ ann.polygon.length }}点</span>
+            <span class="ann-points">{{ annShapeLabel(ann) }}</span>
             <el-button type="danger" text size="small" @click.stop="delAnn(idx)"><el-icon><Delete /></el-icon></el-button>
           </div>
         </div>
@@ -656,7 +698,9 @@ function initCanvas(){
     let z=canvas!.getZoom()*(opt.e.deltaY>0?0.92:1.08)
     z=Math.max(0.05,Math.min(30,z))
     canvas!.zoomToPoint({x:opt.e.offsetX,y:opt.e.offsetY} as fabric.Point,z)
-    zoomLevel.value=z;opt.e.preventDefault();opt.e.stopPropagation()
+    zoomLevel.value=z
+    refreshHandles()   // 手柄按屏幕像素恒定，缩放后必须按新比例重建
+    opt.e.preventDefault();opt.e.stopPropagation()
   })
 
   canvas.on('mouse:down',(opt)=>{
@@ -1100,7 +1144,35 @@ function addAnn(polygon:Point[],shape:AnnShape='polygon'){
 // 编辑时按形状给手柄（矩形拖 4 角、圆拖圆心/半径），改完重新生成 polygon。
 // 这样不会把圆/矩形退化成“一堆可随意拖的顶点”。
 const CIRCLE_SAMPLE=48
-const MANUAL_HANDLE_R=4
+// 手柄尺寸一律按「屏幕像素」定义，绘制前除以当前缩放换算成场景单位。
+// 否则手柄会跟着图像一起放大/缩小（放大 5 倍时半径 4px 的点会变成 20px 的大圆），
+// 这里让所有操控点恒定跟随窗口尺寸，不跟随图像尺寸。
+const MANUAL_HANDLE_R=4      // 矩形角点 / 圆心 / 半径手柄半径
+const VERTEX_HANDLE_R=3      // 多边形顶点白点半径
+const ROT_HANDLE_R=7         // 旋转手柄（绿点）半径
+const ROT_HANDLE_GAP=26      // 旋转手柄相对区域最高点的距离
+
+/** 屏幕像素 → 场景单位（按当前缩放换算，保证手柄屏幕尺寸恒定） */
+function pxToScene(n:number):number{
+  const z=canvas?.getZoom()||1
+  return n/(z>0?z:1)
+}
+
+/** 缩放变化后重建当前选中区域的编辑手柄（手柄尺寸依赖缩放） */
+let handleRefreshRaf=0
+function refreshHandles(){
+  if(!canvas||!currentImage.value)return
+  if(currentTool.value!=='select'||selectedAnnIdx.value<0)return
+  if(isSegTask.value&&!showAnnotationLayer.value)return
+  // 滚轮缩放会连续触发，合并到下一帧重建，避免每格都重建全部顶点手柄
+  if(handleRefreshRaf)return
+  handleRefreshRaf=requestAnimationFrame(()=>{
+    handleRefreshRaf=0
+    if(!canvas||!currentImage.value)return
+    if(currentTool.value!=='select'||selectedAnnIdx.value<0)return
+    showVertexHandles(selectedAnnIdx.value)
+  })
+}
 
 /** 圆（显示坐标：中心归一化 + 像素半径）→ 归一化轮廓点 */
 function circlePolyFrom(cx:number,cy:number,rPx:number,W:number,H:number):Point[]{
@@ -1135,6 +1207,103 @@ function shapeParamsFromPolygon(shape:AnnShape|undefined,polygon:Point[],W:numbe
 /** 当前显示坐标系下的形状参数 */
 function dispShapeParams(ann:AnnotationData):ShapeParams|undefined{
   return shapeParamsFromPolygon(ann.shape,ann.polygon,dispW(),dispH())
+}
+
+// ====== 固定形状参数化：矩形两边长 / 圆直径（统一原图像素口径）======
+/** 标注（显示坐标系归一化）→ 原图像素 bbox */
+function annOrigBBox(ann:AnnotationData){
+  const img=currentImage.value
+  if(!img||!ann.polygon?.length)return null
+  const pts=ann.polygon.map(p=>dispToOrig(p))
+  const xs=pts.map(p=>p.x*img.width),ys=pts.map(p=>p.y*img.height)
+  return {x1:Math.min(...xs),y1:Math.min(...ys),x2:Math.max(...xs),y2:Math.max(...ys)}
+}
+
+/**
+ * 选中标注的精确尺寸（原图像素），非矩形/圆返回 null（此时不显示参数面板）。
+ * 视图旋转 90/270 时显示坐标的宽高与原图互换，这里统一换算回原图口径，
+ * 否则旋转后「宽/高」会反着显示。
+ */
+const selFixedShape=computed(()=>{
+  const idx=selectedAnnIdx.value
+  const ann=idx>=0?annotations.value[idx]:null
+  const img=currentImage.value
+  if(!ann||!img)return null
+  if(ann.shape!=='rect'&&ann.shape!=='circle')return null
+  const box=annOrigBBox(ann)
+  if(!box)return null
+  const w=box.x2-box.x1,h=box.y2-box.y1
+  return {
+    shape:ann.shape,
+    w:Math.round(w),h:Math.round(h),d:Math.round((w+h)/2),
+    maxW:img.width,maxH:img.height,maxD:Math.min(img.width,img.height),
+    ...box,
+  }
+})
+
+/** 标注列表里的形状摘要（矩形两边长 / 圆直径，原图像素） */
+function annShapeLabel(ann:AnnotationData):string{
+  if(ann.shape!=='rect'&&ann.shape!=='circle')return `${ann.polygon.length}点`
+  const box=annOrigBBox(ann)
+  if(!box)return ann.shape==='rect'?'矩形':'圆'
+  const w=Math.round(box.x2-box.x1),h=Math.round(box.y2-box.y1)
+  return ann.shape==='rect'?`矩形 ${w}×${h}px`:`圆 ⌀${Math.round((w+h)/2)}px`
+}
+
+/** 原图像素轴对齐矩形 → 显示坐标系四角（视图旋转为 90° 整数倍，旋转后仍轴对齐） */
+function origRectToDispPoly(x1:number,y1:number,x2:number,y2:number,imgW:number,imgH:number):Point[]{
+  const W=dispW(),H=dispH()
+  const pts=[
+    {x:x1/imgW,y:y1/imgH},{x:x2/imgW,y:y1/imgH},
+    {x:x2/imgW,y:y2/imgH},{x:x1/imgW,y:y2/imgH},
+  ].map(origToDisp)
+  const xs=pts.map(p=>p.x*W),ys=pts.map(p=>p.y*H)
+  // 旋转只换轴不缩放：四个角的 bbox 就是新的轴对齐矩形
+  return rectPolyFrom(Math.min(...xs),Math.min(...ys),Math.max(...xs),Math.max(...ys),W,H)
+}
+
+/** 参数化改尺寸后的统一收尾：同步画布 + 重建手柄 + 自动保存 */
+function afterFixedShapeChange(idx:number,hint:string){
+  dirty.value=true
+  syncAnnShape(idx)
+  renderAnnotations()
+  if(currentTool.value==='select')showShapeHandles(idx)
+  highlightSelected()
+  liveHint(hint)
+  scheduleAutoSave()
+}
+
+/** 改矩形边长（原图像素，未改的另一边传 null）。中心固定，越界自动内推不跑出画面。 */
+function applyRectSize(wIn:number|null,hIn:number|null){
+  const idx=selectedAnnIdx.value,cur=selFixedShape.value
+  const ann=idx>=0?annotations.value[idx]:null,img=currentImage.value
+  if(!ann||!img||!cur||ann.shape!=='rect')return
+  const W=Math.max(1,Math.min(img.width,Math.round(Number(wIn??cur.w)||cur.w)))
+  const H=Math.max(1,Math.min(img.height,Math.round(Number(hIn??cur.h)||cur.h)))
+  const cx=(cur.x1+cur.x2)/2,cy=(cur.y1+cur.y2)/2
+  const x1=Math.round(Math.max(0,Math.min(img.width-W,cx-W/2)))
+  const y1=Math.round(Math.max(0,Math.min(img.height-H,cy-H/2)))
+  pushUndo()
+  ann.polygon=origRectToDispPoly(x1,y1,x1+W,y1+H,img.width,img.height)
+  afterFixedShapeChange(idx,`矩形 ${W}×${H} px`)
+}
+
+/** 改圆直径（原图像素）。圆心固定，超出图像边界时按边界收窄。 */
+function applyCircleDiameter(dIn:number|null){
+  const idx=selectedAnnIdx.value,cur=selFixedShape.value
+  const ann=idx>=0?annotations.value[idx]:null,img=currentImage.value
+  if(!ann||!img||!cur||ann.shape!=='circle')return
+  const W=dispW(),H=dispH()
+  const c=origToDisp({x:(cur.x1+cur.x2)/2/img.width,y:(cur.y1+cur.y2)/2/img.height})
+  const cx=c.x*W,cy=c.y*H
+  const want=Math.round(Number(dIn??cur.d)||cur.d)
+  // 视图旋转只换轴不缩放，半径在原图/显示坐标下像素值相同；
+  // 上限取「圆心到显示区域四边的最小距离」，保证圆不会被裁到图外
+  const rMax=Math.min(cx,W-cx,cy,H-cy)
+  const r=Math.max(1,Math.min(want/2,rMax))
+  pushUndo()
+  ann.polygon=circlePolyFrom(cx,cy,r,W,H)
+  afterFixedShapeChange(idx,`圆 ⌀${Math.round(r*2)} px`)
 }
 
 /** 三点外接圆（像素坐标）；返回 null 表示三点近似共线 */
@@ -1201,11 +1370,12 @@ function showShapeHandles(idx:number){
   const W=dispW(),H=dispH()
   const params=dispShapeParams(ann)
   if(!params)return
-  const R=MANUAL_HANDLE_R
+  // 半径与描边都按屏幕像素换算成场景单位（放大图像时手柄不变大）
+  const R=pxToScene(MANUAL_HANDLE_R)
   const mkHandle=(x:number,y:number,color:string,cursor:string)=>{
     const h=new fabric.Circle({
       left:x-R,top:y-R,radius:R,
-      fill:color,stroke:'#409EFF',strokeWidth:1.5,
+      fill:color,stroke:'#409EFF',strokeWidth:pxToScene(1.5),
       hasControls:false,hasBorders:false,
       selectable:true,evented:true,hoverCursor:cursor,
       originX:'left',originY:'top',
@@ -1325,11 +1495,12 @@ function showVertexHandles(idx:number){
   const rotCx=xsAll.reduce((a,b)=>a+b,0)/xsAll.length
   const rotCy=ysAll.reduce((a,b)=>a+b,0)/ysAll.length
   const rotMinY=Math.min(...ysAll)
-  const rotHandleY=Math.max(10,rotMinY-26)   // 上方 26 px，至少留 10px
-  const rotR=7
+  // 旋转手柄/连线同样按屏幕像素恒定尺寸（缩放后不会变成一个大绿圆）
+  const rotR=pxToScene(ROT_HANDLE_R)
+  const rotHandleY=Math.max(pxToScene(10),rotMinY-pxToScene(ROT_HANDLE_GAP))   // 上方 26 屏幕像素，至少留 10px
   // 中心 → 手柄的虚线连接
   const stem=new fabric.Line([rotCx,rotCy,rotCx,rotHandleY],{
-    stroke:'#52C41A',strokeWidth:1,strokeDashArray:[3,3],
+    stroke:'#52C41A',strokeWidth:pxToScene(1),strokeDashArray:[pxToScene(3),pxToScene(3)],
     selectable:false,evented:false,
   })
   ;(stem as any)._handle=true
@@ -1338,7 +1509,7 @@ function showVertexHandles(idx:number){
 
   const rotHandle=new fabric.Circle({
     left:rotCx-rotR,top:rotHandleY-rotR,radius:rotR,
-    fill:'#52C41A',stroke:'#fff',strokeWidth:1.5,
+    fill:'#52C41A',stroke:'#fff',strokeWidth:pxToScene(1.5),
     hasControls:false,hasBorders:false,
     selectable:true,evented:true,
     hoverCursor:'crosshair',
@@ -1410,10 +1581,11 @@ function showVertexHandles(idx:number){
   editHandles.push(rotHandle)
 
   // ---- 4 个角顶点 ----
+  const vr=pxToScene(VERTEX_HANDLE_R)
   ann.polygon.forEach((p,i)=>{
     const handle=new fabric.Circle({
-      left:p.x*W-3,top:p.y*H-3,radius:3,
-      fill:'#fff',stroke:'#409EFF',strokeWidth:1,
+      left:p.x*W-vr,top:p.y*H-vr,radius:vr,
+      fill:'#fff',stroke:'#409EFF',strokeWidth:pxToScene(1),
       hasControls:false,hasBorders:false,
       selectable:true,evented:true,
       hoverCursor:'move',
@@ -1430,7 +1602,7 @@ function showVertexHandles(idx:number){
       // 第一次移动才入栈，避免单击也 push undo
       if(firstMove){pushUndo();firstMove=false}
       const W2=dispW(),H2=dispH()
-      const cx=(handle.left||0)+3,cy=(handle.top||0)+3
+      const cx=(handle.left||0)+vr,cy=(handle.top||0)+vr
       // clamp 到画布范围（防止越界后端 422）
       const nx=Math.max(0,Math.min(1,cx/W2))
       const ny=Math.max(0,Math.min(1,cy/H2))
@@ -1733,6 +1905,7 @@ function zoomFit(){
   // 「适应窗口」之后所有标注区域都点不中、拖不动（平移旋转失效的真因）。
   canvas.setViewportTransform([z,0,0,z,(cw-iw*z)/2,(ch-ih*z)/2])
   canvas.requestRenderAll();zoomLevel.value=z
+  refreshHandles()
 }
 function isTypingTarget(e:KeyboardEvent){
   // 只有真正的文本输入才算「正在输入」：工具栏的单选/复选/滑块(radio/checkbox/range)
@@ -1817,7 +1990,12 @@ function imgSC(img:ImageInfo){return{'sc-u':img.status==='unlabeled','sc-l':img.
 .empty-hint{padding:20px;text-align:center;color:#666;font-size:13px}
 .ann-item{display:flex;align-items:center;gap:6px;padding:6px 12px;cursor:pointer;transition:background .15s}
 .ann-item:hover{background:#333}.ann-item.selected{background:#1a3a5c}
-.ann-label{flex:1;font-size:12px}.ann-points{font-size:11px;color:#888}
+.ann-label{flex:1;font-size:12px}.ann-points{font-size:11px;color:#888;white-space:nowrap}
+.geom-body{padding:0 12px 10px;display:flex;flex-direction:column;gap:6px}
+.geom-row{display:flex;align-items:center;gap:6px}
+.geom-label{font-size:12px;color:#bbb;width:30px;flex-shrink:0}
+.geom-unit{font-size:11px;color:#777}
+.geom-tip{font-size:11px;color:#666;line-height:1.4}
 .ann-class-select{flex:1;min-width:0}
 .ann-class-select :deep(.el-select__wrapper){min-height:24px;padding:0 8px}
 .ann-class-select :deep(.el-select__selected-item){font-size:12px}

@@ -100,6 +100,14 @@ class TrainEpochLog(Base):
     top1_acc: Mapped[float | None] = mapped_column(Float, nullable=True, comment="cls: top1 accuracy")
     top5_acc: Mapped[float | None] = mapped_column(Float, nullable=True, comment="cls: top5 accuracy")
 
+    # 语义分割任务专用指标（semseg；像素级，patch 级验证）
+    val_dice: Mapped[float | None] = mapped_column(Float, nullable=True, comment="semseg: 验证 Dice")
+    val_iou: Mapped[float | None] = mapped_column(Float, nullable=True, comment="semseg: 验证 IoU")
+    val_recall: Mapped[float | None] = mapped_column(Float, nullable=True, comment="semseg: 验证像素召回")
+    # 多分类专用：逐类 IoU/Dice 取平均（类别图口径，0=背景不计入）
+    val_miou: Mapped[float | None] = mapped_column(Float, nullable=True, comment="semseg 多分类: mIoU")
+    val_mdice: Mapped[float | None] = mapped_column(Float, nullable=True, comment="semseg 多分类: mDice")
+
     lr: Mapped[float | None] = mapped_column(Float, nullable=True)
 
     # 关系

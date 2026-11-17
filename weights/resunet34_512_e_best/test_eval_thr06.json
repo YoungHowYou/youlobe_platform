@@ -1,0 +1,953 @@
+{
+  "summary": {
+    "dice": 0.7293254885316599,
+    "iou": 0.5880967506002462,
+    "recall": 0.8351458407709225,
+    "instance_recall": 0.8921568627450981,
+    "skeleton_recall": 0.154691752641537,
+    "fragmentation": 2.226950354609929,
+    "boundary_error": 6.577604409862072
+  },
+  "per_image": [
+    {
+      "dice": 0.4963554321416175,
+      "iou": 0.3301015697137581,
+      "recall": 1.0,
+      "instance_recall": NaN,
+      "fragmentation": 3.0,
+      "skeleton_recall": 0.0,
+      "boundary_error": 9.96723461151123,
+      "id": "01394f175854401e86e66dbb75c76487"
+    },
+    {
+      "dice": 0.70511187920684,
+      "iou": 0.5445349817364428,
+      "recall": 0.8738914775289344,
+      "instance_recall": 1.0,
+      "fragmentation": 1.0,
+      "skeleton_recall": 0.1018041237113402,
+      "boundary_error": 3.052971839904785,
+      "id": "0358ba237a9b4f4081862f4f2f49de68"
+    },
+    {
+      "dice": 0.6454504706409682,
+      "iou": 0.47650562541363334,
+      "recall": 0.8791208791208791,
+      "instance_recall": NaN,
+      "fragmentation": 2.0,
+      "skeleton_recall": 0.11462450592885376,
+      "boundary_error": 2.6621546745300293,
+      "id": "0463ad76f15342a5b80f7fc8e6ca5e56"
+    },
+    {
+      "dice": 0.6523168908819134,
+      "iou": 0.48402839396628217,
+      "recall": 0.9261460101867572,
+      "instance_recall": NaN,
+      "fragmentation": 2.0,
+      "skeleton_recall": 0.06914893617021277,
+      "boundary_error": 2.2713470458984375,
+      "id": "05351006b64d47b48168e13b18943d9a"
+    },
+    {
+      "dice": 0.6433041301627034,
+      "iou": 0.474169741697417,
+      "recall": 0.8202127659574469,
+      "instance_recall": NaN,
+      "fragmentation": 2.0,
+      "skeleton_recall": 0.23648648648648649,
+      "boundary_error": 2.423680305480957,
+      "id": "056e2dbcfaef4c69a87ad5012ff881ce"
+    },
+    {
+      "dice": 0.6789286866731203,
+      "iou": 0.5139228138739619,
+      "recall": 0.7891972993248312,
+      "instance_recall": NaN,
+      "fragmentation": 4.0,
+      "skeleton_recall": 0.2681818181818182,
+      "boundary_error": 4.156817436218262,
+      "id": "06270a68055446f19abc383ed26d39ad"
+    },
+    {
+      "dice": 0.8331003634330445,
+      "iou": 0.7139434595112601,
+      "recall": 0.7637109174782163,
+      "instance_recall": NaN,
+      "fragmentation": 4.0,
+      "skeleton_recall": 0.13076923076923078,
+      "boundary_error": 8.391491889953613,
+      "id": "0b4e65a6573e4c9382cb615e81f42042"
+    },
+    {
+      "dice": 0.6908077994428969,
+      "iou": 0.5276595744680851,
+      "recall": 0.5927342256214149,
+      "instance_recall": NaN,
+      "fragmentation": 1.0,
+      "skeleton_recall": 0.3867924528301887,
+      "boundary_error": 5.334660530090332,
+      "id": "0c1b9ef359534960a5dce42717a4ce1b"
+    },
+    {
+      "dice": 0.6921599732821241,
+      "iou": 0.5292390194075587,
+      "recall": 0.9637293652638921,
+      "instance_recall": 1.0,
+      "fragmentation": 1.5,
+      "skeleton_recall": 0.056782334384858045,
+      "boundary_error": 2.817206382751465,
+      "id": "0c52731dcda14e0dbfce63185c803a48"
+    },
+    {
+      "dice": 0.6713286713286714,
+      "iou": 0.5052631578947369,
+      "recall": 1.0,
+      "instance_recall": 1.0,
+      "fragmentation": 2.0,
+      "skeleton_recall": 0.05,
+      "boundary_error": 9.202215194702148,
+      "id": "0d6d4d1ddb4e4dd0a0b554b9ff64a71b"
+    },
+    {
+      "dice": 0.8968253968253969,
+      "iou": 0.8129496402877698,
+      "recall": 0.9658119658119658,
+      "instance_recall": 1.0,
+      "fragmentation": 1.0,
+      "skeleton_recall": 0.0,
+      "boundary_error": 0.5158846974372864,
+      "id": "12b2e14acddd46cd9fa8362ca6123862"
+    },
+    {
+      "dice": 0.7489350372736954,
+      "iou": 0.598638008086827,
+      "recall": 0.9277704485488126,
+      "instance_recall": 1.0,
+      "fragmentation": 2.0,
+      "skeleton_recall": 0.048,
+      "boundary_error": 3.3911561965942383,
+      "id": "16a1401690f944c9b2e84f6cab74f8b5"
+    },
+    {
+      "dice": 0.7758995411736296,
+      "iou": 0.633852830933123,
+      "recall": 0.9625524266027562,
+      "instance_recall": 1.0,
+      "fragmentation": 0.6666666666666666,
+      "skeleton_recall": 0.036211699164345405,
+      "boundary_error": 2.0199785232543945,
+      "id": "197beaf65048428789da6fd0628f71a9"
+    },
+    {
+      "dice": 0.7777777777777778,
+      "iou": 0.6363636363636364,
+      "recall": 0.7762096774193549,
+      "instance_recall": NaN,
+      "fragmentation": 3.0,
+      "skeleton_recall": 0.3225806451612903,
+      "boundary_error": 14.356294631958008,
+      "id": "1ccea0437f4940368688109facf9681e"
+    },
+    {
+      "dice": 0.7764329298789637,
+      "iou": 0.6345650752125572,
+      "recall": 0.753445932828577,
+      "instance_recall": 1.0,
+      "fragmentation": 1.5,
+      "skeleton_recall": 0.2041343669250646,
+      "boundary_error": 2.8431320190429688,
+      "id": "1d540884cfbd4ce8ba0885dc6a4371a5"
+    },
+    {
+      "dice": 0.6980561555075594,
+      "iou": 0.5361645653616457,
+      "recall": 0.7069116360454943,
+      "instance_recall": NaN,
+      "fragmentation": 2.0,
+      "skeleton_recall": 0.2513812154696133,
+      "boundary_error": 3.245429039001465,
+      "id": "2045294c170d49339021f1b67e978441"
+    },
+    {
+      "dice": 0.6950246866691986,
+      "iou": 0.5325960419091967,
+      "recall": 0.9786096256684492,
+      "instance_recall": NaN,
+      "fragmentation": 1.0,
+      "skeleton_recall": 0.057692307692307696,
+      "boundary_error": 1.7637152671813965,
+      "id": "237111933e684c60a9f35672046446d6"
+    },
+    {
+      "dice": 0.7941897412619155,
+      "iou": 0.6586357476283692,
+      "recall": 0.9594209256415881,
+      "instance_recall": NaN,
+      "fragmentation": 2.0,
+      "skeleton_recall": 0.06212424849699399,
+      "boundary_error": 1.7158267498016357,
+      "id": "25f9ed7f29274f078c53c1862122673a"
+    },
+    {
+      "dice": 0.9063583815028902,
+      "iou": 0.828752642706131,
+      "recall": 1.0,
+      "instance_recall": 1.0,
+      "fragmentation": 2.0,
+      "skeleton_recall": 0.0,
+      "boundary_error": 4.125809192657471,
+      "id": "29252457431042698260fc63b37d6e69"
+    },
+    {
+      "dice": 0.7149321266968326,
+      "iou": 0.5563380281690141,
+      "recall": 0.9753086419753086,
+      "instance_recall": 1.0,
+      "fragmentation": 3.0,
+      "skeleton_recall": 0.0,
+      "boundary_error": 39.51416015625,
+      "id": "294fb3ed019542cfae8503f20c14b2c1"
+    },
+    {
+      "dice": 0.7733539891556933,
+      "iou": 0.6304622379388735,
+      "recall": 0.8510057961131947,
+      "instance_recall": 1.0,
+      "fragmentation": 1.0,
+      "skeleton_recall": 0.09228187919463088,
+      "boundary_error": 1.9621597528457642,
+      "id": "2a34731336a34c6bbfd6497187be160a"
+    },
+    {
+      "dice": 0.6380368098159509,
+      "iou": 0.46846846846846846,
+      "recall": 0.8125,
+      "instance_recall": 1.0,
+      "fragmentation": 3.0,
+      "skeleton_recall": 0.3333333333333333,
+      "boundary_error": 45.30348587036133,
+      "id": "2c8df2799f3b4dca85767070e329fcef"
+    },
+    {
+      "dice": 0.7121212121212122,
+      "iou": 0.5529411764705883,
+      "recall": 0.590782122905028,
+      "instance_recall": 0.0,
+      "fragmentation": 4.0,
+      "skeleton_recall": 0.3263157894736842,
+      "boundary_error": 2.6384100914001465,
+      "id": "2ecc81c8f1e6407ab336db6932b4d74f"
+    },
+    {
+      "dice": 0.6629213483146067,
+      "iou": 0.4957983193277311,
+      "recall": 0.5607180570221753,
+      "instance_recall": 1.0,
+      "fragmentation": 1.0,
+      "skeleton_recall": 0.43636363636363634,
+      "boundary_error": 5.04268741607666,
+      "id": "3044ac2fdafa473cb59f491cefadf9c1"
+    },
+    {
+      "dice": 0.7384205264911696,
+      "iou": 0.5853143159006867,
+      "recall": 0.9643167972149695,
+      "instance_recall": NaN,
+      "fragmentation": 1.0,
+      "skeleton_recall": 0.05434782608695652,
+      "boundary_error": 1.4691095352172852,
+      "id": "3353a09ca5c4479892d3e6e5f3408aa9"
+    },
+    {
+      "dice": 0.1875,
+      "iou": 0.10344827586206896,
+      "recall": 0.10344827586206896,
+      "instance_recall": 0.0,
+      "fragmentation": 1.0,
+      "skeleton_recall": 1.0,
+      "boundary_error": 2.1438586711883545,
+      "id": "33fac552d8584105951529ce0094a0ce"
+    },
+    {
+      "dice": 0.8131067961165048,
+      "iou": 0.6850715746421268,
+      "recall": 0.8072289156626506,
+      "instance_recall": NaN,
+      "fragmentation": 1.0,
+      "skeleton_recall": 0.06060606060606061,
+      "boundary_error": 1.1623098850250244,
+      "id": "36bb1792df3c43479048e1b36370ca00"
+    },
+    {
+      "dice": 0.8518518518518519,
+      "iou": 0.7419354838709677,
+      "recall": 0.9011194029850746,
+      "instance_recall": 1.0,
+      "fragmentation": 4.0,
+      "skeleton_recall": 0.0,
+      "boundary_error": 1.0418933629989624,
+      "id": "37c08eadbfcd4f5db1ccfabe91029e89"
+    },
+    {
+      "dice": 0.5372390152695544,
+      "iou": 0.36727737537281635,
+      "recall": 0.9994202898550725,
+      "instance_recall": 1.0,
+      "fragmentation": 1.5,
+      "skeleton_recall": 0.010638297872340425,
+      "boundary_error": 3.776726484298706,
+      "id": "385fb1c1db9347c5be92359d84c87fd2"
+    },
+    {
+      "dice": 0.7105263157894737,
+      "iou": 0.5510204081632653,
+      "recall": 0.9473684210526315,
+      "instance_recall": 1.0,
+      "fragmentation": 5.0,
+      "skeleton_recall": 0.09090909090909091,
+      "boundary_error": 20.719520568847656,
+      "id": "3c33339266514e05a8afc388c3443d95"
+    },
+    {
+      "dice": 0.8457142857142858,
+      "iou": 0.7326732673267327,
+      "recall": 0.891566265060241,
+      "instance_recall": 1.0,
+      "fragmentation": 1.0,
+      "skeleton_recall": 0.14285714285714285,
+      "boundary_error": 0.666458785533905,
+      "id": "3c741c6bc8d543b08b11eb0821712aed"
+    },
+    {
+      "dice": 0.7875943000838223,
+      "iou": 0.6496128318584071,
+      "recall": 0.9702602230483272,
+      "instance_recall": 1.0,
+      "fragmentation": 2.0,
+      "skeleton_recall": 0.014545454545454545,
+      "boundary_error": 2.7889304161071777,
+      "id": "3ea75a5a53714b859137a3a744ca2e7a"
+    },
+    {
+      "dice": 0.7655174978615791,
+      "iou": 0.6201120684461047,
+      "recall": 0.7213344547238576,
+      "instance_recall": 1.0,
+      "fragmentation": 1.0,
+      "skeleton_recall": 0.1347331583552056,
+      "boundary_error": 3.682826519012451,
+      "id": "45af592d291941fc8be3e768aa271fce"
+    },
+    {
+      "dice": 0.5504587155963303,
+      "iou": 0.379746835443038,
+      "recall": 0.6896551724137931,
+      "instance_recall": 1.0,
+      "fragmentation": 3.0,
+      "skeleton_recall": 0.0,
+      "boundary_error": 50.43238067626953,
+      "id": "46d6e24f4c964bd7952ee0cfad72f4b2"
+    },
+    {
+      "dice": 0.717948717948718,
+      "iou": 0.56,
+      "recall": 1.0,
+      "instance_recall": 1.0,
+      "fragmentation": 1.0,
+      "skeleton_recall": 0.0,
+      "boundary_error": 0.9910079836845398,
+      "id": "484f18977dd449f9a820d1b2b8a1eaaf"
+    },
+    {
+      "dice": 0.7822894485645054,
+      "iou": 0.6424264351181862,
+      "recall": 0.9360393603936039,
+      "instance_recall": NaN,
+      "fragmentation": 1.0,
+      "skeleton_recall": 0.04838709677419355,
+      "boundary_error": 1.917226791381836,
+      "id": "4d9091be838046d1a4d57eff095b393d"
+    },
+    {
+      "dice": 0.6207203201422855,
+      "iou": 0.45003223726627983,
+      "recall": 0.6931479642502483,
+      "instance_recall": NaN,
+      "fragmentation": 3.0,
+      "skeleton_recall": 0.277602523659306,
+      "boundary_error": 6.700410842895508,
+      "id": "5572208bfe5046b490f4c9fe13b8f6e0"
+    },
+    {
+      "dice": 0.8560436832961033,
+      "iou": 0.7483185072683879,
+      "recall": 0.8603142928411075,
+      "instance_recall": 1.0,
+      "fragmentation": 1.0,
+      "skeleton_recall": 0.03184713375796178,
+      "boundary_error": 1.9798099994659424,
+      "id": "585654db778a4ea98a49a4e93662c78c"
+    },
+    {
+      "dice": 0.8918032786885246,
+      "iou": 0.8047337278106509,
+      "recall": 0.8421052631578947,
+      "instance_recall": 1.0,
+      "fragmentation": 2.0,
+      "skeleton_recall": 0.0,
+      "boundary_error": 7.083626747131348,
+      "id": "5df5a9a440054d63a56cb6b2507e263f"
+    },
+    {
+      "dice": 0.8136363636363636,
+      "iou": 0.685823754789272,
+      "recall": 0.8647342995169082,
+      "instance_recall": 1.0,
+      "fragmentation": 1.0,
+      "skeleton_recall": 0.0,
+      "boundary_error": 1.3207859992980957,
+      "id": "611f5ec16cb44f359bc42e865685048e"
+    },
+    {
+      "dice": 0.8152766952455183,
+      "iou": 0.6881578947368421,
+      "recall": 0.8698946590279061,
+      "instance_recall": NaN,
+      "fragmentation": 3.0,
+      "skeleton_recall": 0.13002364066193853,
+      "boundary_error": 1.8773305416107178,
+      "id": "62de9eaeac16441cb129b7d4e1f878c6"
+    },
+    {
+      "dice": 0.6840731070496083,
+      "iou": 0.5198412698412699,
+      "recall": 1.0,
+      "instance_recall": NaN,
+      "fragmentation": 1.0,
+      "skeleton_recall": 0.0,
+      "boundary_error": 1.5382592678070068,
+      "id": "63496908835346afaadf0df59dc9dd72"
+    },
+    {
+      "dice": 0.7738666184055741,
+      "iou": 0.6311439114391144,
+      "recall": 0.9338283468006114,
+      "instance_recall": 1.0,
+      "fragmentation": 0.5,
+      "skeleton_recall": 0.06320907617504051,
+      "boundary_error": 1.9554253816604614,
+      "id": "65f8304125654965b957a879662c5aa1"
+    },
+    {
+      "dice": 0.8276051690954083,
+      "iou": 0.7059099437148217,
+      "recall": 0.8061060524906267,
+      "instance_recall": NaN,
+      "fragmentation": 3.0,
+      "skeleton_recall": 0.8888888888888888,
+      "boundary_error": 11.672578811645508,
+      "id": "6c0617312a9344ba94765c196ce48770"
+    },
+    {
+      "dice": 0.7830939095334204,
+      "iou": 0.6435121951219512,
+      "recall": 0.8935247900298022,
+      "instance_recall": NaN,
+      "fragmentation": 5.0,
+      "skeleton_recall": 0.08040201005025126,
+      "boundary_error": 2.160989284515381,
+      "id": "77d3029657a94c14a0a3304b16c542ef"
+    },
+    {
+      "dice": 0.7031400829027312,
+      "iou": 0.5421866106221813,
+      "recall": 0.6696771402303824,
+      "instance_recall": NaN,
+      "fragmentation": 5.0,
+      "skeleton_recall": 0.21511627906976744,
+      "boundary_error": 2.8334131240844727,
+      "id": "7a155d02a1454136a44462c9fe33e6b7"
+    },
+    {
+      "dice": 0.6862745098039216,
+      "iou": 0.5223880597014925,
+      "recall": 0.860655737704918,
+      "instance_recall": NaN,
+      "fragmentation": 1.0,
+      "skeleton_recall": 0.2015810276679842,
+      "boundary_error": 2.5350894927978516,
+      "id": "7ae82cfcd13d42919aae488bc31e7c48"
+    },
+    {
+      "dice": 0.8421887390959556,
+      "iou": 0.7273972602739726,
+      "recall": 0.8388625592417062,
+      "instance_recall": NaN,
+      "fragmentation": 2.0,
+      "skeleton_recall": 0.10416666666666667,
+      "boundary_error": 8.706978797912598,
+      "id": "7baf7840501448d5a3f84c751a1c8505"
+    },
+    {
+      "dice": 0.8962199312714777,
+      "iou": 0.8119551681195517,
+      "recall": 0.9206872205224759,
+      "instance_recall": NaN,
+      "fragmentation": 2.0,
+      "skeleton_recall": 0.02881844380403458,
+      "boundary_error": 0.8250595331192017,
+      "id": "7fd4405d117c498fb4d9078da5ec29b7"
+    },
+    {
+      "dice": 0.7841486936699983,
+      "iou": 0.6449379867320449,
+      "recall": 0.9667099005620406,
+      "instance_recall": 1.0,
+      "fragmentation": 0.5,
+      "skeleton_recall": 0.022653721682847898,
+      "boundary_error": 1.7203497886657715,
+      "id": "83f9daec229b499e8c0a2ea9f59e85a1"
+    },
+    {
+      "dice": 0.8260135135135135,
+      "iou": 0.7035971223021583,
+      "recall": 0.9831121833534379,
+      "instance_recall": NaN,
+      "fragmentation": 2.0,
+      "skeleton_recall": 0.02835538752362949,
+      "boundary_error": 1.2833585739135742,
+      "id": "891f8bc9ebe447ecbae34370f1503e56"
+    },
+    {
+      "dice": 0.9058823529411765,
+      "iou": 0.8279569892473119,
+      "recall": 0.9625,
+      "instance_recall": 1.0,
+      "fragmentation": 1.0,
+      "skeleton_recall": 0.0,
+      "boundary_error": 0.4264408349990845,
+      "id": "8adb7e42511b48068b49b3f886e1e578"
+    },
+    {
+      "dice": 0.8232987312572088,
+      "iou": 0.6996667320133307,
+      "recall": 0.7556237760016937,
+      "instance_recall": 1.0,
+      "fragmentation": 0.5,
+      "skeleton_recall": 0.036585365853658534,
+      "boundary_error": 1.882588505744934,
+      "id": "94abc4b8651a41dab9807da49f0e36a3"
+    },
+    {
+      "dice": 0.5140900078110917,
+      "iou": 0.3459765467044076,
+      "recall": 0.864591754244139,
+      "instance_recall": NaN,
+      "fragmentation": 7.0,
+      "skeleton_recall": 0.16685330347144456,
+      "boundary_error": 5.937648773193359,
+      "id": "9d58c75f4143431e97b6253f9361f09a"
+    },
+    {
+      "dice": 0.8571428571428571,
+      "iou": 0.75,
+      "recall": 0.9078947368421053,
+      "instance_recall": 1.0,
+      "fragmentation": 1.0,
+      "skeleton_recall": 0.3333333333333333,
+      "boundary_error": 0.5903892517089844,
+      "id": "9dc3129d5de8427eb1c3f439be7b94e7"
+    },
+    {
+      "dice": 0.5895131086142322,
+      "iou": 0.4179500796601168,
+      "recall": 0.8708160442600277,
+      "instance_recall": 0.5,
+      "fragmentation": 2.5,
+      "skeleton_recall": 0.1413427561837456,
+      "boundary_error": 3.3330602645874023,
+      "id": "9e1467aec4794eba849a27bdec80a116"
+    },
+    {
+      "dice": 0.7975177304964539,
+      "iou": 0.663226186965497,
+      "recall": 0.9881370826010545,
+      "instance_recall": NaN,
+      "fragmentation": 1.0,
+      "skeleton_recall": 0.010752688172043012,
+      "boundary_error": 1.5874812602996826,
+      "id": "a100abdaaeba4543bf42f9d01973ec06"
+    },
+    {
+      "dice": 0.9004457652303121,
+      "iou": 0.8189189189189189,
+      "recall": 0.9558359621451105,
+      "instance_recall": 1.0,
+      "fragmentation": 3.0,
+      "skeleton_recall": 0.0,
+      "boundary_error": 17.80169105529785,
+      "id": "a6687263f8e143659e88d117d076be2d"
+    },
+    {
+      "dice": 0.8030383795309168,
+      "iou": 0.6708973502560677,
+      "recall": 0.9427409261576971,
+      "instance_recall": 1.0,
+      "fragmentation": 1.3333333333333333,
+      "skeleton_recall": 0.018461538461538463,
+      "boundary_error": 3.0507237911224365,
+      "id": "a73907e28117414f981692eef5c4219f"
+    },
+    {
+      "dice": 0.7601476014760148,
+      "iou": 0.6130952380952381,
+      "recall": 0.9712617871576111,
+      "instance_recall": 1.0,
+      "fragmentation": 1.0,
+      "skeleton_recall": 0.0033333333333333335,
+      "boundary_error": 2.431973934173584,
+      "id": "a96e5971537e43b6b84c4a92f8cdce8c"
+    },
+    {
+      "dice": 0.6131805157593123,
+      "iou": 0.44214876033057854,
+      "recall": 1.0,
+      "instance_recall": 1.0,
+      "fragmentation": 2.0,
+      "skeleton_recall": 0.0,
+      "boundary_error": 1.765889286994934,
+      "id": "a97ac02cc874493cb2c4de4636f8047e"
+    },
+    {
+      "dice": 0.8821165741116981,
+      "iou": 0.7890953150242326,
+      "recall": 0.9818090452261307,
+      "instance_recall": NaN,
+      "fragmentation": 1.0,
+      "skeleton_recall": 0.020718232044198894,
+      "boundary_error": 1.198285698890686,
+      "id": "b5715f6bcc1f46a5ba397f0bb7ba09fd"
+    },
+    {
+      "dice": 0.8672566371681416,
+      "iou": 0.765625,
+      "recall": 0.8484848484848485,
+      "instance_recall": NaN,
+      "fragmentation": 2.0,
+      "skeleton_recall": 0.12,
+      "boundary_error": 5.027610778808594,
+      "id": "b8a1834ae39440f9add56a8b50e47750"
+    },
+    {
+      "dice": 0.6923199744531374,
+      "iou": 0.5294261294261294,
+      "recall": 0.6900063653723743,
+      "instance_recall": NaN,
+      "fragmentation": 2.0,
+      "skeleton_recall": 0.33766233766233766,
+      "boundary_error": 10.033708572387695,
+      "id": "bbe3db557afd4658b5d19875f5fbc09a"
+    },
+    {
+      "dice": 0.8610822060353798,
+      "iou": 0.7560529922338968,
+      "recall": 0.8065302144249513,
+      "instance_recall": NaN,
+      "fragmentation": 4.0,
+      "skeleton_recall": 0.1276595744680851,
+      "boundary_error": 4.212006092071533,
+      "id": "be6fcb3406d94bb0a2ebef55cce6a29b"
+    },
+    {
+      "dice": 0.6788452864230943,
+      "iou": 0.5138272447934449,
+      "recall": 0.7122574538570753,
+      "instance_recall": NaN,
+      "fragmentation": 3.0,
+      "skeleton_recall": 0.3024193548387097,
+      "boundary_error": 4.302165508270264,
+      "id": "c0c04947a4ac4500a28689b74c33eac8"
+    },
+    {
+      "dice": 0.8234891871100094,
+      "iou": 0.6999418773612321,
+      "recall": 0.8476156959352454,
+      "instance_recall": 1.0,
+      "fragmentation": 1.0,
+      "skeleton_recall": 0.08587786259541985,
+      "boundary_error": 1.889426827430725,
+      "id": "c5c0929ff1824cb39da18419fd9cedd3"
+    },
+    {
+      "dice": 0.5968740784429372,
+      "iou": 0.4253888188314418,
+      "recall": 0.7844961240310078,
+      "instance_recall": NaN,
+      "fragmentation": 3.0,
+      "skeleton_recall": 0.25925925925925924,
+      "boundary_error": 3.113248586654663,
+      "id": "c6cf35c0c7834f558fc2a5984795333d"
+    },
+    {
+      "dice": 0.6527487821851079,
+      "iou": 0.484504132231405,
+      "recall": 0.576521204671174,
+      "instance_recall": NaN,
+      "fragmentation": 5.0,
+      "skeleton_recall": 0.4101123595505618,
+      "boundary_error": 12.73535442352295,
+      "id": "c8fd1a6a19594c4698d4fceaebdde005"
+    },
+    {
+      "dice": 0.743895918731064,
+      "iou": 0.5922247446083996,
+      "recall": 0.9238601150951748,
+      "instance_recall": 1.0,
+      "fragmentation": 1.5,
+      "skeleton_recall": 0.041666666666666664,
+      "boundary_error": 2.745445728302002,
+      "id": "c97925dbcd854219bf741cd4a51f0783"
+    },
+    {
+      "dice": 0.4683053040103493,
+      "iou": 0.30574324324324326,
+      "recall": 0.3175438596491228,
+      "instance_recall": 0.0,
+      "fragmentation": 4.0,
+      "skeleton_recall": 0.7102803738317757,
+      "boundary_error": 3.4565927982330322,
+      "id": "cd396bca150c4b8899deaef970fc5ff7"
+    },
+    {
+      "dice": 0.8141592920353983,
+      "iou": 0.6865671641791045,
+      "recall": 0.9857142857142858,
+      "instance_recall": 1.0,
+      "fragmentation": 2.0,
+      "skeleton_recall": 0.1,
+      "boundary_error": 0.7627080678939819,
+      "id": "ce66dc40ec7c420a8a1afe4ac3e53a35"
+    },
+    {
+      "dice": 0.8624763705103969,
+      "iou": 0.7582052347320316,
+      "recall": 0.7600999583506872,
+      "instance_recall": 1.0,
+      "fragmentation": 1.0,
+      "skeleton_recall": 0.004866180048661801,
+      "boundary_error": 1.9182870388031006,
+      "id": "cee0a1b8a8924d7a970b61500d10bb5e"
+    },
+    {
+      "dice": 0.6917293233082706,
+      "iou": 0.5287356321839081,
+      "recall": 0.989247311827957,
+      "instance_recall": 1.0,
+      "fragmentation": 3.0,
+      "skeleton_recall": 0.125,
+      "boundary_error": 40.505828857421875,
+      "id": "d1806188e52e41f58e81859ab9079092"
+    },
+    {
+      "dice": 0.8682877406281662,
+      "iou": 0.7672336615935542,
+      "recall": 0.7994402985074627,
+      "instance_recall": 1.0,
+      "fragmentation": 2.0,
+      "skeleton_recall": 0.06329113924050633,
+      "boundary_error": 6.668732643127441,
+      "id": "d226a383e30c455496297fa7b2910b7c"
+    },
+    {
+      "dice": 0.7025703794369645,
+      "iou": 0.5415094339622641,
+      "recall": 0.9911198815984213,
+      "instance_recall": 1.0,
+      "fragmentation": 0.3333333333333333,
+      "skeleton_recall": 0.003115264797507788,
+      "boundary_error": 2.152306079864502,
+      "id": "d2df749e2bea4c2688f02446ff2fedc1"
+    },
+    {
+      "dice": 0.6308457711442786,
+      "iou": 0.46075581395348836,
+      "recall": 0.8820255982192543,
+      "instance_recall": NaN,
+      "fragmentation": 9.0,
+      "skeleton_recall": 0.16722408026755853,
+      "boundary_error": 4.073147296905518,
+      "id": "d36b8d89359a423093431ade2007960b"
+    },
+    {
+      "dice": 0.6715449858639614,
+      "iou": 0.5055082623935904,
+      "recall": 0.7341818181818182,
+      "instance_recall": NaN,
+      "fragmentation": 2.0,
+      "skeleton_recall": 0.24188790560471976,
+      "boundary_error": 4.1928839683532715,
+      "id": "d38f4bf4b3db476caa863fb25a27e54e"
+    },
+    {
+      "dice": 0.7740893594114481,
+      "iou": 0.6314402810304449,
+      "recall": 0.9198294243070363,
+      "instance_recall": 1.0,
+      "fragmentation": 1.0,
+      "skeleton_recall": 0.05314009661835749,
+      "boundary_error": 1.9556632041931152,
+      "id": "d7631f95e3ee4448b8b800464e2f50bb"
+    },
+    {
+      "dice": 0.9018338727076591,
+      "iou": 0.8212180746561886,
+      "recall": 0.9478458049886621,
+      "instance_recall": NaN,
+      "fragmentation": 3.0,
+      "skeleton_recall": 0.013333333333333334,
+      "boundary_error": 7.70985221862793,
+      "id": "d8c2f1f67299429882876e70ae45aa2b"
+    },
+    {
+      "dice": 0.7021485245609344,
+      "iou": 0.5410083802720154,
+      "recall": 0.8219578376121895,
+      "instance_recall": NaN,
+      "fragmentation": 4.0,
+      "skeleton_recall": 0.2297551789077213,
+      "boundary_error": 2.661264181137085,
+      "id": "d9ff7fe87df84d1d840a8d22834e7f34"
+    },
+    {
+      "dice": 0.7996589940323956,
+      "iou": 0.6661931818181818,
+      "recall": 0.9474747474747475,
+      "instance_recall": 1.0,
+      "fragmentation": 1.0,
+      "skeleton_recall": 0.1891891891891892,
+      "boundary_error": 1.1238796710968018,
+      "id": "da3667cdbeff415ba0dec17a63aa718a"
+    },
+    {
+      "dice": 0.70661853188929,
+      "iou": 0.5463342017119464,
+      "recall": 0.5712062256809338,
+      "instance_recall": 0.0,
+      "fragmentation": 4.0,
+      "skeleton_recall": 0.4403292181069959,
+      "boundary_error": 6.273705005645752,
+      "id": "df6fee1f814b46dcb58c021d26317932"
+    },
+    {
+      "dice": 0.8080645161290323,
+      "iou": 0.6779431664411367,
+      "recall": 0.6834924965893588,
+      "instance_recall": 1.0,
+      "fragmentation": 1.0,
+      "skeleton_recall": 0.0,
+      "boundary_error": 2.1159181594848633,
+      "id": "e6d681ed01fe4568ba57b86372fcf0a0"
+    },
+    {
+      "dice": 0.7044361304115446,
+      "iou": 0.5437293729372937,
+      "recall": 0.9634502923976608,
+      "instance_recall": 1.0,
+      "fragmentation": 5.0,
+      "skeleton_recall": 0.014705882352941176,
+      "boundary_error": 11.790056228637695,
+      "id": "e928439788544bd2a096e0225fbd5be3"
+    },
+    {
+      "dice": 0.6925515055467512,
+      "iou": 0.5296969696969697,
+      "recall": 0.9107961650687787,
+      "instance_recall": NaN,
+      "fragmentation": 1.0,
+      "skeleton_recall": 0.07407407407407407,
+      "boundary_error": 2.460773468017578,
+      "id": "ec8ba79231d049dfacf8808782f68e7a"
+    },
+    {
+      "dice": 0.44300647088103534,
+      "iou": 0.28452685421994883,
+      "recall": 0.4587628865979381,
+      "instance_recall": NaN,
+      "fragmentation": 2.0,
+      "skeleton_recall": 0.5416666666666666,
+      "boundary_error": 10.762101173400879,
+      "id": "f1302232598e4ef7bb3997d2bd3a46fe"
+    },
+    {
+      "dice": 0.31095406360424027,
+      "iou": 0.18410041841004185,
+      "recall": 0.24175824175824176,
+      "instance_recall": NaN,
+      "fragmentation": 4.0,
+      "skeleton_recall": 0.8846153846153846,
+      "boundary_error": 51.97773361206055,
+      "id": "f16ea1004e6144a0b7b9994298a70e5e"
+    },
+    {
+      "dice": 0.8750511606150968,
+      "iou": 0.7778586278586278,
+      "recall": 0.9104513931135174,
+      "instance_recall": NaN,
+      "fragmentation": 2.0,
+      "skeleton_recall": 0.064891846921797,
+      "boundary_error": 1.107053279876709,
+      "id": "f3c58784a2684852b9ee4d6227b7dc53"
+    },
+    {
+      "dice": 0.7060306030603061,
+      "iou": 0.5456316082359488,
+      "recall": 0.9450602409638554,
+      "instance_recall": NaN,
+      "fragmentation": 1.0,
+      "skeleton_recall": 0.07792207792207792,
+      "boundary_error": 1.926759958267212,
+      "id": "f3fcb60d6109433188dd54c4c08132cf"
+    },
+    {
+      "dice": 0.7052551408987052,
+      "iou": 0.5447058823529412,
+      "recall": 0.9391480730223124,
+      "instance_recall": NaN,
+      "fragmentation": 3.0,
+      "skeleton_recall": 0.20454545454545456,
+      "boundary_error": 2.147446393966675,
+      "id": "f6d1efa23aed47dd8245dbd30d485e98"
+    },
+    {
+      "dice": 0.7753086419753087,
+      "iou": 0.6330645161290323,
+      "recall": 0.7405660377358491,
+      "instance_recall": 1.0,
+      "fragmentation": 2.0,
+      "skeleton_recall": 0.1,
+      "boundary_error": 20.691184997558594,
+      "id": "f7be2712502c4d37a144a8ec803a5a98"
+    },
+    {
+      "dice": 0.6611800809038918,
+      "iou": 0.4938528860179204,
+      "recall": 0.8987485779294653,
+      "instance_recall": 1.0,
+      "fragmentation": 2.0,
+      "skeleton_recall": 0.11080332409972299,
+      "boundary_error": 2.6947221755981445,
+      "id": "f8751f1eb80e4a048ac39e14879c92fd"
+    },
+    {
+      "dice": 0.5456019456830158,
+      "iou": 0.375139353400223,
+      "recall": 0.38789625360230545,
+      "instance_recall": 0.0,
+      "fragmentation": 3.0,
+      "skeleton_recall": 0.4956521739130435,
+      "boundary_error": 19.397449493408203,
+      "id": "f89095ac5be7477689278c8806ea39b1"
+    }
+  ]
+}
