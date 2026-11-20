@@ -97,6 +97,10 @@ cls 标签存 `images.class_id`（图级），其他 task 标签存 `annotations
   精度：真实模型 FP32 vs INT8 概率 MAE <0.0001、前景 IoU 0.983、argmax 一致率 0.9999。
   产物命名 `semseg_{imgsz}_int8.xml/.bin`（FP16 是 `_fp16`，FP32 保持 `semseg_{imgsz}.xml`），
   四者共存不互相覆盖；`metadata.yaml` 的 `model_file` 指向当前精度对应的模型文件。
+  **ONNX FP16**：`semseg_{imgsz}_fp16.onnx`，由 `_convert_onnx_fp16()` 用
+  `onnxruntime.transformers.float16.convert_float_to_float16` 做图转换（权重 FP16、
+  输入输出仍 float32，部署端预处理不用改）。转换器会把输入 Cast 追加到图末尾，
+  必须用 `_toposort_graph()` 重排，否则 `onnx.checker` 报节点未拓扑排序。
   依赖：`pip install nncf`（ONNX INT8 还需 onnxruntime），requirements.txt 里列为可选注释项。
 - 监控：`train_epoch_logs.val_dice / val_iou / val_recall`，前端按 Dice/IoU/Recall 出图。
 

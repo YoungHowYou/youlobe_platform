@@ -23,7 +23,8 @@ pyyaml>=6.0
 # ---- 可选：模型导出 / 量化 ----
 # openvino>=2024.0      # ONNX → OpenVINO IR（FP32/FP16 导出、CPU 推理）
 # nncf>=2.0             # INT8 后训练量化（语义分割 INT8 导出必需；校准需真实缺陷 patch）
-# onnxruntime>=1.17     # 仅在导出 ONNX INT8 时需要（NNCF 的 ONNX 后端）
+# onnxruntime>=1.17     # ONNX INT8 量化后端（NNCF）+ 语义分割 ONNX FP16 转换
+#                       # （自带 onnxruntime.transformers.float16，无需 onnxconverter-common）
 
 # ---- 训练相关 ----
 # torch / torchvision 故意不写在这里：CPU 版与 GPU(CUDA) 版来自不同的 wheel index，

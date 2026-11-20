@@ -86,6 +86,9 @@ cls 标签存 `images.class_id`（图级），其他 task 标签存 `annotations
   **INT8 已支持**：NNCF PTQ + 用 `collect_semseg_calibration_patches()` 从项目标注按缺陷中心裁的真实 patch 校准）。
   INT8 实测（真实模型 640 patch）：CPU 260 ms → 161 ms（1.62×）、权重 98.5→24.7 MB、
   概率 MAE <1e-4 / 前景 IoU 0.983；产物名 `semseg_{imgsz}_int8.xml`，与 FP32/FP16 共存不覆盖。
+  **ONNX FP16**：`semseg_{imgsz}_fp16.onnx`，由 `_convert_onnx_fp16()` 做图转换
+  （权重 FP16、输入输出仍 float32）；转换器把输入 Cast 追加到图末尾，需
+  `_toposort_graph()` 重排才能通过 `onnx.checker`。
 - 监控列：`train_epoch_logs.val_dice / val_iou / val_recall`。
 
 #### 多分类语义分割（2026-11-16 新增）

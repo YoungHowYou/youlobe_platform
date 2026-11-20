@@ -90,6 +90,13 @@
             </el-radio>
           </el-radio-group>
         </el-form-item>
+        <div v-if="precision==='fp16' && isSemsegTask" style="font-size:12px;color:#909399;line-height:1.6;margin:-6px 0 12px 24px">
+          语义分割 ONNX 会额外生成 <code>semseg_*_fp16.onnx</code>：权重减半，但<b>输入输出仍是 float32</b>，
+          预处理无需改动。只有 GPU 上的 onnxruntime/TensorRT 才会明显提速，CPU 上请用 INT8。
+        </div>
+        <div v-else-if="precision==='fp16'" style="font-size:12px;color:#909399;line-height:1.6;margin:-6px 0 12px 24px">
+          FP16 主要作用于 OpenVINO / TensorRT；ONNX 产物目前仍为 FP32。
+        </div>
         <el-alert v-if="precision==='int8'" type="warning" :closable="false" style="margin-bottom:12px">
           <div style="font-size:12px">
             INT8 用 NNCF 后训练量化（PTQ），需要<b>真实缺陷样本</b>校准：<br>
@@ -345,6 +352,12 @@ function onTaskChange() {
 const isClsTask = computed(() => {
   const t = tasks.value.find(x => x.task_id === selTaskId.value)
   return t?.task_type === 'cls'
+})
+
+// 当前选中任务是否为语义分割（决定 FP16 提示文案：只有 semseg 的 ONNX 会真实转 FP16）
+const isSemsegTask = computed(() => {
+  const t = tasks.value.find(x => x.task_id === selTaskId.value)
+  return t?.task_type === 'semseg'
 })
 
 // 当前选中任务是否 end2end 架构模型（YOLO26/10 head 支持 native/compat/nms 三种导出模式）

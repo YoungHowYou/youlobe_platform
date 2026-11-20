@@ -15,7 +15,10 @@
 因此 ``export_semseg`` 要求调用方传入 ``calibration_patches``（灰度 patch 列表），
 缺省时直接报错而不是悄悄用噪声凑数。
 
-FP16 相对 FP32 在 CPU 上无提速（实验已验证），要 CPU 低延迟请用 INT8。
+**FP16**：OpenVINO 用 ``compress_to_fp16`` 压缩权重；ONNX 侧用
+``_convert_onnx_fp16()`` 做一次图转换（权重 FP16、输入输出仍 FP32，
+部署端预处理不用改）。只有 GPU 上的 onnxruntime EP 才会明显变快，
+CPU 上 FP16 无提速，要 CPU 低延迟请用 INT8。
 """
 
 from pathlib import Path
@@ -147,6 +150,105 @@ def _quantize(model, calibration, subset_size: int):
     return nncf.quantize(model, calibration, **kwargs)
 
 
+def _toposort_graph(graph) -> None:
+    """就地按拓扑序重排节点（Kahn 算法）。
+
+    onnxruntime 的 float16 转换在 ``keep_io_types=True`` 时会把**输入 Cast
+    追加到图末尾**，导致 ``onnx.checker`` 报 “Nodes in a graph must be
+    topologically sorted”。这里按真实依赖重新排一次，不改变任何节点内容。
+    """
+    from collections import deque
+
+    nodes = list(graph.node)
+    n = len(nodes)
+    producer: dict = {}
+    for idx, node in enumerate(nodes):
+        for out in node.output:
+            if out:
+                producer[out] = idx
+
+    external = {vi.name for vi in graph.input}
+    external.update(t.name for t in graph.initializer)
+    indeg = [0] * n
+    consumers: list = [[] for _ in range(n)]
+    for idx, node in enumerate(nodes):
+        for inp in node.input:
+            if not inp or inp in external:
+                continue
+            src = producer.get(inp)
+            if src is None or src == idx:
+                continue
+            indeg[idx] += 1
+            consumers[src].append(idx)
+
+    queue = deque(i for i, d in enumerate(indeg) if d == 0)
+    order = []
+    while queue:
+        idx = queue.popleft()
+        order.append(idx)
+        for c in consumers[idx]:
+            indeg[c] -= 1
+            if indeg[c] == 0:
+                queue.append(c)
+
+    if len(order) != n:      # 存在环/外部输入异常：保持原序，交给 checker 报错
+        return
+    del graph.node[:]
+    graph.node.extend(nodes[i] for i in order)
+
+
+def _convert_onnx_fp16(src: Path, dst: Path) -> Path:
+    """把 ONNX 图的算子权重/计算转成 FP16，**输入输出仍保持 FP32**。
+
+    ``keep_io_types=True`` 会在图首尾插入 Cast，部署端依旧按 metadata
+    （NCHW、0~255、float32）喂数据，预处理无需改动；只有 GPU 上的
+    onnxruntime（CUDA/TensorRT EP）才能拿到实际加速，CPU EP 不会变快。
+
+    转换器优先级：onnxruntime 自带的 ``transformers.float16``（已随
+    onnxruntime 安装）→ ``onnxconverter-common``（可选替代）。
+    """
+    import onnx
+
+    try:
+        from onnxruntime.transformers.float16 import (
+            convert_float_to_float16 as _convert,
+        )
+    except Exception:                                    # pragma: no cover - 环境相关
+        try:
+            from onnxconverter_common.float16 import (
+                convert_float_to_float16 as _convert,
+            )
+        except Exception as exc:                          # pragma: no cover - 环境相关
+            raise RuntimeError(
+                "ONNX FP16 转换需要 onnxruntime（自带 float16 转换器）或 "
+                "onnxconverter-common，请先执行 `.venv/bin/pip install onnxruntime`。"
+            ) from exc
+
+    model = onnx.load(str(src))
+    fp16_model = _convert(model, keep_io_types=True)
+    _toposort_graph(fp16_model.graph)
+
+    # 自检 1：I/O 必须还是 FP32（否则部署端喂 float32 会直接报 dtype 不匹配）
+    io_types = {vi.name: vi.type.tensor_type.elem_type for vi in fp16_model.graph.input}
+    io_types.update({vi.name: vi.type.tensor_type.elem_type for vi in fp16_model.graph.output})
+    bad_io = [k for k, v in io_types.items() if v != onnx.TensorProto.FLOAT]
+    if bad_io:
+        raise RuntimeError(
+            "ONNX FP16 转换后输入/输出不再是 float32（"
+            + ", ".join(bad_io) + "），已中止，避免导出不可用的模型。"
+        )
+
+    onnx.save(fp16_model, str(dst))
+
+    # 自检 2：落盘后必须是合法 ONNX 图
+    try:
+        onnx.checker.check_model(str(dst))
+    except Exception as exc:
+        dst.unlink(missing_ok=True)
+        raise RuntimeError(f"ONNX FP16 转换结果未通过 onnx.checker：{exc}") from exc
+    return dst
+
+
 def export_semseg(
     model_path: str,
     output_dir: str,
@@ -181,7 +283,6 @@ def export_semseg(
     imgsz = int(imgsz or 512)
     output = Path(output_dir)
     output.mkdir(parents=True, exist_ok=True)
-    stem = f"semseg_{imgsz}"
 
     if int8:
         try:
@@ -222,6 +323,8 @@ def export_semseg(
     except Exception as exc:
         print(f"[semseg 导出] 读取 checkpoint meta 失败，按传入类别数 {num_classes} 导出：{exc}")
     valid = int(valid or imgsz)
+    # 文件名跟随**调正后**的真实输入尺寸，保证与 metadata.yaml 的 imgsz 一致
+    stem = f"semseg_{imgsz}"
     model = build_model(num_classes=int(num_classes), pretrained=False)
     load_weights(model, model_path, strict=False, verbose=False, skip_mismatch=True)
     model.eval()
@@ -241,46 +344,58 @@ def export_semseg(
         )
 
     calib_count = len(patches) if int8 else 0
-    # INT8/FP16 用带后缀的 IR 文件名，避免覆盖同任务之前导出的其他精度
+    # INT8/FP16 用带后缀的文件名，避免覆盖同任务之前导出的其他精度
     ir_name = f"{stem}_int8.xml" if int8 else (f"{stem}_fp16.xml" if half else f"{stem}.xml")
     if fmt == "openvino":
         model_file = ir_name
     else:
-        model_file = f"{stem}_int8.onnx" if int8 else f"{stem}.onnx"
-    _write_metadata(output, imgsz, half, window, stride, threshold,
-                    num_classes=int(num_classes), class_names=class_names,
-                    int8=bool(int8), calibration_count=calib_count,
-                    model_file=model_file, valid_size=valid)
+        model_file = (f"{stem}_int8.onnx" if int8
+                      else (f"{stem}_fp16.onnx" if half else f"{stem}.onnx"))
+
+    def _meta() -> None:
+        """metadata 只在产物真正生成后写，避免失败时留下“声明 FP16 实为 FP32”的残留。"""
+        _write_metadata(output, imgsz, half, window, stride, threshold,
+                        num_classes=int(num_classes), class_names=class_names,
+                        int8=bool(int8), calibration_count=calib_count,
+                        model_file=model_file, valid_size=valid)
 
     # ---------- ONNX ----------
     if fmt == "onnx":
-        if not int8:
-            return {
-                "format": "onnx",
-                "onnx_path": str(onnx_path),
-                "export_path": str(onnx_path),
-                "imgsz": imgsz,
-                "precision": _precision_label(half, int8),
-            }
-        if progress_callback:
-            progress_callback(60, 100, "NNCF 量化 ONNX（INT8）...")
-        import onnx
+        export_path = onnx_path
+        fp16_path = None
+        if int8:
+            if progress_callback:
+                progress_callback(60, 100, "NNCF 量化 ONNX（INT8）...")
+            import onnx
 
-        calib = _make_calibration_dataset(patches, imgsz, onnx_inputs=True)
-        int8_model = _quantize(onnx.load(str(onnx_path)), calib, calib_count)
-        int8_path = output / f"{stem}_int8.onnx"
-        onnx.save(int8_model, str(int8_path))
+            calib = _make_calibration_dataset(patches, imgsz, onnx_inputs=True)
+            int8_model = _quantize(onnx.load(str(onnx_path)), calib, calib_count)
+            export_path = output / f"{stem}_int8.onnx"
+            onnx.save(int8_model, str(export_path))
+        elif half:
+            # ResUNet34 不是 ultralytics 图模型，torch.onnx.export 只产出 FP32 图，
+            # FP16 必须显式做一次图转换（I/O 仍为 FP32）。
+            if progress_callback:
+                progress_callback(60, 100, "转换 ONNX FP16...")
+            fp16_path = _convert_onnx_fp16(onnx_path, output / f"{stem}_fp16.onnx")
+            export_path = fp16_path
+
+        _meta()
         if progress_callback:
             progress_callback(100, 100, "导出完成")
-        return {
+        result = {
             "format": "onnx",
             "onnx_path": str(onnx_path),
-            "export_path": str(int8_path),
-            "int8_path": str(int8_path),
+            "export_path": str(export_path),
             "imgsz": imgsz,
-            "precision": "INT8",
-            "calibration_patches": calib_count,
+            "precision": _precision_label(half, int8),
         }
+        if int8:
+            result["int8_path"] = str(export_path)
+            result["calibration_patches"] = calib_count
+        if fp16_path is not None:
+            result["fp16_path"] = str(fp16_path)
+        return result
 
     # ---------- OpenVINO ----------
     if progress_callback:
@@ -301,6 +416,7 @@ def export_semseg(
     else:
         ov.save_model(ov_model, str(xml_path), compress_to_fp16=bool(half))
 
+    _meta()
     if progress_callback:
         progress_callback(100, 100, "导出完成")
     return {
